@@ -23,4 +23,4 @@ open the GPU at all. The probe reserves 14 GiB against the page file for a momen
 
 ## Status
 
-Built; not yet run on the target machine. Piece 1 of the build order. Its results decide the open questions in `docs/design/2026-11-27-architecture.md`.
+Built, and run on the target machine on 2026-11-27: the results are the first entry in `docs/measurements.md`, and Q1 to Q5 in `docs/design/2026-11-27-architecture.md` have their answers. The probe exits with 1 there, because one 14 GiB heap does not open; the same 14 GiB as seven 2 GiB heaps does. Piece 1 of the build order.

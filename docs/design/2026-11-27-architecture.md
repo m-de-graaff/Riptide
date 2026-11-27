@@ -4,6 +4,8 @@ Approved 2026-11-27, revised the same day (see "What changed"). The README expla
 
 ## Decisions
 
+Q1's answer (2026-11-27): one heap cannot hold the block on the target machine. D1 and D2 below still describe one heap and one subtraction; they take the several-heaps form Q1 names, which is not designed yet.
+
 - **D1. Title memory is one block of RAM that the GPU uses in place.** Riptide owns the title's allocator. The block is one committed section, opened as a D3D12 heap (`OpenExistingHeapFromFileMapping`) with one buffer over it. The GPU reads and writes the title's bytes directly; the CPU works at RAM speed. There is no mirror on this path.
 - **D2. One address conversion.** A console GPU address becomes an offset in that buffer with one subtraction, in shaders and on the CPU.
 - **D3. Promotion is an optimisation, never a requirement.** Data that is large, used every frame and unwritten for a while gets a copy in video memory, and its RAM pages are write-protected. A write fault drops the copy and the protection before the write continues. With every promotion off, the picture must be the same.
@@ -70,10 +72,15 @@ Each piece ships on its own and gets its own design and plan.
 Numbered so plans and measurements can refer to them. The probe answers Q1 to Q5.
 
 - **Q1.** Does a 14 GiB committed section open as one heap with one buffer on the Adrenalin driver, and do CPU writes and GPU writes each show up on the other side? If not at that size, D1 uses several heaps and D2 becomes a table lookup. If not at all, D1 fails and the memory design is redone before piece 2.
+  **Answer (2026-11-27):** Not at that size. A section of 4 GiB or more does not open as a heap on driver 32.0.32029.2010; the largest that opens is 4 GiB less 64 KiB. Seven 2 GiB sections do open as seven heaps at once, with CPU and GPU writes each seen on the other side in all of them. So D1 holds in its several-heaps form and D2 becomes a table lookup. `riptide-mem` still builds one section and one heap, and has to change before a block of 4 GiB or more is used. [Measurements](../measurements.md#2026-11-27--riptide-probe--commit-8892833).
 - **Q2.** How fast does the GPU read in-place memory compared with video memory, for bulk copies and for scattered small reads? This sets how much D3 has to promote, and whether D5's in-shader descriptor reads can stay in place.
+  **Answer (2026-11-27):** Bulk copies run at 12.7 GiB/s from in-place memory to video memory and 12.4 GiB/s back, against 104.9 GiB/s inside video memory: about 8 times slower. A scattered 4-byte shader read costs 9.39 ns in place and 0.155 ns in video memory: about 60 times slower. The sums read in place were correct. Scattered reads are the case for promotion; whether D5's descriptor reads can stay in place is decided with these figures when `riptide-gpu` is designed. [Measurements](../measurements.md#2026-11-27--riptide-probe--commit-8892833).
 - **Q3.** Can a shader write to the in-place buffer (unordered access)? If not, GPU writes to title memory go through copies.
+  **Answer (2026-11-27):** Yes. A compute shader wrote to the in-place buffer through unordered access and the CPU read what it wrote. [Measurements](../measurements.md#2026-11-27--riptide-probe--commit-8892833).
 - **Q4.** What does a write fault on a protected page cost, and what does protecting a range cost? This sets how D3 and D4 group pages.
+  **Answer (2026-11-27):** A write fault costs 2.45 us from the write to the write going on. Protecting 1 GiB took 7 to 21 ms across runs, which is 0.03 to 0.08 us per 4 KiB page. A GPU write to a protected page lands without a fault, so guards never hear of GPU writes. [Measurements](../measurements.md#2026-11-27--riptide-probe--commit-8892833).
 - **Q5.** With Smart Access Memory on, what are CPU write and read bandwidth to GPU upload heap memory? This confirms or corrects the 30 MB/s read figure behind D1 and D9.
+  **Answer (2026-11-27):** The CPU writes GPU upload memory at 10.6 GiB/s and reads it at 15.6 MiB/s, against 24.6 and 47.8 GiB/s for ordinary memory. The read figure is confirmed and is lower than assumed: D9's rule stands, the CPU never reads that memory. [Measurements](../measurements.md#2026-11-27--riptide-probe--commit-8892833).
 - **Q6.** Shaders addressing more than 4 GiB: does the driver accept a 4-byte-word view over 14 GiB, or are windows needed? Measured in piece 5.
 - **Q7.** Does Riptide's one-core budget hold when the title keeps seven cores busy, and does using the second hardware thread of title cores slow the title? Measured in piece 4.
 - **Q8.** AMD-specific shader faults reported by VIctory-RDNA (helper lanes in quad wave reads, compiler crashes on some pipeline flags) need tests in piece 5.
