@@ -22,6 +22,8 @@ Setting `RIPTIDE_ADAPTER=software` makes the host device on Windows' software ad
 
 ## Status
 
-Started. The real title creates its device (on the RX 7900 XTX, from a 0x40-byte parameter block with interface version 2.4) and stops at its first device method that is not built. Built: device creation, `QueryInterface`, the reference count and `GetNodeCount`.
+Started. The real title creates its device (on the RX 7900 XTX, from a 0x40-byte parameter block with interface version 2.4, as `ID3D12Device11`), asks for its heap rules, makes its command queues and fences, and stops at `CreateCommandAllocator`.
 
-Not built: every other device method, queues, command lists, resources, descriptors, pipelines and presenting. Piece 6 of the build order.
+Built: device creation, `GetNodeCount`, `GetCustomHeapProperties`, command queues (`CreateCommandQueue`, `CreateCommandQueueX`, `Signal`, `Wait`) and fences (`GetCompletedValue`, `SetEventOnCompletion`, `Signal`, `GetCreationFlags`), each on a host object of the same kind.
+
+Not built: command allocators and lists, submission, resources, descriptors, pipelines and presenting. No unit test makes a host object yet; the host side has only run under the real title. Piece 6 of the build order.

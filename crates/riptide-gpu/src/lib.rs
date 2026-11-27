@@ -6,8 +6,11 @@
 //! (decision D6). See README.md in this folder.
 
 mod device;
+mod fence;
 mod host;
 mod object;
+mod queue;
+mod resource;
 
 use std::sync::{Arc, OnceLock};
 

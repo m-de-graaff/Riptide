@@ -15,8 +15,6 @@ use crate::trace;
 
 /// The host device and what it runs on.
 pub(crate) struct Host {
-    /// Read by the methods that make host objects.
-    #[allow(dead_code)]
     pub(crate) device: ID3D12Device,
     pub(crate) adapter: String,
 }

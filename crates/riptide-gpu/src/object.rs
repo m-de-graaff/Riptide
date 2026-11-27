@@ -90,6 +90,154 @@ impl Object {
     }
 }
 
+/// The ids of the three interfaces every device child inherits: `ID3D12Pageable`,
+/// `ID3D12DeviceChild` and `ID3D12Object`.
+pub(crate) const CHILD_IIDS: [Iid; 3] = [
+    guid(
+        0x63ee58fb,
+        0x1268,
+        0x4835,
+        [0x86, 0xda, 0xf0, 0x08, 0xce, 0x62, 0xf0, 0xd6],
+    ),
+    guid(
+        0x905db94b,
+        0xa00c,
+        0x4140,
+        [0x9d, 0xf5, 0x2b, 0x64, 0xca, 0x9e, 0xa3, 0x57],
+    ),
+    guid(
+        0xc4fec28f,
+        0x7966,
+        0x4e95,
+        [0x9f, 0x94, 0xf4, 0x31, 0xcb, 0x56, 0xc3, 0xb8],
+    ),
+];
+
+/// An object made from the device: a queue, a fence, a list, a resource. It is counted and
+/// goes with its last reference.
+///
+/// # Safety
+/// The type is `#[repr(C)]` and its first field is its [`Object`], so a pointer to one is a
+/// pointer to its header.
+pub(crate) unsafe trait Child: Sized {
+    /// What the session log calls it.
+    const NAME: &'static str;
+    /// The ids of its own interfaces. It also answers to `IUnknown` and [`CHILD_IIDS`].
+    const IIDS: &'static [Iid];
+
+    fn header(&self) -> &Object;
+}
+
+/// Whether the id at `iid` names a `T`.
+///
+/// # Safety
+/// `iid` is null or points at an interface id.
+unsafe fn names<T: Child>(iid: *const Iid) -> bool {
+    // SAFETY: the caller's pointer.
+    unsafe { is(iid, T::IIDS) || is(iid, &CHILD_IIDS) }
+}
+
+/// Whether a `T` can be handed out as the interface at `iid` through `out`: asked before
+/// the object is made, so nothing is made for a request that is refused. On a refusal `out`
+/// is set to null if there is one.
+///
+/// # Safety
+/// `iid` is null or points at an interface id; `out` is null or where the object goes.
+pub(crate) unsafe fn accepts<T: Child>(iid: *const Iid, out: *mut *const T) -> Result<(), Hresult> {
+    if out.is_null() {
+        return Err(E_POINTER);
+    }
+    // SAFETY: checked non-null.
+    unsafe { out.write(std::ptr::null()) };
+    // SAFETY: the caller's id.
+    if !unsafe { names::<T>(iid) } {
+        // SAFETY: the caller's id; null has no text.
+        let id = unsafe { iid.as_ref() }.map(guid_text).unwrap_or_default();
+        crate::trace!(
+            "a {} was asked for as interface {id}, which it is not",
+            T::NAME
+        );
+        return Err(E_NOINTERFACE);
+    }
+    Ok(())
+}
+
+/// Hands a new object to the title, after [`accepts`] said it can be. `child` has one
+/// reference, which becomes the title's.
+///
+/// # Safety
+/// `out` is where the object goes, as checked by [`accepts`].
+pub(crate) unsafe fn hand_out<T: Child>(child: Box<T>, out: *mut *const T) -> Hresult {
+    // SAFETY: the caller checked it.
+    unsafe { out.write(Box::into_raw(child)) };
+    S_OK
+}
+
+/// `QueryInterface` for a device child.
+///
+/// # Safety
+/// `this` is a live `T`; `iid` and `out` are null or valid.
+pub(crate) unsafe extern "system" fn query_interface<T: Child>(
+    this: *const T,
+    iid: *const Iid,
+    out: *mut *const T,
+) -> Hresult {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: the caller's id.
+    let found = unsafe { names::<T>(iid) };
+    if found {
+        // SAFETY: a live object.
+        unsafe { &*this }.header().add_ref();
+    }
+    // SAFETY: checked non-null.
+    unsafe { out.write(if found { this } else { std::ptr::null() }) };
+    if found { S_OK } else { E_NOINTERFACE }
+}
+
+/// `AddRef` for a device child.
+pub(crate) extern "system" fn add_ref<T: Child>(this: &T) -> u32 {
+    this.header().add_ref()
+}
+
+/// `Release` for a device child: it goes with its last reference.
+///
+/// # Safety
+/// `this` is a live `T` handed out by [`hand_out`], and the caller gives up one reference.
+pub(crate) unsafe extern "system" fn release<T: Child>(this: *mut T) -> u32 {
+    // SAFETY: a live object.
+    let left = unsafe { &*this }.header().release();
+    if left == 0 {
+        // SAFETY: that was the last reference, and the object came from `Box::into_raw`.
+        drop(unsafe { Box::from_raw(this) });
+    }
+    left
+}
+
+/// `GetDevice` for a device child: the device, as the interface asked for.
+///
+/// # Safety
+/// `iid` and `out` are null or valid.
+pub(crate) unsafe extern "system" fn get_device<T: Child>(
+    _this: *const T,
+    iid: *const Iid,
+    out: *mut *const crate::device::Device,
+) -> Hresult {
+    // SAFETY: as received.
+    unsafe { crate::device::answer(iid, out) }
+}
+
+/// The four methods every device child's table starts with and has at position 7.
+pub(crate) fn child_methods<T: Child>() -> [(usize, usize); 4] {
+    [
+        (0, query_interface::<T> as *const () as usize),
+        (1, add_ref::<T> as *const () as usize),
+        (2, release::<T> as *const () as usize),
+        (7, get_device::<T> as *const () as usize),
+    ]
+}
+
 /// What an unbuilt method is when this crate has not been given a stub maker (in its own
 /// tests): it fails, as an interface without the method would.
 extern "system" fn unbuilt() -> Hresult {

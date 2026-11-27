@@ -6,6 +6,7 @@
 
 use std::ffi::c_void;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::object::{
     self, E_INVALIDARG, E_NOINTERFACE, E_POINTER, Hresult, Iid, Object, S_OK, guid, guid_text,
@@ -87,6 +88,15 @@ const LEVELS: [Iid; 9] = [
 unsafe fn is_device(iid: *const Iid) -> bool {
     // SAFETY: the caller's pointer.
     unsafe { object::is(iid, &[IID]) || object::is(iid, &LEVELS) }
+}
+
+/// Set when the title creates its device as `ID3D12Device11`. Its queues and lists then
+/// have two more methods each than older titles', although the interface version is the
+/// same.
+static NEWER: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn newer() -> bool {
+    NEWER.load(Ordering::Relaxed)
 }
 
 /// The version of the console's graphics interface these layouts are for (2.4): the first
@@ -179,7 +189,7 @@ const _: () = assert!(size_of::<Device>() == 0x58);
 const _: () = assert!(std::mem::offset_of!(Device, out_of_line) == 0x18);
 
 /// The one device. It lives as long as the process, so its count only counts.
-fn device() -> &'static Device {
+pub(crate) fn device() -> &'static Device {
     static DEVICE: OnceLock<Device> = OnceLock::new();
     DEVICE.get_or_init(|| {
         let methods = [
@@ -187,6 +197,13 @@ fn device() -> &'static Device {
             (1, add_ref as *const () as usize),
             (2, release as *const () as usize),
             (7, node_count as *const () as usize),
+            (8, crate::queue::create as *const () as usize),
+            (36, crate::fence::create as *const () as usize),
+            (48, crate::queue::create_x as *const () as usize),
+            (
+                26,
+                crate::resource::custom_heap_properties as *const () as usize,
+            ),
         ];
         let mut out_of_line = [0u32; 16];
         out_of_line[0] = 1;
@@ -202,7 +219,7 @@ fn device() -> &'static Device {
 ///
 /// # Safety
 /// `iid` is null or points at an interface id; `out` is null or where the object goes.
-unsafe fn answer(iid: *const Iid, out: *mut *const Device) -> Hresult {
+pub(crate) unsafe fn answer(iid: *const Iid, out: *mut *const Device) -> Hresult {
     if out.is_null() {
         return E_POINTER;
     }
@@ -249,6 +266,11 @@ pub unsafe extern "system" fn create(
     }
     if let Err(code) = crate::host::host() {
         return code;
+    }
+    // SAFETY: the title's id; null is not the newest level.
+    if unsafe { iid.as_ref() } == Some(&LEVELS[8]) {
+        NEWER.store(true, Ordering::Relaxed);
+        trace!("the device is created as ID3D12Device11: queues and lists have the newer layouts");
     }
     // SAFETY: the title's id and out-pointer.
     unsafe { answer(iid, out.cast()) }
