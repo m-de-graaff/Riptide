@@ -1,0 +1,33 @@
+# The stand-in title is not a workspace member. It is a freestanding image: it needs
+# panic = "abort" in every profile, which a workspace member cannot have under `cargo test`.
+# `riptide-pe`'s tests build it with `cargo build --manifest-path`.
+[workspace]
+
+[package]
+name = "stand-in-title"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+license = "UNLICENSED"
+publish = false
+
+[[bin]]
+name = "stand-in-title"
+path = "src/main.rs"
+test = false
+doctest = false
+bench = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.dev]
+panic = "abort"
+# Optimised a little, so the image holds no debug-only calls into the C runtime.
+opt-level = 1
+
+[profile.release]
+panic = "abort"

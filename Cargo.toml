@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
+# The stand-in title is a freestanding image with its own profile; tests build it on demand.
+exclude = ["tests/fixtures/stand-in-title"]
 
 [workspace.package]
 version = "0.0.0"
