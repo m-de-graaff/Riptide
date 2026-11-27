@@ -60,4 +60,18 @@ A reboot gives it back: 13.2 GiB committed afterwards, and the page file shrank 
 
 Not yet known: whether restarting the graphics driver gives the memory back without a reboot, whether the driver or Windows holds it, and whether sections the heap was never opened on are affected (the 14 GiB section whose heap open failed appears not to be: the total fits the heaps that did open).
 
+### 2026-11-27 · two ways to open memory as an in-place heap · commit 343fc10
+
+Driver 32.0.32029.2010, Windows 11 build 26200. One-off tests in `riptide-probe`, release build, each run in its own process; committed memory read from Windows before the run and a few seconds after it exited.
+
+| Heap opened | Works | CPU write through a second view of the section seen by the GPU | Committed memory left after four runs of 256 MiB |
+| --- | --- | --- | --- |
+| `OpenExistingHeapFromFileMapping` on a section | yes | yes | 1,026 MiB |
+| `OpenExistingHeapFromAddress` on a view of a section | yes | yes | none (the figure fell by 23 MiB) |
+| `OpenExistingHeapFromAddress` on `VirtualAlloc` memory | yes | not applicable | none in one run (the figure fell by 65 MiB) |
+
+With the file-mapping heap, a view of part of the section mapped at its own address after the heap was opened was also seen by the GPU. `OpenExistingHeapFromAddress` on 6 GiB of `VirtualAlloc` memory was refused with "The parameter is incorrect", as the file-mapping heap is at 4 GiB and above.
+
+Single runs move committed memory by up to about 60 MiB either way from other programs, which is why the first two rows are four runs each.
+
 Spread between runs of the probe: three runs of the probe that day gave 102 to 146 GiB/s for the video-to-video copy and 7,000 to 21,300 us for protecting 1 GiB. The other figures moved by less than 10 %.
