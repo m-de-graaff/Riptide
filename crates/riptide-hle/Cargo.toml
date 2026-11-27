@@ -13,6 +13,8 @@ workspace = true
 riptide-pe = { path = "../riptide-pe" }
 riptide-mem = { path = "../riptide-mem" }
 riptide-trace = { path = "../riptide-trace" }
+# Inflates the zlib streams a title's file requests can ask for.
+miniz_oxide = "=0.8.9"
 
 [dev-dependencies]
 riptide-testkit = { path = "../riptide-testkit" }

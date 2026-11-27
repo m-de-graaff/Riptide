@@ -206,6 +206,19 @@ unsafe extern "system" fn unimplemented(entry: *const Entry) -> ! {
     std::process::abort()
 }
 
+/// Stops the title because it asked for something that is not built, naming it: for what
+/// is found unbuilt in the middle of a call, where there is no stub to jump to.
+pub(crate) fn stop(what: &str) -> ! {
+    let line = format!("unimplemented: {what}");
+    let _ = std::panic::catch_unwind(|| {
+        eprintln!("riptide: {line}");
+        crate::trace::trace!("{line}");
+    });
+    // SAFETY: ending this process is always allowed.
+    unsafe { sys::TerminateProcess(sys::GetCurrentProcess(), UNIMPLEMENTED_IMPORT) };
+    std::process::abort()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

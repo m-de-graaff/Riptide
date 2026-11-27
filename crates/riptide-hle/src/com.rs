@@ -64,6 +64,68 @@ impl Header {
     }
 }
 
+/// An object with data of its own, counted: the title holds references and the object goes
+/// when the last one does. Its address is what the title is handed.
+#[repr(C)]
+pub(crate) struct Instance<T> {
+    header: Header,
+    references: std::sync::atomic::AtomicU32,
+    pub(crate) state: T,
+}
+
+impl<T> Instance<T> {
+    /// Makes an object with one reference, which the caller hands to the title. `table` is
+    /// the interface's method table, made once with [`table`].
+    pub(crate) fn create(table: &'static [usize], state: T) -> *mut Instance<T> {
+        Box::into_raw(Box::new(Instance {
+            header: Header {
+                table: table.as_ptr(),
+            },
+            references: std::sync::atomic::AtomicU32::new(1),
+            state,
+        }))
+    }
+
+    /// `AddRef`.
+    ///
+    /// # Safety
+    /// `this` is a live object made by [`Instance::create`] with this `T`.
+    pub(crate) unsafe extern "system" fn add_ref(this: *mut Instance<T>) -> u32 {
+        // SAFETY: as this function's contract says.
+        unsafe { &*this }
+            .references
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    /// `Release`: the object is freed with its last reference.
+    ///
+    /// # Safety
+    /// `this` is a live object made by [`Instance::create`] with this `T`, and the caller
+    /// gives up one reference to it.
+    pub(crate) unsafe extern "system" fn release(this: *mut Instance<T>) -> u32 {
+        // SAFETY: as this function's contract says.
+        let left = unsafe { &*this }
+            .references
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            - 1;
+        if left == 0 {
+            // SAFETY: that was the last reference, and the object came from `Box::into_raw`.
+            drop(unsafe { Box::from_raw(this) });
+        }
+        left
+    }
+}
+
+/// A method table of `slots` positions for `interface`: `methods` at the positions they
+/// name, stubs that name themselves everywhere else. Made once per interface and never
+/// freed.
+pub(crate) fn table(interface: &str, slots: usize, methods: &[(usize, usize)]) -> &'static [usize] {
+    let header = Header::new(interface, slots, methods);
+    // SAFETY: `Header::new` leaked a table of exactly `slots` entries.
+    unsafe { std::slice::from_raw_parts(header.table, slots) }
+}
+
 /// An object with no data of its own that lives as long as the process: the address to hand
 /// the title.
 pub(crate) fn singleton(interface: &str, slots: usize, methods: &[(usize, usize)]) -> usize {

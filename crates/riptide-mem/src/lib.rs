@@ -405,28 +405,11 @@ impl TitleMemory {
         self.state().space.locate(address, bytes)
     }
 
-    /// Write-protects the pages of `bytes` at `address`, at every address their frames are
-    /// mapped at, and guards them for `resource`, a number of the caller's choosing
-    /// (decisions D3, D4 and M7).
-    ///
-    /// The first write to any of those pages, through any of those addresses, takes the
-    /// protection off all of them, puts `resource` in the list [`TitleMemory::take_written`]
-    /// returns, and then goes on as if nothing had happened. Reads are never disturbed.
-    ///
-    /// Pages are protected whole. A write beside the resource but on one of its pages ends
-    /// the guard too: it is reported as written though it was not, which costs a copy and
-    /// never a wrong picture. Guard a resource before copying it, not after.
-    pub fn guard(&self, address: u64, bytes: u64, resource: u64) -> Result<(), MemError> {
-        if bytes == 0 {
-            return Err(MemError::InvalidParameter);
-        }
-        let state = self.state();
-        let parts = state
-            .space
-            .locate(address, bytes)
-            .ok_or(MemError::InvalidAddress)?;
+    /// The whole pages of `bytes` at `address`, at every address their frames are mapped at.
+    /// `None` if any of the range is not mapped.
+    fn pages_everywhere(state: &State, address: u64, bytes: u64) -> Option<Vec<Range<u64>>> {
         let mut pages = Vec::new();
-        for part in parts {
+        for part in state.space.locate(address, bytes)? {
             let first = part.bank as u32 * BANK_FRAMES + (part.offset / FRAME) as u32;
             let last =
                 part.bank as u32 * BANK_FRAMES + ((part.offset + part.bytes - 1) / FRAME) as u32;
@@ -445,6 +428,83 @@ impl TitleMemory {
                 }
             }
         }
+        Some(pages)
+    }
+
+    /// Says that `bytes` at `address` are about to be written by something a guard cannot
+    /// hear: a system call, which fails on a protected page instead of faulting, or the
+    /// GPU, which page protection does not bind. The guards there are ended and reported as
+    /// written, as the write itself would have done. An address that is not title memory is
+    /// nobody's to guard, and nothing happens.
+    pub fn will_write(&self, address: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let state = self.state();
+        if let Some(pages) = Self::pages_everywhere(&state, address, bytes) {
+            for range in pages {
+                guard::end_overlapping(self.id, range);
+            }
+        }
+    }
+
+    /// Copies `data` into physical pages the title holds, starting `offset` bytes into the
+    /// first, whether or not they are mapped anywhere. Guards on them are ended and
+    /// reported.
+    pub fn write_frames(&self, frames: &[u32], offset: usize, data: &[u8]) -> Result<(), MemError> {
+        let state = self.state();
+        let room = frames.len() * FRAME as usize;
+        if offset > room || data.len() > room - offset {
+            return Err(MemError::InvalidParameter);
+        }
+        if frames.iter().any(|frame| !state.held.contains(frame)) {
+            return Err(MemError::InvalidParameter);
+        }
+        let mut written = 0;
+        let mut at = offset;
+        while written < data.len() {
+            let frame = frames[at / FRAME as usize];
+            let within = at % FRAME as usize;
+            let count = (FRAME as usize - within).min(data.len() - written);
+            let one = FrameRun {
+                first: frame,
+                count: 1,
+            };
+            for (view, _) in state.space.views_of(one) {
+                guard::end_overlapping(self.id, view);
+            }
+            // SAFETY: the frame lies inside its bank's anchor view, which is readable and
+            // writable for the bank's life, and `within + count` does not pass its end.
+            unsafe {
+                let to = state.sections[one.bank()]
+                    .anchor()
+                    .add(one.offset() as usize + within);
+                std::ptr::copy_nonoverlapping(data.as_ptr().add(written), to, count);
+            }
+            written += count;
+            at += count;
+        }
+        Ok(())
+    }
+
+    /// Write-protects the pages of `bytes` at `address`, at every address their frames are
+    /// mapped at, and guards them for `resource`, a number of the caller's choosing
+    /// (decisions D3, D4 and M7).
+    ///
+    /// The first write to any of those pages, through any of those addresses, takes the
+    /// protection off all of them, puts `resource` in the list [`TitleMemory::take_written`]
+    /// returns, and then goes on as if nothing had happened. Reads are never disturbed.
+    ///
+    /// Pages are protected whole. A write beside the resource but on one of its pages ends
+    /// the guard too: it is reported as written though it was not, which costs a copy and
+    /// never a wrong picture. Guard a resource before copying it, not after.
+    pub fn guard(&self, address: u64, bytes: u64, resource: u64) -> Result<(), MemError> {
+        if bytes == 0 {
+            return Err(MemError::InvalidParameter);
+        }
+        let state = self.state();
+        let pages =
+            Self::pages_everywhere(&state, address, bytes).ok_or(MemError::InvalidAddress)?;
         // Holding the state keeps the mappings in place until the guard stands.
         if guard::guard(self.id, resource, pages) {
             Ok(())

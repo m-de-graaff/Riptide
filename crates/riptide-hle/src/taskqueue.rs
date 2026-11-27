@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::trace::trace;
@@ -29,10 +29,6 @@ const S_OK: i32 = 0;
 const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
 const E_ABORT: i32 = 0x8000_4004_u32 as i32;
 const INFINITE: u32 = u32::MAX;
-
-/// How many threads run pool work. The title's own threads do its heavy work; these carry
-/// the runtime's callbacks.
-const POOL_THREADS: usize = 4;
 
 /// A callback the title submits: its context, and whether the queue was ended before it ran.
 type Callback = unsafe extern "system" fn(*mut c_void, bool);
@@ -127,7 +123,7 @@ impl Queue {
         let at = &self.ports[port];
         match at.mode {
             Mode::Immediate => task.run(false),
-            Mode::Pool => pool().run(Box::new(move || task.run(false))),
+            Mode::Pool => crate::pool::run(move || task.run(false)),
             Mode::Manual => {
                 at.waiting().push_back(task);
                 at.arrived.notify_one();
@@ -147,7 +143,7 @@ impl Queue {
             return;
         }
         let queue = Arc::clone(self);
-        pool().run(Box::new(move || {
+        crate::pool::run(move || {
             let at = &queue.ports[port];
             loop {
                 let next = at.waiting().pop_front();
@@ -162,7 +158,7 @@ impl Queue {
                     }
                 }
             }
-        }));
+        });
     }
 
     fn tell_monitors(&self, port: usize) {
@@ -234,61 +230,6 @@ impl Queue {
             port.arrived.notify_all();
         }
     }
-}
-
-/// The threads that run pool work.
-struct Pool {
-    work: Mutex<VecDeque<Box<dyn FnOnce() + Send>>>,
-    arrived: Condvar,
-}
-
-impl Pool {
-    fn run(&self, work: Box<dyn FnOnce() + Send>) {
-        self.work
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .push_back(work);
-        self.arrived.notify_one();
-    }
-}
-
-fn pool() -> &'static Pool {
-    static POOL: OnceLock<&'static Pool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let pool: &'static Pool = Box::leak(Box::new(Pool {
-            work: Mutex::new(VecDeque::new()),
-            arrived: Condvar::new(),
-        }));
-        for index in 0..POOL_THREADS {
-            let started = std::thread::Builder::new()
-                .name(format!("riptide task pool {index}"))
-                .spawn(move || {
-                    loop {
-                        let mut work = pool
-                            .work
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner());
-                        let next = loop {
-                            match work.pop_front() {
-                                Some(next) => break next,
-                                None => {
-                                    work = pool
-                                        .arrived
-                                        .wait(work)
-                                        .unwrap_or_else(|poison| poison.into_inner());
-                                }
-                            }
-                        };
-                        drop(work);
-                        next();
-                    }
-                });
-            if started.is_err() {
-                trace!("task queues: a pool thread could not be started");
-            }
-        }
-        pool
-    })
 }
 
 /// The process's queue, which a null handle means: pool threads for both ports until the
@@ -432,12 +373,12 @@ unsafe extern "system" fn submit_delayed(
     if delay == 0 {
         return queue.submit(port as usize, task);
     }
-    pool().run(Box::new(move || {
+    crate::pool::run(move || {
         std::thread::sleep(Duration::from_millis(u64::from(delay)));
         if queue.submit(port as usize, task) != S_OK {
             task.run(true);
         }
-    }));
+    });
     S_OK
 }
 

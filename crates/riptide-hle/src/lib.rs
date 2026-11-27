@@ -10,6 +10,7 @@ pub mod dstorage;
 mod files;
 mod imports;
 mod network;
+mod pool;
 pub mod process;
 pub mod runtime;
 pub mod saves;

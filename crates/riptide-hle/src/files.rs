@@ -28,7 +28,7 @@ const INVALID_HANDLE: *mut c_void = usize::MAX as *mut c_void;
 ///
 /// # Safety
 /// `text` is null or null-terminated.
-unsafe fn wide(text: *const u16) -> String {
+pub(crate) unsafe fn wide(text: *const u16) -> String {
     if text.is_null() {
         return String::new();
     }
@@ -74,7 +74,7 @@ fn lead(path: &str, package: Option<&Path>) -> (String, bool) {
 }
 
 /// [`lead`] for the title that is running, as a null-terminated UTF-16 string.
-fn lead_wide(path: &str) -> (Vec<u16>, bool) {
+pub(crate) fn lead_wide(path: &str) -> (Vec<u16>, bool) {
     let (led, in_package) = lead(path, crate::process::title_folder().as_deref());
     (led.encode_utf16().chain([0]).collect(), in_package)
 }

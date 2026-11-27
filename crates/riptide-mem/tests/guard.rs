@@ -214,3 +214,52 @@ fn a_handler_ahead_of_the_guard_that_passes_faults_on_does_not_break_it() {
     // SAFETY: the handle came from AddVectoredExceptionHandler above.
     unsafe { RemoveVectoredExceptionHandler(handle) };
 }
+
+#[test]
+fn a_write_announced_beforehand_ends_the_guard_without_a_fault() {
+    let (memory, at) = committed(2);
+    memory.guard(at, PAGE, 1).unwrap();
+    memory.guard(at + FRAME, PAGE, 2).unwrap();
+    // Something that cannot fault, a system call or the GPU, is about to write the first.
+    memory.will_write(at + 10, 20);
+    assert_eq!(memory.take_written(), [1]);
+    assert_eq!(memory.guard_count(), 1);
+    // An address that is not title memory is nobody's to guard.
+    memory.will_write(0x1000, 16);
+    assert!(memory.take_written().is_empty());
+}
+
+#[test]
+fn bytes_written_into_physical_pages_show_wherever_they_are_mapped() {
+    let memory = TitleMemory::new(BANK_BYTES);
+    let range = memory.reserve(8 * FRAME, ANYWHERE).unwrap();
+    let frames = memory.allocate_frames(2).unwrap();
+    // Not mapped yet: the bytes go in all the same.
+    let data: Vec<u8> = (0..100u8).collect();
+    let start = FRAME as usize - 40;
+    memory.write_frames(&frames, start, &data).unwrap();
+    memory
+        .map_frames(range, &frames, Access::ReadWrite)
+        .unwrap();
+    // The write ran across the two pages.
+    assert_eq!(read(range + FRAME - 40), 0);
+    assert_eq!(read(range + FRAME - 1), 39);
+    assert_eq!(read(range + FRAME), 40);
+    assert_eq!(read(range + FRAME + 59), 99);
+
+    // Mapped and guarded: a write into the pages ends the guard.
+    memory.guard(range, PAGE, 3).unwrap();
+    memory.write_frames(&frames, 0, &[7]).unwrap();
+    assert_eq!(memory.take_written(), [3]);
+    assert_eq!(read(range), 7);
+
+    // Past the end of the pages, or pages the title does not hold, are refused.
+    assert_eq!(
+        memory.write_frames(&frames, 2 * FRAME as usize - 1, &[1, 2]),
+        Err(MemError::InvalidParameter)
+    );
+    assert_eq!(
+        memory.write_frames(&[999], 0, &[1]),
+        Err(MemError::InvalidParameter)
+    );
+}
