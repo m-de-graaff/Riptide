@@ -126,6 +126,7 @@ impl Imports {
         crate::runtime::register(&mut imports);
         crate::files::register(&mut imports);
         crate::cores::register(&mut imports);
+        crate::graphics::register(&mut imports);
         imports
     }
 

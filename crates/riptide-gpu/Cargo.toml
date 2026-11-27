@@ -14,3 +14,10 @@ riptide-mem = { path = "../riptide-mem" }
 riptide-shader = { path = "../riptide-shader" }
 riptide-formats = { path = "../riptide-formats" }
 riptide-trace = { path = "../riptide-trace" }
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }

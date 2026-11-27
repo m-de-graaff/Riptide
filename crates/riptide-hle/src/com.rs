@@ -17,7 +17,7 @@ use crate::trace::trace;
 static STUBS: Mutex<Option<Stubs>> = Mutex::new(None);
 
 /// A stub that, when called, logs `name` as unimplemented and stops the title.
-fn stub(name: String) -> usize {
+pub(crate) fn stub(name: String) -> usize {
     let mut stubs = STUBS.lock().unwrap_or_else(|poison| poison.into_inner());
     stubs
         .get_or_insert_with(|| {

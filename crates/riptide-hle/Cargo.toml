@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 riptide-pe = { path = "../riptide-pe" }
 riptide-mem = { path = "../riptide-mem" }
+riptide-gpu = { path = "../riptide-gpu" }
 riptide-trace = { path = "../riptide-trace" }
 # Inflates the zlib streams a title's file requests can ask for.
 miniz_oxide = "=0.8.9"

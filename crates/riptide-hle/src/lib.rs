@@ -9,6 +9,7 @@ pub mod cores;
 mod display;
 pub mod dstorage;
 mod files;
+mod graphics;
 mod imports;
 mod localstorage;
 mod network;
