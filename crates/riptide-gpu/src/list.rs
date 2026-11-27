@@ -9,7 +9,9 @@
 use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator, ID3D12GraphicsCommandList,
+    D3D12_COMMAND_LIST_TYPE, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
+    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_UAV_BARRIER,
+    ID3D12CommandAllocator, ID3D12GraphicsCommandList,
 };
 
 use crate::device::Device;
@@ -267,6 +269,8 @@ fn list_table(newer: bool) -> &'static [usize] {
             (8, list_type as *const () as usize),
             (9, close as *const () as usize),
             (10, reset as *const () as usize),
+            (129, sync as *const () as usize),
+            (130, sync as *const () as usize),
         ]);
         let names: Vec<(usize, &str)> = LIST_NAMES
             .iter()
@@ -478,6 +482,32 @@ unsafe extern "system" fn reset(
             error.code().0
         }
     }
+}
+
+/// `PipelineSyncTopX` and `PipelineSyncBottomX`: `(flags, control, address, size)`. On the
+/// console these make the GPU finish earlier work, and flush its caches over a range of
+/// memory, before it goes on. The host orders a list's commands itself except for what
+/// shaders write through unordered access, so the sync becomes a wait for all of that.
+extern "system" fn sync(this: &List, flags: u32, control: u32, address: u64, size: u64) {
+    static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        trace!(
+            "pipeline sync on list {:p}: flags {flags:#x}, control {control:#x}, address {address:#x}, size {size:#x}",
+            &raw const *this
+        );
+    }
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    };
+    // SAFETY: a plain call on the host list; the barrier names no resource, so nothing in
+    // it needs dropping.
+    unsafe { this.host.ResourceBarrier(&[barrier]) };
 }
 
 #[cfg(test)]

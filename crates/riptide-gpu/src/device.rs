@@ -85,7 +85,7 @@ const LEVELS: [Iid; 9] = [
 ///
 /// # Safety
 /// `iid` is null or points at an interface id.
-unsafe fn is_device(iid: *const Iid) -> bool {
+pub(crate) unsafe fn is_device(iid: *const Iid) -> bool {
     // SAFETY: the caller's pointer.
     unsafe { object::is(iid, &[IID]) || object::is(iid, &LEVELS) }
 }
@@ -203,6 +203,9 @@ pub(crate) fn device() -> &'static Device {
             (36, crate::fence::create as *const () as usize),
             (73, crate::list::create_list_x as *const () as usize),
             (48, crate::queue::create_x as *const () as usize),
+            (78, crate::frame::set_interval as *const () as usize),
+            (79, crate::frame::schedule as *const () as usize),
+            (80, crate::frame::wait as *const () as usize),
             (
                 26,
                 crate::resource::custom_heap_properties as *const () as usize,
@@ -228,6 +231,16 @@ pub(crate) unsafe fn answer(iid: *const Iid, out: *mut *const Device) -> Hresult
     }
     // SAFETY: the caller's id.
     if !unsafe { is_device(iid) } {
+        // The device is also a DXGI device. `IUnknown` was answered above, so only the
+        // DXGI ids themselves get here.
+        // SAFETY: the caller's id.
+        if unsafe { iid.as_ref() }.is_some_and(|id| crate::dxgi::DEVICE_IIDS.contains(id)) {
+            let dxgi = crate::dxgi::device();
+            dxgi.add_ref();
+            // SAFETY: checked non-null.
+            unsafe { out.write(std::ptr::from_ref(dxgi).cast()) };
+            return S_OK;
+        }
         // SAFETY: the caller's id; null has no text.
         let id = unsafe { iid.as_ref() }.map(guid_text).unwrap_or_default();
         trace!("the graphics device was asked for as interface {id}, which it is not");

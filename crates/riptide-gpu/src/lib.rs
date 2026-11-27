@@ -6,7 +6,9 @@
 //! (decision D6). See README.md in this folder.
 
 mod device;
+mod dxgi;
 mod fence;
+mod frame;
 mod host;
 mod list;
 mod object;
