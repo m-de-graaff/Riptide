@@ -16,6 +16,13 @@ A settings file that will not load is moved to `riptide.toml.bad`, and the launc
 
 A program, not a library. Its decisions are in `src/logic.rs` and are unit-tested; the window code in `src/app.rs` only draws and edits a `Settings` value.
 
+## Icon and release package
+
+- **The icon is drawn by `scripts/make-icon.ps1`**, from code, in the launcher's colours. It writes `assets/riptide.ico`, which `build.rs` builds into the .exe together with the version information, and `assets/icon-64.rgba`, which the window shows in its title bar and on the taskbar. Run the script again only when the drawing changes, and commit both files.
+- **`scripts/package.ps1` makes the release package**: `local/dist/riptide-<version>-win-x64.zip`, holding `riptide-launcher.exe`, `riptide.exe` beside it, and a short README. The programs have the C runtime linked in, so the package needs no installer, no Visual C++ redistributable and no Rust toolchain; the script checks that neither imports a C runtime DLL. `-Target7800X3D` makes the package for the target machine.
+- A release build has no console window, and the launcher starts the runtime without one.
+- If the Windows SDK's resource compiler is missing, the launcher still builds, with a warning, and has no icon or version page.
+
 ## Depends on
 
 - `riptide-config`

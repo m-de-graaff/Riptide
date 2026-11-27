@@ -12,6 +12,7 @@ use eframe::egui::{
 use riptide_config::{ConsoleMode, MissingPipeline, Settings, WindowMode};
 use riptide_log::{Level as LogLevel, Line, Logger};
 use riptide_preflight::{Check, Level};
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 
 const FIELD_WIDTH: f32 = 300.0;
@@ -197,12 +198,16 @@ impl LauncherApp {
                 ));
             }
             PlayOutcome::Start => {
+                // The runtime is a console program, so `riptide census` can print. Started
+                // from here it gets no console window: what it has to say is in the log.
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
                 match std::process::Command::new(&self.runtime)
                     .arg("run")
                     .arg("--config")
                     .arg(&self.path)
                     .arg("--log")
                     .arg(self.log.path())
+                    .creation_flags(CREATE_NO_WINDOW)
                     .spawn()
                 {
                     Ok(_) => {
