@@ -18,7 +18,7 @@ Step 0: review and merge the open pull requests. They were all built on a laptop
 - Run the tests on this machine before each merge.
 - Merge order:
   - Independent, base main: #48 (xtask policy), #49 (CI), #50 (setup doc), #57 (preflight checks), and #56 (statistics figures), which must be squash-merged: its first commit holds build output committed by mistake.
-  - Loader stack, bottom first: #52 -> #53 -> #55 -> #58 -> #61 -> #62.
+  - Loader stack, bottom first: #52 -> #53 -> #55 -> #58 -> #61 -> #62 -> #63 (release packaging).
   - Memory stack, bottom first: #47 -> #59 -> #60.
 - Expect small conflicts where two stacks touched the same file (README.md, Cargo.lock, Cargo.toml, .gitignore). Resolve them; do not drop either side.
 - Delete the merged branches. Afterwards main must pass cargo fmt --all --check, clippy with -D warnings, cargo test --workspace and cargo xtask policy.
@@ -36,6 +36,6 @@ Decisions still open; ask me, do not guess: #10 (a called stub stops the title i
 Rules: numbers from this machine go in docs/measurements.md with the driver version. Stage files by path, never `git add -A`. No attribution lines in commits.
 ```
 
-## Not on GitHub yet
+## State of the laptop
 
-The release-packaging work for issue #37 (an icon, version information, `scripts/package.ps1`) is on the laptop only, uncommitted, on a local branch `launcher/issue-37`. It built a 2.8 MiB package there. It was not yet checked from an empty folder or under Windows PowerShell 5.1.
+Everything built on the laptop is pushed and has a pull request. Nothing is left there uncommitted.
