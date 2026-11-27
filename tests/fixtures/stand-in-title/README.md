@@ -6,7 +6,7 @@ A small program of our own, built as a freestanding PE32+ image, that `riptide-p
 
 Everything a loader has to handle, and nothing else:
 
-- imports by name from `standin_console.dll`, by ordinal from `standin_ordinal.dll`, and one of the host's own functions from `kernel32.dll`;
+- imports by name from `standin_console.dll`, by ordinal from `standin_ordinal.dll`, and functions from `kernel32.dll`;
 - a stored pointer, so the image has base relocations;
 - writable data;
 - a TLS directory with one callback;
@@ -19,9 +19,10 @@ The module and function names are made up for this fixture. As `riptide-hle` gro
 | --- | --- |
 | `StandInReport(id, value)` | Hands one observed value to the test. |
 | `StandInAdd(a, b)` | Returns `a + b`; shows arguments and results cross an import correctly. |
-| `StandInMode()` | 0 to run to the exit, 1 to write to address zero and fault, 2 to call `StandInUnbuilt`. |
+| `StandInMode()` | 0 to run to the exit, 1 to write to address zero and fault, 2 to call `StandInUnbuilt`, 3 to call `Sleep(1)` 1,000 times. |
 | `StandInUnbuilt()` | A function no test implements, called only in mode 2: what a call to an unbuilt console function looks like. |
 | `kernel32.dll!GetCurrentThreadId` | A function whose console version is the host's own. Its result is reported. |
+| `kernel32.dll!Sleep` | The title's sleep, called only in mode 3. |
 | ordinal 7 of `standin_ordinal.dll` | An import with no name in the image. |
 
 ## Building it

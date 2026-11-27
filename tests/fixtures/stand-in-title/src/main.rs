@@ -27,11 +27,17 @@ const REPORT_ORDINAL: u32 = 4;
 const REPORT_RELOCATED: u32 = 5;
 const REPORT_COUNTER: u32 = 6;
 const REPORT_THREAD: u32 = 7;
+const REPORT_SLEPT: u32 = 8;
 
 /// `StandInMode` answers this to ask for a write to address zero.
 const MODE_FAULT: u32 = 1;
 /// `StandInMode` answers this to ask for a call to `StandInUnbuilt`.
 const MODE_UNBUILT: u32 = 2;
+/// `StandInMode` answers this to ask for [`SLEEPS`] sleeps of one millisecond.
+const MODE_SLEEP: u32 = 3;
+
+/// How many times [`MODE_SLEEP`] sleeps.
+const SLEEPS: u32 = 1000;
 
 #[link(name = "standin_console", kind = "raw-dylib")]
 unsafe extern "C" {
@@ -40,7 +46,7 @@ unsafe extern "C" {
     /// Returns `a + b`; shows that arguments and results cross the import correctly.
     safe fn StandInAdd(a: u64, b: u64) -> u64;
     /// What the test wants this run to do: 0 to run to the exit, [`MODE_FAULT`] to fault,
-    /// [`MODE_UNBUILT`] to call `StandInUnbuilt`.
+    /// [`MODE_UNBUILT`] to call `StandInUnbuilt`, [`MODE_SLEEP`] to sleep 1 ms a thousand times.
     safe fn StandInMode() -> u32;
     /// A function no test implements: what a title's call to an unbuilt console function
     /// looks like. Only called in [`MODE_UNBUILT`].
@@ -51,6 +57,8 @@ unsafe extern "C" {
 unsafe extern "system" {
     /// A function whose console version is the host's own, to be passed straight through.
     safe fn GetCurrentThreadId() -> u32;
+    /// The title's sleep. On the console a 1 ms sleep takes 1 ms.
+    safe fn Sleep(milliseconds: u32);
 }
 
 #[link(name = "standin_ordinal", kind = "raw-dylib")]
@@ -123,6 +131,14 @@ pub extern "C" fn title_entry() -> u32 {
     let mode = StandInMode();
     if mode == MODE_UNBUILT {
         StandInReport(REPORT_ENTERED, StandInUnbuilt());
+    }
+    if mode == MODE_SLEEP {
+        let mut slept = 0;
+        while slept < SLEEPS {
+            Sleep(1);
+            slept += 1;
+        }
+        StandInReport(REPORT_SLEPT, u64::from(slept));
     }
     if mode == MODE_FAULT {
         let nowhere = black_box(0usize) as *mut u32;

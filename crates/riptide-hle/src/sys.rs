@@ -13,6 +13,10 @@ pub const PAGE_EXECUTE_READ: u32 = 0x20;
 
 pub const EXCEPTION_NONCONTINUABLE: u32 = 0x1;
 
+/// Asks for a timer that fires when it says, not on the next timer tick. Windows 10 1803 on.
+pub const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x2;
+pub const TIMER_ALL_ACCESS: u32 = 0x1F_0003;
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     pub fn VirtualAlloc(
@@ -33,4 +37,27 @@ unsafe extern "system" {
     pub fn RaiseException(code: u32, flags: u32, argument_count: u32, arguments: *const usize);
     pub fn LoadLibraryA(name: *const u8) -> *mut c_void;
     pub fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    pub fn CreateWaitableTimerExW(
+        attributes: *const c_void,
+        name: *const u16,
+        flags: u32,
+        access: u32,
+    ) -> *mut c_void;
+    pub fn SetWaitableTimer(
+        timer: *mut c_void,
+        due_time: *const i64,
+        period: i32,
+        completion_routine: *const c_void,
+        completion_argument: *const c_void,
+        resume: i32,
+    ) -> i32;
+    pub fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+    pub fn WaitForMultipleObjects(
+        count: u32,
+        handles: *const *mut c_void,
+        wait_all: i32,
+        milliseconds: u32,
+    ) -> u32;
+    pub fn CloseHandle(handle: *mut c_void) -> i32;
+    pub fn Sleep(milliseconds: u32);
 }
