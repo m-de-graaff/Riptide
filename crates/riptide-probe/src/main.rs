@@ -12,15 +12,23 @@ mod report;
 mod timing;
 
 use std::process::ExitCode;
-use windows::Win32::Graphics::Direct3D12::{D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE};
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
+};
 
 /// A 1 GiB in-place block for the timed checks, with shader writes allowed when the driver
 /// takes that flag.
 fn work_block(gpu: &device::Gpu, facts: &mut report::Facts) -> Option<inplace::InPlace> {
-    match inplace::open(gpu, buffers::GIB, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+    match inplace::open(
+        gpu,
+        buffers::GIB,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    ) {
         Ok(mem) => Some(mem),
         Err(e) => {
-            facts.notes.push(format!("in-place buffer with unordered access refused: {e}"));
+            facts.notes.push(format!(
+                "in-place buffer with unordered access refused: {e}"
+            ));
             facts.in_place_uav = Some(false);
             inplace::open(gpu, buffers::GIB, D3D12_RESOURCE_FLAG_NONE)
                 .map_err(|e| facts.notes.push(format!("in-place work block: {e}")))
@@ -62,13 +70,22 @@ fn main() -> ExitCode {
         if unsafe { gpu.device.GetDeviceRemovedReason() }.is_err() {
             match device::open(debug) {
                 Ok(fresh) => gpu = fresh,
-                Err(e) => facts.notes.push(format!("device lost and not reopened: {e}")),
+                Err(e) => facts
+                    .notes
+                    .push(format!("device lost and not reopened: {e}")),
             }
         }
     }
     bandwidth::check_bandwidth(&gpu, &mut facts);
 
     let report = report::build(facts);
-    println!("{}", serde_json::to_string_pretty(&report).expect("report serialises"));
-    if report.pass { ExitCode::SUCCESS } else { ExitCode::from(1) }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).expect("report serialises")
+    );
+    if report.pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
 }

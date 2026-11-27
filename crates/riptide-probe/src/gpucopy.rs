@@ -29,12 +29,23 @@ fn time_copy(gpu: &Gpu, dst: &ID3D12Resource, src: &ID3D12Resource) -> windows::
 pub fn check_gpu_copy(gpu: &Gpu, mem: &InPlace, facts: &mut Facts) {
     assert!(mem.bytes >= BYTES && GIB >= BYTES);
     // Touch every page first, so the copies time the bus and not first-use page faults.
-    mem.slice(0, BYTES).copy_from_slice(&pattern(0x33, BYTES as usize));
-    let video = |gpu: &Gpu| committed(gpu, D3D12_HEAP_TYPE_DEFAULT, BYTES, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+    mem.slice(0, BYTES)
+        .copy_from_slice(&pattern(0x33, BYTES as usize));
+    let video = |gpu: &Gpu| {
+        committed(
+            gpu,
+            D3D12_HEAP_TYPE_DEFAULT,
+            BYTES,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COMMON,
+        )
+    };
     let (a, b) = match (video(gpu), video(gpu)) {
         (Ok(a), Ok(b)) => (a, b),
         (Err(e), _) | (_, Err(e)) => {
-            facts.notes.push(format!("video buffers for copy timing: {e}"));
+            facts
+                .notes
+                .push(format!("video buffers for copy timing: {e}"));
             return;
         }
     };

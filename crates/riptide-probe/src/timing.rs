@@ -24,7 +24,11 @@ mod tests {
 
     #[test]
     fn best_is_the_shortest_sample() {
-        let s = [Duration::from_millis(9), Duration::from_millis(4), Duration::from_millis(7)];
+        let s = [
+            Duration::from_millis(9),
+            Duration::from_millis(4),
+            Duration::from_millis(7),
+        ];
         assert_eq!(best(&s), Duration::from_millis(4));
     }
 }

@@ -39,7 +39,10 @@ const OUT_IN_PLACE: u64 = SRC_BYTES;
 
 fn blob_bytes(blob: &ID3DBlob) -> Vec<u8> {
     // SAFETY: a blob's pointer is valid for its reported size while the blob lives.
-    unsafe { std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()) }.to_vec()
+    unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+    }
+    .to_vec()
 }
 
 pub fn compile() -> Result<Vec<u8>, String> {
@@ -65,7 +68,9 @@ pub fn compile() -> Result<Vec<u8>, String> {
         (Ok(()), Some(code)) => Ok(blob_bytes(&code)),
         (r, _) => Err(format!(
             "{r:?}: {}",
-            errors.map(|e| String::from_utf8_lossy(&blob_bytes(&e)).into_owned()).unwrap_or_default()
+            errors
+                .map(|e| String::from_utf8_lossy(&blob_bytes(&e)).into_owned())
+                .unwrap_or_default()
         )),
     }
 }
@@ -76,10 +81,16 @@ struct Pass {
 }
 
 fn build(gpu: &Gpu) -> windows::core::Result<Pass> {
-    let code = compile().map_err(|e| windows::core::Error::new(windows::Win32::Foundation::E_FAIL, e))?;
+    let code =
+        compile().map_err(|e| windows::core::Error::new(windows::Win32::Foundation::E_FAIL, e))?;
     let descriptor = |kind| D3D12_ROOT_PARAMETER {
         ParameterType: kind,
-        Anonymous: D3D12_ROOT_PARAMETER_0 { Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 } },
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: 0,
+                RegisterSpace: 0,
+            },
+        },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
     };
     let params = [
@@ -88,7 +99,11 @@ fn build(gpu: &Gpu) -> windows::core::Result<Pass> {
         D3D12_ROOT_PARAMETER {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
             Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 3 },
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 3,
+                },
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         },
@@ -109,19 +124,31 @@ fn build(gpu: &Gpu) -> windows::core::Result<Pass> {
         let root: ID3D12RootSignature = gpu.device.CreateRootSignature(0, &blob_bytes(&blob))?;
         let pso = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: ManuallyDrop::new(Some(root.clone())),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: code.as_ptr().cast(),
+                BytecodeLength: code.len(),
+            },
             NodeMask: 0,
             CachedPSO: Default::default(),
             Flags: D3D12_PIPELINE_STATE_FLAG_NONE,
         };
         let pipeline = gpu.device.CreateComputePipelineState(&pso);
         drop(ManuallyDrop::into_inner(pso.pRootSignature));
-        Ok(Pass { root, pipeline: pipeline? })
+        Ok(Pass {
+            root,
+            pipeline: pipeline?,
+        })
     }
 }
 
 /// Runs the shader once. `dst_base` is the byte offset in `dst` where sums are stored.
-fn dispatch(gpu: &Gpu, pass: &Pass, src: &ID3D12Resource, dst: &ID3D12Resource, dst_base: u32) -> windows::core::Result<()> {
+fn dispatch(
+    gpu: &Gpu,
+    pass: &Pass,
+    src: &ID3D12Resource,
+    dst: &ID3D12Resource,
+    dst_base: u32,
+) -> windows::core::Result<()> {
     let args = [(SRC_BYTES / 4) as u32, READS, dst_base];
     submit(gpu, |list| {
         // SAFETY: the root signature has parameters 0 (SRV), 1 (UAV) and 2 (three constants);
@@ -137,7 +164,12 @@ fn dispatch(gpu: &Gpu, pass: &Pass, src: &ID3D12Resource, dst: &ID3D12Resource, 
     })
 }
 
-fn time_reads(gpu: &Gpu, pass: &Pass, src: &ID3D12Resource, dst: &ID3D12Resource) -> windows::core::Result<f64> {
+fn time_reads(
+    gpu: &Gpu,
+    pass: &Pass,
+    src: &ID3D12Resource,
+    dst: &ID3D12Resource,
+) -> windows::core::Result<f64> {
     let mut samples = Vec::with_capacity(RUNS);
     for run in 0..=RUNS {
         let t = Instant::now();
@@ -159,35 +191,58 @@ pub fn check_gpu_read(gpu: &Gpu, mem: &InPlace, facts: &mut Facts) {
 fn run(gpu: &Gpu, mem: &InPlace, facts: &mut Facts) -> windows::core::Result<()> {
     {
         let pass = build(gpu)?;
-        mem.slice(0, SRC_BYTES).copy_from_slice(&pattern(0x44, SRC_BYTES as usize));
+        mem.slice(0, SRC_BYTES)
+            .copy_from_slice(&pattern(0x44, SRC_BYTES as usize));
 
-        let video_src = committed(gpu, D3D12_HEAP_TYPE_DEFAULT, SRC_BYTES, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON)?;
+        let video_src = committed(
+            gpu,
+            D3D12_HEAP_TYPE_DEFAULT,
+            SRC_BYTES,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COMMON,
+        )?;
         submit(gpu, |list| {
             // SAFETY: both buffers are at least SRC_BYTES long.
             unsafe { list.CopyBufferRegion(&video_src, 0, &mem.buffer, 0, SRC_BYTES) }
         })?;
         let out = |gpu: &Gpu| {
-            committed(gpu, D3D12_HEAP_TYPE_DEFAULT, OUT_BYTES, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)
+            committed(
+                gpu,
+                D3D12_HEAP_TYPE_DEFAULT,
+                OUT_BYTES,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COMMON,
+            )
         };
         let (out_in_place, out_video) = (out(gpu)?, out(gpu)?);
 
         let ns = time_reads(gpu, &pass, &mem.buffer, &out_in_place)?;
-        facts.gpu_random_read.push(RandomRead { source: Place::InPlaceRam, ns_per_read: ns });
+        facts.gpu_random_read.push(RandomRead {
+            source: Place::InPlaceRam,
+            ns_per_read: ns,
+        });
         let ns = time_reads(gpu, &pass, &video_src, &out_video)?;
-        facts.gpu_random_read.push(RandomRead { source: Place::Video, ns_per_read: ns });
+        facts.gpu_random_read.push(RandomRead {
+            source: Place::Video,
+            ns_per_read: ns,
+        });
 
         let expected = read_back(gpu, &out_video, 0, OUT_BYTES)?;
         facts.in_place_reads_match = Some(read_back(gpu, &out_in_place, 0, OUT_BYTES)? == expected);
 
         // Q3: the same sums, stored by the shader into in-place memory, read by the CPU.
         mem.slice(OUT_IN_PLACE, OUT_BYTES).fill(0);
-        facts.in_place_uav = Some(match dispatch(gpu, &pass, &video_src, &mem.buffer, OUT_IN_PLACE as u32) {
-            Ok(()) => mem.slice(OUT_IN_PLACE, OUT_BYTES) == expected.as_slice(),
-            Err(e) => {
-                facts.notes.push(format!("shader write to in-place memory: {e}"));
-                false
-            }
-        });
+        facts.in_place_uav = Some(
+            match dispatch(gpu, &pass, &video_src, &mem.buffer, OUT_IN_PLACE as u32) {
+                Ok(()) => mem.slice(OUT_IN_PLACE, OUT_BYTES) == expected.as_slice(),
+                Err(e) => {
+                    facts
+                        .notes
+                        .push(format!("shader write to in-place memory: {e}"));
+                    false
+                }
+            },
+        );
         Ok(())
     }
 }
@@ -206,10 +261,20 @@ mod tests {
     #[ignore = "needs the target machine"]
     fn shader_reads_in_place_memory_correctly() {
         let gpu = crate::device::open(false).unwrap();
-        let mem = crate::inplace::open(&gpu, crate::buffers::GIB, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS).unwrap();
+        let mem = crate::inplace::open(
+            &gpu,
+            crate::buffers::GIB,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        )
+        .unwrap();
         let mut facts = Facts::default();
         check_gpu_read(&gpu, &mem, &mut facts);
-        assert_eq!(facts.in_place_reads_match, Some(true), "notes: {:?}", facts.notes);
+        assert_eq!(
+            facts.in_place_reads_match,
+            Some(true),
+            "notes: {:?}",
+            facts.notes
+        );
         assert_eq!(facts.gpu_random_read.len(), 2);
         eprintln!("{:#?} uav: {:?}", facts.gpu_random_read, facts.in_place_uav);
     }
