@@ -86,6 +86,22 @@ extern "C" fn stand_in_unbuilt() -> u64 {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     safe fn GetCurrentThreadId() -> u32;
+    fn GetModuleHandleA(name: *const u8) -> *mut std::ffi::c_void;
+    fn GetProcAddress(module: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
+}
+
+/// The host's own kernel32 function of that name. The stand-in title imports a few, and
+/// these tests give it the real ones.
+fn kernel32(name: &str) -> Option<usize> {
+    let name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: both names are null-terminated, and kernel32 is loaded in every process.
+    let address = unsafe {
+        GetProcAddress(
+            GetModuleHandleA(c"kernel32.dll".as_ptr().cast()),
+            name.as_ptr().cast(),
+        )
+    };
+    (!address.is_null()).then_some(address as usize)
 }
 
 /// Resolves every import of the stand-in title.
@@ -101,9 +117,7 @@ fn resolver(module: &str, symbol: &Symbol) -> Option<usize> {
         ("standin_ordinal.dll", Symbol::Ordinal(7)) => {
             Some(stand_in_by_ordinal as *const () as usize)
         }
-        ("kernel32.dll", Symbol::Name(name)) if name == "GetCurrentThreadId" => {
-            Some(GetCurrentThreadId as *const () as usize)
-        }
+        ("kernel32.dll", Symbol::Name(name)) => kernel32(name),
         _ => None,
     }
 }
@@ -129,7 +143,7 @@ fn expected_reports() -> Vec<(u32, u64)> {
 fn the_image_parses_with_its_imports_sections_and_tls() {
     let image = Image::parse(stand_in()).unwrap();
 
-    let mut imports: Vec<String> = image
+    let imports: Vec<String> = image
         .imports
         .iter()
         .flat_map(|module| {
@@ -139,18 +153,20 @@ fn the_image_parses_with_its_imports_sections_and_tls() {
                 .map(move |import| format!("{}!{}", module.name, import.symbol))
         })
         .collect();
-    imports.sort();
-    assert_eq!(
-        imports,
-        [
-            "kernel32.dll!GetCurrentThreadId",
-            "standin_console.dll!StandInAdd",
-            "standin_console.dll!StandInMode",
-            "standin_console.dll!StandInReport",
-            "standin_console.dll!StandInUnbuilt",
-            "standin_ordinal.dll!#7",
-        ]
-    );
+    // The title imports more as the console API tests grow; these are the loader's own.
+    for expected in [
+        "kernel32.dll!GetCurrentThreadId",
+        "standin_console.dll!StandInAdd",
+        "standin_console.dll!StandInMode",
+        "standin_console.dll!StandInReport",
+        "standin_console.dll!StandInUnbuilt",
+        "standin_ordinal.dll!#7",
+    ] {
+        assert!(
+            imports.iter().any(|import| import == expected),
+            "{expected} is missing from {imports:?}"
+        );
+    }
 
     let text = image.sections.iter().find(|s| s.name == ".text").unwrap();
     assert!(text.executable && !text.writable);

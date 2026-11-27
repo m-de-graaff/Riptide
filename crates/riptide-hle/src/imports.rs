@@ -64,14 +64,21 @@ impl Imports {
     /// The table with every console function Riptide implements so far, logging called stubs
     /// to standard error.
     ///
-    /// No console function is implemented yet, so today every import of a real title is a
-    /// stub. The console API issues each add their functions here.
+    /// Few are implemented yet, so today most imports of a real title are stubs. The console
+    /// API issues each add their functions here.
     pub fn new() -> Imports {
         Imports::with_log(Arc::new(|line: &str| eprintln!("riptide: {line}")))
     }
 
     /// As [`Imports::new`], with each stub's first call reported to `log` instead.
     pub fn with_log(log: Log) -> Imports {
+        let mut imports = Imports::empty(log);
+        crate::timers::register(&mut imports);
+        imports
+    }
+
+    /// A table with nothing in it: every import is a stub until it is added.
+    pub fn empty(log: Log) -> Imports {
         Imports {
             riptide: HashMap::new(),
             host: HashSet::new(),
@@ -242,7 +249,7 @@ mod tests {
     }
 
     fn table() -> Imports {
-        let mut imports = Imports::with_log(Arc::new(|_: &str| {}));
+        let mut imports = Imports::empty(Arc::new(|_: &str| {}));
         // SAFETY: `implemented` is a real function; these tests never call through it with
         // another signature.
         unsafe {

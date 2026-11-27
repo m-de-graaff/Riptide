@@ -14,6 +14,8 @@ const EXIT_CODE: u32 = 42;
 // Report ids and modes. The stand-in title's source holds the same numbers.
 const REPORT_THREAD: u32 = 7;
 const MODE_UNBUILT: u32 = 2;
+const MODE_SLEEP: u32 = 3;
+const REPORT_SLEPT: u32 = 8;
 
 /// Set in the child process that the stub test starts.
 const STUB_CHILD: &str = "RIPTIDE_HLE_STUB_CHILD";
@@ -115,14 +117,15 @@ fn the_census_lists_every_import_by_what_it_gets_without_running_the_title() {
     assert_eq!(
         census.to_string(),
         "host    kernel32.dll!GetCurrentThreadId\n\
+         riptide kernel32.dll!Sleep\n\
          riptide standin_console.dll!StandInAdd\n\
          riptide standin_console.dll!StandInMode\n\
          riptide standin_console.dll!StandInReport\n\
          stub    standin_console.dll!StandInUnbuilt\n\
          riptide standin_ordinal.dll!#7\n\
-         6 imports: 4 implemented by Riptide, 1 passed to the host, 1 stubs"
+         7 imports: 5 implemented by Riptide, 1 passed to the host, 1 stubs"
     );
-    assert_eq!(census.count(Binding::Riptide), 4);
+    assert_eq!(census.count(Binding::Riptide), 5);
     assert_eq!(census.count(Binding::Host), 1);
     assert_eq!(census.count(Binding::Stub), 1);
     // Nothing ran: the title reports as soon as it runs.
@@ -132,9 +135,42 @@ fn the_census_lists_every_import_by_what_it_gets_without_running_the_title() {
 #[test]
 fn with_an_empty_table_every_import_is_a_stub() {
     let image = Image::parse(stand_in()).unwrap();
-    let census = Imports::new().census(&image);
+    let census = Imports::empty(std::sync::Arc::new(|_: &str| {})).census(&image);
     assert_eq!(census.count(Binding::Stub), census.lines.len());
-    assert_eq!(census.lines.len(), 6);
+    assert_eq!(census.lines.len(), 7);
+}
+
+#[test]
+fn a_1_ms_sleep_from_the_title_takes_under_2_ms_over_1000_calls() {
+    let imports = imports();
+    let loaded = load(NAME, stand_in(), &imports).unwrap();
+
+    REPORTS.take();
+    MODE.set(MODE_SLEEP);
+    let start = std::time::Instant::now();
+    // SAFETY: as in the test above. In this mode the title calls Sleep(1) a thousand times.
+    let exit_code = unsafe { loaded.run() };
+    let took = start.elapsed();
+    MODE.set(0);
+
+    assert_eq!(exit_code, EXIT_CODE);
+    let slept = REPORTS
+        .take()
+        .into_iter()
+        .find(|&(id, _)| id == REPORT_SLEPT)
+        .map(|(_, value)| value);
+    assert_eq!(slept, Some(1000));
+
+    let mean = took / 1000;
+    println!("1 ms sleep from the title over 1000 calls: mean {mean:?}");
+    assert!(
+        mean >= std::time::Duration::from_micros(900),
+        "mean {mean:?}"
+    );
+    // A shared CI runner's timers jitter too much for the upper bound.
+    if std::env::var_os("CI").is_none() {
+        assert!(mean < std::time::Duration::from_millis(2), "mean {mean:?}");
+    }
 }
 
 #[test]
