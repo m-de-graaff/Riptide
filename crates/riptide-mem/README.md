@@ -20,12 +20,19 @@ Pages that are not committed are inaccessible to the CPU, so a stray access faul
 
 **The heap.** `open_heap(device, flags)` opens the block as a D3D12 heap with one buffer over all of it. Offset `n` of the buffer is the byte at title address `base + n`. The GPU reads and writes every page, committed or not: page protection applies to the CPU only.
 
+**Write guards.** `guard(address, size, resource)` write-protects the pages of a resource (decisions D3 and D4). The first write to any of them takes the protection off the whole resource, puts `resource` in the list `take_written()` returns, and then goes on as if nothing had happened; later writes cost nothing. `unguard(resource)` ends a guard without a report. Reads are never disturbed.
+
+- Pages are protected whole. A write beside a resource but on one of its pages ends its guard too: it is reported as written though it was not, which costs a copy and never a wrong picture. Two resources that share a page are both reported; a page shared with a guard that is still live stays protected.
+- Decommitting or releasing guarded pages ends their guards and reports them.
+- The fault is caught by a vectored exception handler, which Windows calls before the title's own handlers. It answers only for write faults on guarded pages and passes every other fault on, so a title's exception handling keeps working.
+- When several threads write one guarded resource at once, the first ends the guard and the others find the page writable and try again. One report, no lost write.
+
 ## Depends on
 
 - `riptide-trace` (not used yet)
 
 ## Status
 
-Piece 3 of the build order. Working: the block, the allocator, address conversion and the heap. The GPU test (`cargo test -p riptide-mem --test gpu -- --ignored`) needs a GPU and has passed on a development laptop with a 64 MiB block; it has not run on the target machine, and the 14 GiB block waits for the probe's answer to open question Q1.
+Piece 3 of the build order. Working: the block, the allocator, address conversion, the heap and write guards. The GPU test (`cargo test -p riptide-mem --test gpu -- --ignored`) needs a GPU and has passed on a development laptop with a 64 MiB block; it has not run on the target machine, and the 14 GiB block waits for the probe's answer to open question Q1.
 
-Not built yet: write guards, the RAM budget, and returning freed pages to Windows. Until the last one, decommitted pages keep their RAM, and are zeroed when committed again.
+Not built yet: the RAM budget, and returning freed pages to Windows. Until the last one, decommitted pages keep their RAM, and are zeroed when committed again.

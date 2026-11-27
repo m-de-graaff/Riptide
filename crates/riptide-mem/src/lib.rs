@@ -1,13 +1,15 @@
 //! The title's memory: one committed block of RAM that is also a D3D12 heap, its allocator,
-//! and console-to-host address conversion. See README.md in this folder.
+//! write guards, and console-to-host address conversion. See README.md in this folder.
 
 mod block;
+mod guard;
 mod pages;
 
 pub use pages::{GRANULARITY, MemError, PAGE, Region, State};
 
 use block::Block;
 use pages::PageMap;
+use std::ops::Range;
 use std::sync::{Mutex, MutexGuard};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
@@ -65,6 +67,12 @@ pub struct InPlaceHeap {
 pub struct TitleMemory {
     block: Block,
     map: Mutex<PageMap>,
+}
+
+impl Drop for TitleMemory {
+    fn drop(&mut self) {
+        guard::forget(self.span());
+    }
 }
 
 impl TitleMemory {
@@ -141,6 +149,7 @@ impl TitleMemory {
         let at = self.offset(address)?;
         let mut map = self.map();
         for run in map.decommit(at, size)? {
+            self.end_guards(&run);
             self.block.close(run)?;
         }
         Ok(())
@@ -151,9 +160,79 @@ impl TitleMemory {
         let at = self.offset(address)?;
         let mut map = self.map();
         for run in map.release(at)?.1 {
+            self.end_guards(&run);
             self.block.close(run)?;
         }
         Ok(())
+    }
+
+    /// The block's addresses.
+    fn span(&self) -> Range<u64> {
+        let base = self.block.base();
+        base..base + self.block.bytes()
+    }
+
+    /// Ends the guards on pages that are about to be decommitted, given as offsets.
+    fn end_guards(&self, run: &Range<u64>) {
+        let base = self.block.base();
+        guard::end_overlapping(base, base + run.start..base + run.end);
+    }
+
+    /// Write-protects the pages covering `size` bytes at `address` and guards them for
+    /// `resource`, a number of the caller's choosing (decisions D3 and D4).
+    ///
+    /// The first write to any of those pages takes the protection off all of them, puts
+    /// `resource` in the list [`TitleMemory::take_written`] returns, and then goes on as if
+    /// nothing had happened. Reads are never disturbed.
+    ///
+    /// Pages are protected whole. A write beside the resource but on one of its pages ends
+    /// the guard too: it is reported as written though it was not, which costs a copy and
+    /// never a wrong picture. Two resources that share a page are both reported.
+    ///
+    /// Every page has to be committed. `resource` may be guarded once at a time.
+    pub fn guard(&self, address: u64, size: u64, resource: u64) -> Result<(), MemError> {
+        if size == 0 {
+            return Err(MemError::InvalidParameter);
+        }
+        let start = self.offset(address)?;
+        let end = start
+            .checked_add(size)
+            .filter(|&end| end <= self.block.bytes())
+            .ok_or(MemError::InvalidAddress)?;
+        // Holding the map keeps the pages committed until they are guarded.
+        let map = self.map();
+        let mut at = start;
+        while at < end {
+            let region = map.query(at)?;
+            if region.state != State::Committed {
+                return Err(MemError::InvalidAddress);
+            }
+            at = region.base + region.size;
+        }
+        let base = self.block.base();
+        if guard::guard(self.span(), resource, base + start..base + end) {
+            Ok(())
+        } else {
+            Err(MemError::InvalidParameter)
+        }
+    }
+
+    /// Ends the guard for `resource` and makes its pages writable again, without reporting
+    /// it as written. Returns whether it was guarded: false if a write, or a decommit,
+    /// ended the guard first.
+    pub fn unguard(&self, resource: u64) -> bool {
+        guard::unguard(self.block.base(), resource)
+    }
+
+    /// The resources whose guard was ended by a write, or by their pages being decommitted,
+    /// since the last call. Each appears once, in the order it happened.
+    pub fn take_written(&self) -> Vec<u64> {
+        guard::take_written(self.block.base())
+    }
+
+    /// How many resources are guarded right now.
+    pub fn guard_count(&self) -> usize {
+        guard::count(self.block.base())
     }
 
     /// The run of pages around `address` that share one state.
