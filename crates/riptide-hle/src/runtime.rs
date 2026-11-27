@@ -246,20 +246,28 @@ unsafe extern "system" fn query_api_impl(
         .find(|(p, i, _)| (*p, *i) == (provider, interface))
         .map(|&(_, _, object)| object);
     let object = known.unwrap_or_else(|| {
-        let name = format!("runtime area {}", guid(Some(&interface)));
+        // The areas with methods built, by interface id.
+        let (name, mut methods) = if interface == crate::taskqueue::INTERFACE {
+            (
+                format!("runtime area {}", crate::taskqueue::NAME),
+                crate::taskqueue::methods(),
+            )
+        } else {
+            (
+                format!("runtime area {}", guid(Some(&interface))),
+                Vec::new(),
+            )
+        };
         trace!(
-            "runtime services: {name} asked for (provider {}); not built, its methods will \
-             name themselves",
-            guid(Some(&provider))
+            "runtime services: {name} asked for (interface {}, provider {}); {} of its \
+             methods are built, the others name themselves",
+            guid(Some(&interface)),
+            guid(Some(&provider)),
+            methods.len()
         );
-        let object = com::singleton(
-            &name,
-            AREA_SLOTS,
-            &[
-                (1, com::keep as *const () as usize),
-                (2, com::keep as *const () as usize),
-            ],
-        );
+        methods.push((1, com::keep as *const () as usize));
+        methods.push((2, com::keep as *const () as usize));
+        let object = com::singleton(&name, AREA_SLOTS, &methods);
         areas.push((provider, interface, object));
         object
     });

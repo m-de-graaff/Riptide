@@ -13,6 +13,7 @@ pub mod runtime;
 pub mod saves;
 mod stub;
 mod sys;
+mod taskqueue;
 pub mod timers;
 mod trace;
 pub mod xmem;
