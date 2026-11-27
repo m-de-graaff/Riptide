@@ -1,0 +1,4 @@
+#!/bin/sh
+# Refuses a commit that stages a game, console or SDK file.
+# Turn it on once per checkout with: cargo xtask hooks
+exec cargo xtask policy --staged

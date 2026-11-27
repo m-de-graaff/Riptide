@@ -153,7 +153,7 @@ The launcher, its settings library and the preflight checks exist and are tested
 
 ## Rules
 
-- **No game, console or SDK files in the repository, ever.** Tests use inputs built from our own source.
+- **No game, console or SDK files in the repository, ever.** Tests use inputs built from our own source. `cargo xtask policy` checks every tracked file, and `cargo xtask hooks` makes git run the same check before each commit.
 - **Measure before and after.** A performance change lands with the frame-time ledger from both runs.
 - **No title-specific code in the core.** Fixes are made in the platform layers, so they apply to every title.
 - **An unimplemented console function fails loudly**, with its name, rather than returning a guess.
