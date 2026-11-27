@@ -35,4 +35,17 @@ Driver 32.0.32029.2010. `riptide-probe` release build. Windows 11 build 26200, 3
 
 Where the one-heap limit lies was found with a one-off test on the same day, same driver, not kept in the probe: a section opens as a heap at 1, 2, 3 GiB and at 4 GiB less 64 KiB (0xFFFF0000 bytes), and is refused at 4 GiB and every size above it. The refusal comes from opening the heap, before any buffer is placed. Four heaps of 0xFFFF0000 bytes (16 GiB in all) did not open together: the fourth failed with "Not enough memory resources" (0x8007000E), on a machine with 16 GiB of RAM free at the time.
 
-Spread between runs: three runs of the probe that day gave 102 to 146 GiB/s for the video-to-video copy and 7,000 to 21,300 us for protecting 1 GiB. The other figures moved by less than 10 %.
+### 2026-11-27 · riptide-hle timers and cores, riptide-mem in place · commit 47fcedc
+
+Driver 32.0.32029.2010. Debug test builds, as `cargo test` makes them.
+
+| Check | Result |
+| --- | --- |
+| 1 ms sleep, 1000 calls (`cargo test -p riptide-hle -- --nocapture`) | mean 1.512 ms, median 1.518 ms, worst 2.226 ms |
+| 1 ms sleep called by the stand-in title, 1000 calls | mean 1.507 ms |
+| Core layout (`cargo test -p riptide-hle --lib cores -- --nocapture`) | 8 physical cores; title mask 0x1555, Riptide mask 0xeaaa |
+| GPU and CPU see each other's writes in `riptide-mem`'s block (`cargo test -p riptide-mem --test gpu -- --ignored`) | passed |
+
+The 1 ms sleep is under the 2 ms the tests ask for, and half a millisecond over the 1 ms the console gives.
+
+Spread between runs of the probe: three runs of the probe that day gave 102 to 146 GiB/s for the video-to-video copy and 7,000 to 21,300 us for protecting 1 GiB. The other figures moved by less than 10 %.

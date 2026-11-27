@@ -15,9 +15,12 @@ pub const AUTO_RAM_BUDGET_MIB: u64 = 16 * 1024;
 pub const COMMIT_NEEDED_MIB: u64 = 16 * 1024;
 /// Less free space than this on the game's drive draws a warning, in MiB.
 pub const GAME_DRIVE_FREE_MIB: u64 = 2 * 1024;
-/// The graphics driver Riptide was last measured with, from `docs/measurements.md`. `None`
-/// until that file has its first entry; the driver check compares nothing until then.
-pub const MEASURED_DRIVER: Option<Driver> = None;
+/// The graphics driver Riptide was last measured with, from the newest entry in
+/// `docs/measurements.md`. Change it when a newer driver is measured.
+pub const MEASURED_DRIVER: Option<Driver> = Some(Driver {
+    vendor_id: VENDOR_AMD,
+    version: [32, 0, 32029, 2010],
+});
 
 /// PCI vendor numbers, for naming the make of a graphics card.
 const VENDOR_AMD: u32 = 0x1002;
@@ -365,11 +368,11 @@ mod tests {
         Machine {
             free_ram_mib: 24 * 1024,
             commit_headroom_mib: 40 * 1024,
-            gpu: Some("AMD Radeon RX 7900 XTX (driver 32.0.21025.1010)".into()),
+            gpu: Some("AMD Radeon RX 7900 XTX (driver 32.0.32029.2010)".into()),
             power_saver: Some(false),
             game_folder_exists: Some(true),
             runtime_present: true,
-            gpu_driver: Some(amd([32, 0, 21025, 1010])),
+            gpu_driver: Some(amd([32, 0, 32029, 2010])),
             game_drive: Some(Drive {
                 free_mib: 500 * 1024,
                 seek_penalty: Some(false),
@@ -577,8 +580,8 @@ mod tests {
             check(&judge_with(&unread, &s, measured), "gpu_driver").level,
             Level::Ok
         );
-        // Until docs/measurements.md has an entry, nothing is compared.
-        assert_eq!(MEASURED_DRIVER, None);
+        // The driver of the newest entry in docs/measurements.md.
+        assert_eq!(MEASURED_DRIVER, Some(amd([32, 0, 32029, 2010])));
     }
 
     #[test]
