@@ -149,6 +149,8 @@ One Cargo workspace:
 
 `cargo build-7800x3d` makes the release build for the target machine (`target-cpu=znver4`, with AVX-512, full link-time optimization). That build does not run on CPUs without Zen 4's instructions, so plain `cargo build` and `cargo test` stay portable.
 
+`docs/setup.md` lists what a machine needs to build and test Riptide.
+
 The launcher, its settings library and the preflight checks exist and are tested. Start the launcher with `cargo run -p riptide-launcher`. Everything else is still a design.
 
 ## Rules
