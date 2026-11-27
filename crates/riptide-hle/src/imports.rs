@@ -74,6 +74,7 @@ impl Imports {
     pub fn with_log(log: Log) -> Imports {
         let mut imports = Imports::empty(log);
         crate::timers::register(&mut imports);
+        crate::cores::register(&mut imports);
         imports
     }
 

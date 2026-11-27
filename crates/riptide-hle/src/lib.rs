@@ -1,9 +1,10 @@
 //! Console API implementations, and mapping title threads onto host cores.
 //!
 //! So far this crate holds the import table (what each function a title imports is bound to)
-//! and the title's sleeps and timed waits.
+//! the title's sleeps and timed waits, and title threads on their own cores.
 //! See README.md in this folder.
 
+pub mod cores;
 mod imports;
 mod stub;
 mod sys;
