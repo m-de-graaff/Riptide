@@ -56,6 +56,8 @@ A section that has been opened as a D3D12 heap stays charged against the commit 
 
 Checked on a small scale: two runs of `cargo test -p riptide-mem --test gpu -- --ignored`, which opens one 64 MiB block as a heap and exits, raised committed memory by 82 MiB and then 56 MiB.
 
+A reboot gives it back: 13.2 GiB committed afterwards, and the page file shrank again (commit limit 56.2 GiB).
+
 Not yet known: whether restarting the graphics driver gives the memory back without a reboot, whether the driver or Windows holds it, and whether sections the heap was never opened on are affected (the 14 GiB section whose heap open failed appears not to be: the total fits the heaps that did open).
 
 Spread between runs of the probe: three runs of the probe that day gave 102 to 146 GiB/s for the video-to-video copy and 7,000 to 21,300 us for protecting 1 GiB. The other figures moved by less than 10 %.

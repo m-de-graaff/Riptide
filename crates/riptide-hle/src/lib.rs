@@ -9,6 +9,7 @@ pub mod cores;
 pub mod dstorage;
 mod imports;
 pub mod process;
+pub mod runtime;
 pub mod saves;
 mod stub;
 mod sys;

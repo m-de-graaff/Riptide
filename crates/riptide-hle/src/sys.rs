@@ -47,6 +47,8 @@ unsafe extern "system" {
     pub fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
     pub fn LoadLibraryExA(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void;
     pub fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    pub fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
+    pub fn FreeLibrary(module: *mut c_void) -> i32;
     pub fn GetModuleHandleW(name: *const u16) -> *mut c_void;
     pub fn GetModuleHandleA(name: *const u8) -> *mut c_void;
     pub fn GetModuleFileNameW(module: *mut c_void, buffer: *mut u16, size: u32) -> u32;
