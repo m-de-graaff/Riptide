@@ -51,11 +51,13 @@ pub fn open(debug: bool) -> windows::core::Result<Gpu> {
         let mut adapters = Vec::new();
         let mut infos = Vec::new();
         let mut i = 0;
-        while let Ok(adapter) =
-            factory.EnumAdapterByGpuPreference::<IDXGIAdapter4>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+        while let Ok(adapter) = factory
+            .EnumAdapterByGpuPreference::<IDXGIAdapter4>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
         {
             let d = adapter.GetDesc3()?;
-            let name = String::from_utf16_lossy(&d.Description).trim_end_matches('\0').to_string();
+            let name = String::from_utf16_lossy(&d.Description)
+                .trim_end_matches('\0')
+                .to_string();
             infos.push(AdapterInfo {
                 name,
                 dedicated_video_memory: d.DedicatedVideoMemory as u64,
@@ -64,8 +66,9 @@ pub fn open(debug: bool) -> windows::core::Result<Gpu> {
             adapters.push(adapter);
             i += 1;
         }
-        let index = pick_adapter(&infos)
-            .ok_or_else(|| windows::core::Error::new(DXGI_ERROR_NOT_FOUND, "no hardware adapter"))?;
+        let index = pick_adapter(&infos).ok_or_else(|| {
+            windows::core::Error::new(DXGI_ERROR_NOT_FOUND, "no hardware adapter")
+        })?;
         let adapter = &adapters[index];
         let driver_version = adapter
             .CheckInterfaceSupport(&IDXGIDevice::IID)
@@ -78,7 +81,12 @@ pub fn open(debug: bool) -> windows::core::Result<Gpu> {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
         })?;
-        Ok(Gpu { info: infos[index].clone(), driver_version, device, queue })
+        Ok(Gpu {
+            info: infos[index].clone(),
+            driver_version,
+            device,
+            queue,
+        })
     }
 }
 
@@ -87,38 +95,59 @@ fn feature<T: Default>(gpu: &Gpu, id: D3D12_FEATURE) -> windows::core::Result<T>
     // SAFETY: `data` is a writable `T` and the size passed is exactly `size_of::<T>()`; each
     // caller pairs `id` with its matching D3D12_FEATURE_DATA_* type.
     unsafe {
-        gpu.device.CheckFeatureSupport(id, &mut data as *mut T as *mut _, std::mem::size_of::<T>() as u32)?;
+        gpu.device.CheckFeatureSupport(
+            id,
+            &mut data as *mut T as *mut _,
+            std::mem::size_of::<T>() as u32,
+        )?;
     }
     Ok(data)
 }
 
 pub fn query_features(gpu: &Gpu, facts: &mut Facts) {
-    match feature::<D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT>(gpu, D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT) {
+    match feature::<D3D12_FEATURE_DATA_GPU_VIRTUAL_ADDRESS_SUPPORT>(
+        gpu,
+        D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT,
+    ) {
         Ok(v) => {
             facts.va_bits_per_resource = v.MaxGPUVirtualAddressBitsPerResource;
             facts.va_bits_per_process = v.MaxGPUVirtualAddressBitsPerProcess;
         }
-        Err(e) => facts.notes.push(format!("GPU virtual address query failed ({e})")),
+        Err(e) => facts
+            .notes
+            .push(format!("GPU virtual address query failed ({e})")),
     }
     match feature::<D3D12_FEATURE_DATA_D3D12_OPTIONS16>(gpu, D3D12_FEATURE_D3D12_OPTIONS16) {
         Ok(o) => {
             facts.options16_known = true;
             facts.gpu_upload_heap_supported = o.GPUUploadHeapSupported.as_bool();
         }
-        Err(e) => facts.notes.push(format!("D3D12_OPTIONS16 query failed ({e}); the runtime may predate it")),
+        Err(e) => facts.notes.push(format!(
+            "D3D12_OPTIONS16 query failed ({e}); the runtime may predate it"
+        )),
     }
 }
 
-pub fn submit(gpu: &Gpu, record: impl FnOnce(&ID3D12GraphicsCommandList)) -> windows::core::Result<()> {
+pub fn submit(
+    gpu: &Gpu,
+    record: impl FnOnce(&ID3D12GraphicsCommandList),
+) -> windows::core::Result<()> {
     // SAFETY: the allocator and list outlive the submission because we wait on the fence
     // before returning; the list is closed before it is executed.
     unsafe {
-        let alloc: ID3D12CommandAllocator = gpu.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-        let list: ID3D12GraphicsCommandList =
-            gpu.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None::<&ID3D12PipelineState>)?;
+        let alloc: ID3D12CommandAllocator = gpu
+            .device
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let list: ID3D12GraphicsCommandList = gpu.device.CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            &alloc,
+            None::<&ID3D12PipelineState>,
+        )?;
         record(&list);
         list.Close()?;
-        gpu.queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
+        gpu.queue
+            .ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
         let fence: ID3D12Fence = gpu.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         gpu.queue.Signal(&fence, 1)?;
         while fence.GetCompletedValue() < 1 {
@@ -134,12 +163,20 @@ mod tests {
     use super::*;
 
     fn a(name: &str, mib: u64, software: bool) -> AdapterInfo {
-        AdapterInfo { name: name.into(), dedicated_video_memory: mib << 20, software }
+        AdapterInfo {
+            name: name.into(),
+            dedicated_video_memory: mib << 20,
+            software,
+        }
     }
 
     #[test]
     fn picks_largest_hardware_adapter() {
-        let list = [a("iGPU", 512, false), a("RX 7900 XTX", 24_560, false), a("Basic Render", 0, true)];
+        let list = [
+            a("iGPU", 512, false),
+            a("RX 7900 XTX", 24_560, false),
+            a("Basic Render", 0, true),
+        ];
         assert_eq!(pick_adapter(&list), Some(1));
     }
 

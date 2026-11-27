@@ -21,7 +21,9 @@ impl Drop for Section {
         // released exactly once, here. A heap opened on the section keeps the memory alive.
         unsafe {
             if !self.view.is_null() {
-                let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.view.cast() });
+                let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.view.cast(),
+                });
             }
             let _ = CloseHandle(self.handle);
         }
@@ -59,8 +61,13 @@ pub fn open(gpu: &Gpu, bytes: u64, flags: D3D12_RESOURCE_FLAGS) -> windows::core
             bytes as u32,
             PCWSTR::null(),
         )?;
-        let mut section = Section { handle, view: std::ptr::null_mut() };
-        section.view = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, bytes as usize).Value.cast();
+        let mut section = Section {
+            handle,
+            view: std::ptr::null_mut(),
+        };
+        section.view = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, bytes as usize)
+            .Value
+            .cast();
         if section.view.is_null() {
             return Err(windows::core::Error::from_thread());
         }
@@ -68,7 +75,14 @@ pub fn open(gpu: &Gpu, bytes: u64, flags: D3D12_RESOURCE_FLAGS) -> windows::core
         let heap: ID3D12Heap = device.OpenExistingHeapFromFileMapping(handle)?;
         let desc = buffer_desc(bytes, flags | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
         let mut buffer: Option<ID3D12Resource> = None;
-        gpu.device.CreatePlacedResource(&heap, 0, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)?;
+        gpu.device.CreatePlacedResource(
+            &heap,
+            0,
+            &desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut buffer,
+        )?;
         Ok(InPlace {
             view: section.view,
             bytes,
@@ -98,11 +112,16 @@ fn try_size(gpu: &Gpu, bytes: u64, facts: &mut Facts) -> bool {
     match open(gpu, bytes, D3D12_RESOURCE_FLAG_NONE).and_then(|mem| round_trip(gpu, &mem)) {
         Ok(true) => true,
         Ok(false) => {
-            facts.notes.push(format!("in-place {} GiB: data did not arrive intact", bytes / GIB));
+            facts.notes.push(format!(
+                "in-place {} GiB: data did not arrive intact",
+                bytes / GIB
+            ));
             false
         }
         Err(e) => {
-            facts.notes.push(format!("in-place {} GiB: {e}", bytes / GIB));
+            facts
+                .notes
+                .push(format!("in-place {} GiB: {e}", bytes / GIB));
             false
         }
     }

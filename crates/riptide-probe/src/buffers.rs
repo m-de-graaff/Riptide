@@ -10,7 +10,9 @@ pub const GIB: u64 = 1 << 30;
 
 /// Bytes that differ by position and by `salt`, to tell regions and runs apart.
 pub fn pattern(salt: u8, len: usize) -> Vec<u8> {
-    (0..len).map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8 ^ salt).collect()
+    (0..len)
+        .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8 ^ salt)
+        .collect()
 }
 
 pub fn buffer_desc(bytes: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DESC {
@@ -22,7 +24,10 @@ pub fn buffer_desc(bytes: u64, flags: D3D12_RESOURCE_FLAGS) -> D3D12_RESOURCE_DE
         DepthOrArraySize: 1,
         MipLevels: 1,
         Format: DXGI_FORMAT_UNKNOWN,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         Flags: flags,
     }
@@ -35,11 +40,21 @@ pub fn committed(
     flags: D3D12_RESOURCE_FLAGS,
     state: D3D12_RESOURCE_STATES,
 ) -> windows::core::Result<ID3D12Resource> {
-    let props = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
+    let props = D3D12_HEAP_PROPERTIES {
+        Type: heap,
+        ..Default::default()
+    };
     let mut r: Option<ID3D12Resource> = None;
     // SAFETY: valid descriptions and out-pointer.
     unsafe {
-        gpu.device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &buffer_desc(bytes, flags), state, None, &mut r)?
+        gpu.device.CreateCommittedResource(
+            &props,
+            D3D12_HEAP_FLAG_NONE,
+            &buffer_desc(bytes, flags),
+            state,
+            None,
+            &mut r,
+        )?
     };
     Ok(r.expect("CreateCommittedResource succeeded without a resource"))
 }
@@ -53,9 +68,20 @@ pub fn map(resource: &ID3D12Resource) -> windows::core::Result<*mut u8> {
 }
 
 /// Has the GPU copy `data` into `dst` at `offset`.
-pub fn upload(gpu: &Gpu, dst: &ID3D12Resource, offset: u64, data: &[u8]) -> windows::core::Result<()> {
+pub fn upload(
+    gpu: &Gpu,
+    dst: &ID3D12Resource,
+    offset: u64,
+    data: &[u8],
+) -> windows::core::Result<()> {
     let len = data.len() as u64;
-    let staging = committed(gpu, D3D12_HEAP_TYPE_UPLOAD, len, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+    let staging = committed(
+        gpu,
+        D3D12_HEAP_TYPE_UPLOAD,
+        len,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+    )?;
     let p = map(&staging)?;
     // SAFETY: `staging` maps `len` bytes and `data` holds exactly `len` bytes.
     unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len()) };
@@ -66,8 +92,19 @@ pub fn upload(gpu: &Gpu, dst: &ID3D12Resource, offset: u64, data: &[u8]) -> wind
 }
 
 /// Has the GPU copy `bytes` bytes of `src` at `offset` out to the CPU.
-pub fn read_back(gpu: &Gpu, src: &ID3D12Resource, offset: u64, bytes: u64) -> windows::core::Result<Vec<u8>> {
-    let out = committed(gpu, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
+pub fn read_back(
+    gpu: &Gpu,
+    src: &ID3D12Resource,
+    offset: u64,
+    bytes: u64,
+) -> windows::core::Result<Vec<u8>> {
+    let out = committed(
+        gpu,
+        D3D12_HEAP_TYPE_READBACK,
+        bytes,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+    )?;
     submit(gpu, |list| {
         // SAFETY: the caller guarantees `offset + bytes` lies inside `src`; `out` is `bytes` bytes.
         unsafe { list.CopyBufferRegion(&out, 0, src, offset, bytes) }

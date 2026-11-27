@@ -38,25 +38,46 @@ pub fn measure(dst: *mut u8, len: usize) -> (f64, f64) {
             reads.push(r);
         }
     }
-    (gib_per_s(len as u64, best(&writes)), gib_per_s(len as u64, best(&reads)))
+    (
+        gib_per_s(len as u64, best(&writes)),
+        gib_per_s(len as u64, best(&reads)),
+    )
 }
 
 pub fn check_bandwidth(gpu: &Gpu, facts: &mut Facts) {
     let mut cached = vec![0u8; CACHED_BYTES];
     let (w, r) = measure(cached.as_mut_ptr(), CACHED_BYTES);
-    facts.cpu_bandwidth.push(Bandwidth { memory: MemoryKind::CachedSystem, write_gib_s: w, read_gib_s: r });
+    facts.cpu_bandwidth.push(Bandwidth {
+        memory: MemoryKind::CachedSystem,
+        write_gib_s: w,
+        read_gib_s: r,
+    });
 
     if !facts.gpu_upload_heap_supported {
-        facts.notes.push("GPU upload heaps not reported as supported; Q5 not measured".into());
+        facts
+            .notes
+            .push("GPU upload heaps not reported as supported; Q5 not measured".into());
         return;
     }
-    let buffer = committed(gpu, D3D12_HEAP_TYPE_GPU_UPLOAD, UPLOAD_BYTES as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
+    let buffer = committed(
+        gpu,
+        D3D12_HEAP_TYPE_GPU_UPLOAD,
+        UPLOAD_BYTES as u64,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COMMON,
+    );
     match buffer.and_then(|b| Ok((map(&b)?, b))) {
         Ok((p, _buffer)) => {
             let (w, r) = measure(p, UPLOAD_BYTES);
-            facts.cpu_bandwidth.push(Bandwidth { memory: MemoryKind::GpuUpload, write_gib_s: w, read_gib_s: r });
+            facts.cpu_bandwidth.push(Bandwidth {
+                memory: MemoryKind::GpuUpload,
+                write_gib_s: w,
+                read_gib_s: r,
+            });
         }
-        Err(e) => facts.notes.push(format!("GPU upload buffer for bandwidth: {e}")),
+        Err(e) => facts
+            .notes
+            .push(format!("GPU upload buffer for bandwidth: {e}")),
     }
 }
 
@@ -78,7 +99,14 @@ mod tests {
         let mut facts = Facts::default();
         crate::device::query_features(&gpu, &mut facts);
         check_bandwidth(&gpu, &mut facts);
-        assert_eq!(facts.cpu_bandwidth.len(), if facts.gpu_upload_heap_supported { 2 } else { 1 });
+        assert_eq!(
+            facts.cpu_bandwidth.len(),
+            if facts.gpu_upload_heap_supported {
+                2
+            } else {
+                1
+            }
+        );
         eprintln!("{:#?} notes: {:?}", facts.cpu_bandwidth, facts.notes);
     }
 }

@@ -102,7 +102,10 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             question: "Q1",
             required: true,
             passed: f.in_place_14gib == Some(true),
-            detail: format!("1 GiB: {:?}, 14 GiB: {:?}", f.in_place_1gib, f.in_place_14gib),
+            detail: format!(
+                "1 GiB: {:?}, 14 GiB: {:?}",
+                f.in_place_1gib, f.in_place_14gib
+            ),
         },
         Check {
             id: "va_bits",
@@ -119,14 +122,20 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             question: "Q2",
             required: true,
             passed: f.in_place_reads_match == Some(true),
-            detail: format!("shader sums from in-place memory match video memory: {:?}", f.in_place_reads_match),
+            detail: format!(
+                "shader sums from in-place memory match video memory: {:?}",
+                f.in_place_reads_match
+            ),
         },
         Check {
             id: "in_place_uav",
             question: "Q3",
             required: false,
             passed: f.in_place_uav == Some(true),
-            detail: format!("shader write to in-place memory seen by the CPU: {:?}", f.in_place_uav),
+            detail: format!(
+                "shader write to in-place memory seen by the CPU: {:?}",
+                f.in_place_uav
+            ),
         },
         Check {
             id: "guard",
@@ -134,7 +143,10 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             required: true,
             passed: f.guard.is_some(),
             detail: match &f.guard {
-                Some(g) => format!("{:.2} us per fault, {:.0} us to protect 1 GiB", g.fault_us, g.protect_us_per_gib),
+                Some(g) => format!(
+                    "{:.2} us per fault, {:.0} us to protect 1 GiB",
+                    g.fault_us, g.protect_us_per_gib
+                ),
                 None => "not measured".to_string(),
             },
         },
@@ -143,7 +155,10 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             question: "Q4",
             required: false,
             passed: f.gpu_writes_bypass_guard == Some(true),
-            detail: format!("GPU write to a protected page landed without a fault: {:?}", f.gpu_writes_bypass_guard),
+            detail: format!(
+                "GPU write to a protected page landed without a fault: {:?}",
+                f.gpu_writes_bypass_guard
+            ),
         },
     ]
 }
@@ -155,7 +170,11 @@ pub fn all_required_pass(checks: &[Check]) -> bool {
 pub fn build(facts: Facts) -> Report {
     let checks = evaluate(&facts);
     let pass = all_required_pass(&checks);
-    Report { facts, checks, pass }
+    Report {
+        facts,
+        checks,
+        pass,
+    }
 }
 
 #[cfg(test)]
@@ -170,7 +189,10 @@ mod tests {
             in_place_14gib: Some(true),
             in_place_reads_match: Some(true),
             in_place_uav: Some(true),
-            guard: Some(GuardCost { fault_us: 2.0, protect_us_per_gib: 900.0 }),
+            guard: Some(GuardCost {
+                fault_us: 2.0,
+                protect_us_per_gib: 900.0,
+            }),
             gpu_writes_bypass_guard: Some(true),
             ..Facts::default()
         }
@@ -228,7 +250,11 @@ mod tests {
     #[test]
     fn report_serialises_snake_case_places() {
         let mut f = good();
-        f.gpu_copy.push(GpuCopy { from: Place::InPlaceRam, to: Place::Video, gib_s: 9.5 });
+        f.gpu_copy.push(GpuCopy {
+            from: Place::InPlaceRam,
+            to: Place::Video,
+            gib_s: 9.5,
+        });
         let json = serde_json::to_string(&build(f)).unwrap();
         assert!(json.contains("\"in_place_ram\""));
         assert!(json.contains("\"pass\":true"));
