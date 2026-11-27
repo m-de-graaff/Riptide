@@ -130,6 +130,8 @@ pub struct Tls {
     pub index_rva: u32,
     /// A null-terminated array of callback addresses, or `None`.
     pub callbacks_rva: Option<u32>,
+    /// The directory's characteristics, which hold the alignment each thread's block needs.
+    pub characteristics: u32,
 }
 
 /// A parsed PE32+ image file.
@@ -143,6 +145,8 @@ pub struct Image {
     pub header_size: u32,
     /// The entry point, as an offset into the mapped image. Zero if there is none.
     pub entry_rva: u32,
+    /// How much stack the image asks for on its first thread, in bytes.
+    pub stack_reserve: u64,
     pub sections: Vec<Section>,
     pub imports: Vec<ImportedModule>,
     /// Every 8-byte address in the image that moves with its base.
@@ -187,6 +191,7 @@ impl Image {
         file.get(optional, optional_size, "optional header")?;
         let entry_rva = file.u32(optional + 16, "optional header")?;
         let preferred_base = file.u64(optional + 24, "optional header")?;
+        let stack_reserve = file.u64(optional + 72, "optional header")?;
         let section_alignment = file.u32(optional + 32, "optional header")?;
         let size = file.u32(optional + 56, "optional header")?;
         let header_size = file.u32(optional + 60, "optional header")?;
@@ -259,6 +264,7 @@ impl Image {
             size,
             header_size,
             entry_rva,
+            stack_reserve,
             sections,
             imports: Vec::new(),
             relocations: Vec::new(),
@@ -503,6 +509,7 @@ impl<'a> Mapped<'a> {
         };
         let (start, end, index, callbacks) = (u64_at(0), u64_at(8), u64_at(16), u64_at(24));
         let zero_fill = u64_at(32) as u32;
+        let characteristics = (u64_at(32) >> 32) as u32;
 
         let template_size = end.checked_sub(start).ok_or(ParseError::Malformed(WHAT))?;
         let template_size =
@@ -530,6 +537,7 @@ impl<'a> Mapped<'a> {
             zero_fill,
             index_rva,
             callbacks_rva,
+            characteristics,
         })
     }
 }

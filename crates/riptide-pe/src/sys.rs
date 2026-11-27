@@ -59,6 +59,10 @@ unsafe extern "system" {
         old_protection: *mut u32,
     ) -> i32;
     pub fn GetCurrentProcess() -> *mut c_void;
+    #[cfg(test)]
+    pub fn GetCurrentThreadId() -> u32;
+    pub fn LoadLibraryW(name: *const u16) -> *mut c_void;
+    pub fn FreeLibrary(module: *mut c_void) -> i32;
     pub fn FlushInstructionCache(process: *mut c_void, address: *const c_void, size: usize) -> i32;
     pub fn RtlAddFunctionTable(table: *mut c_void, entry_count: u32, base: u64) -> u8;
     pub fn RtlDeleteFunctionTable(table: *const c_void) -> u8;

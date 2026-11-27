@@ -7,6 +7,7 @@
 //!
 //! See README.md in this folder for what is and is not built.
 
+mod carrier;
 mod fault;
 mod load;
 mod parse;

@@ -6,6 +6,7 @@ use std::fmt;
 use std::io;
 use std::ptr::NonNull;
 
+use crate::carrier::Carrier;
 use crate::fault;
 use crate::parse::{Image, ParseError, Symbol};
 use crate::sys;
@@ -55,6 +56,8 @@ pub enum LoadError {
     Malformed(&'static str),
     /// Windows would not take the image's unwind table.
     FunctionTable,
+    /// The carrier for the image's thread-local data could not be written or loaded.
+    ThreadLocal(io::Error),
 }
 
 impl fmt::Display for LoadError {
@@ -75,6 +78,9 @@ impl fmt::Display for LoadError {
             LoadError::NoEntryPoint => write!(f, "the image has no entry point"),
             LoadError::Malformed(what) => write!(f, "the mapped image's {what} is malformed"),
             LoadError::FunctionTable => write!(f, "Windows refused the image's unwind table"),
+            LoadError::ThreadLocal(error) => {
+                write!(f, "no thread-local data for the image: {error}")
+            }
         }
     }
 }
@@ -83,7 +89,9 @@ impl std::error::Error for LoadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             LoadError::Parse(error) => Some(error),
-            LoadError::Map(error) | LoadError::Protect(error) => Some(error),
+            LoadError::Map(error) | LoadError::Protect(error) | LoadError::ThreadLocal(error) => {
+                Some(error)
+            }
             _ => None,
         }
     }
@@ -164,6 +172,9 @@ impl Drop for Mapping {
 /// Dropping it unmaps the image. Nothing may still be running in it or pointing into it.
 pub struct LoadedImage {
     name: String,
+    /// What gives the image its thread-local data. Declared before `mapping` so that it is
+    /// dropped first: once it is gone no thread event reaches the image's callbacks.
+    _carrier: Option<Carrier>,
     mapping: Mapping,
     entry_rva: u32,
     tls_callbacks: Vec<usize>,
@@ -195,11 +206,6 @@ pub fn load(name: &str, bytes: &[u8], resolver: &dyn Resolver) -> Result<LoadedI
     }
     if image.has_delay_imports {
         return Err(LoadError::Unsupported("delay-loaded imports"));
-    }
-    if let Some(tls) = &image.tls
-        && (tls.template_size != 0 || tls.zero_fill != 0)
-    {
-        return Err(LoadError::Unsupported("thread-local data"));
     }
 
     // Ask the resolver for everything before mapping anything, so the error lists every
@@ -257,6 +263,23 @@ pub fn load(name: &str, bytes: &[u8], resolver: &dyn Resolver) -> Result<LoadedI
         None => Vec::new(),
     };
 
+    // Thread-local data. Windows gives a slot in each thread's TLS array only to images it
+    // loads itself, so a carrier it does load holds the image's template, and the image
+    // takes the carrier's index. See `carrier.rs`.
+    let carrier = match &image.tls {
+        Some(tls) => {
+            let start = tls.template_rva as usize;
+            let mut template = memory[start..start + tls.template_size as usize].to_vec();
+            template.resize(template.len() + tls.zero_fill as usize, 0);
+            let carrier =
+                Carrier::load(&template, tls.characteristics).map_err(LoadError::ThreadLocal)?;
+            let at = tls.index_rva as usize;
+            memory[at..at + 4].copy_from_slice(&carrier.index().to_le_bytes());
+            Some(carrier)
+        }
+        None => None,
+    };
+
     // From here the image is no longer written. Headers become read-only and each section
     // gets the protection it asks for.
     mapping.protect(0, header_size.max(1), sys::PAGE_READONLY)?;
@@ -303,8 +326,13 @@ pub fn load(name: &str, bytes: &[u8], resolver: &dyn Resolver) -> Result<LoadedI
     };
 
     fault::register(name, base, mapping.size);
+    // Only now, with the image whole, are thread starts and ends passed on to its callbacks.
+    if let Some(carrier) = &carrier {
+        carrier.serve(base, tls_callbacks.clone());
+    }
     Ok(LoadedImage {
         name: name.to_owned(),
+        _carrier: carrier,
         mapping,
         entry_rva: image.entry_rva,
         tls_callbacks,
