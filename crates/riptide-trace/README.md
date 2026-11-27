@@ -18,10 +18,12 @@ Frame timing and a per-stage cost ledger, so every other crate is measured from 
 
 **Summary.** `summarise(&frames)` gives the figures `docs/measurements.md` asks for: median frame time, 1% low (the mean of the slowest 1% of frames), median Riptide CPU time per frame, peak private memory, peak video memory, frames of 100 ms or more, and how many frames each cause was blamed for. It prints as text.
 
+**Readout.** `Readout::push(&frame, draws)` keeps the last 30 seconds of frames, and `readout.figures()` gives what the on-screen statistics window shows: frames a second and frame time as the mean over the last second, draw calls in the newest frame, the 1% low and the longest frame over the last 30 seconds, the newest 240 frame times for the graph, and the mean time per frame each cause held frames up for. `Figures` prints as the window's text lines. The window itself, and the machine's lines in it (graphics card, processor, memory), belong to `riptide-gpu` and `riptide`.
+
 ## Depends on
 
 Nothing in this workspace, and no other crates.
 
 ## Status
 
-Working: recording, attribution, the trace file and the summary, with tests on synthetic frames. No crate records into it yet. Recording and replaying guest command streams is not built; it waits for `riptide-gpu`, which defines those streams.
+Working: recording, attribution, the trace file, the summary and the readout's figures, with tests on synthetic frames. No crate records into it yet. Recording and replaying guest command streams is not built; it waits for `riptide-gpu`, which defines those streams.
