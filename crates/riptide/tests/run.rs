@@ -168,13 +168,6 @@ fn the_stand_in_title_starts_and_stops_at_its_first_unbuilt_import() {
         [&"unimplemented import standin_console.dll!StandInReport was called"],
         "{log}"
     );
-    // The crash location is in the log too.
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.starts_with("unhandled fault 0xe0524950")),
-        "{log}"
-    );
 }
 
 #[test]

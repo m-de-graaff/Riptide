@@ -5,14 +5,13 @@
 //! function it stands for and stops the title. It never returns a value, because any value
 //! would be a guess.
 
-use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sys;
 
-/// The exception a called stub raises. Bit 29 marks it as not one of Windows' own; the low
-/// bytes spell "RIP".
+/// The exit code a called stub ends the process with. Bit 29 marks it as not one of
+/// Windows' own; the low bytes spell "RIP".
 pub const UNIMPLEMENTED_IMPORT: u32 = 0xE052_4950;
 
 /// Receives one line for each stub the first time it is called.
@@ -170,21 +169,40 @@ impl Stubs {
 
 /// Where every stub jumps: names the import, once, and stops the title.
 ///
-/// It raises an exception that cannot be continued. Nothing handles it, so the process ends
-/// with [`UNIMPLEMENTED_IMPORT`] as its exit code.
+/// It ends the process with [`UNIMPLEMENTED_IMPORT`] as its exit code. It does not raise an
+/// exception: a title's own handler (a crash reporter around its main loop) could take one
+/// and carry on as if the call had returned.
 unsafe extern "system" fn unimplemented(entry: *const Entry) -> ! {
     // SAFETY: a stub passes the entry stored for it, which lives as long as the stub does.
-    unsafe { &*entry }.note_call();
-    // SAFETY: raising an exception with no arguments is always allowed.
-    unsafe {
-        sys::RaiseException(
-            UNIMPLEMENTED_IMPORT,
-            sys::EXCEPTION_NONCONTINUABLE,
-            0,
-            std::ptr::null::<c_void>().cast(),
-        )
-    };
-    // A handler cannot continue past the exception, but be certain.
+    let entry = unsafe { &*entry };
+    // A log that panics must not change how the process ends.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if entry.note_call() {
+            // A stub jumps here, so the first return address on the stack that lies in a
+            // loaded image is the title's: the instruction after its call. The frames
+            // before it are this function's own.
+            let mut frames = [std::ptr::null_mut::<std::ffi::c_void>(); 16];
+            // SAFETY: `frames` has room for the frames asked for.
+            let found = unsafe {
+                sys::RtlCaptureStackBackTrace(
+                    0,
+                    frames.len() as u32,
+                    frames.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            let place = frames[..usize::from(found).min(frames.len())]
+                .iter()
+                .find_map(|&frame| riptide_pe::describe(frame as usize));
+            // No title frame is on the stack when the title reached the import by a jump
+            // (a tail call) from a function Riptide called.
+            if let Some(place) = place {
+                (entry.log)(&format!("the call returns to {place}"));
+            }
+        }
+    }));
+    // SAFETY: ending this process is always allowed.
+    unsafe { sys::TerminateProcess(sys::GetCurrentProcess(), UNIMPLEMENTED_IMPORT) };
     std::process::abort()
 }
 

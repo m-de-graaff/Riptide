@@ -36,12 +36,16 @@ impl fmt::Display for Binding {
     }
 }
 
-/// A module name and a symbol in it. Module names compare without regard to case, as
-/// Windows compares them.
+/// A module name and a symbol in it. Module names compare as Windows compares them: without
+/// regard to case, and with `.dll` assumed when the name has no extension.
 type Key = (String, Symbol);
 
 fn key(module: &str, symbol: &Symbol) -> Key {
-    (module.to_ascii_lowercase(), symbol.clone())
+    let mut module = module.to_ascii_lowercase();
+    if !module.contains('.') {
+        module.push_str(".dll");
+    }
+    (module, symbol.clone())
 }
 
 /// The table of what every import is bound to. It is the [`Resolver`] `riptide-pe` binds a
@@ -109,7 +113,9 @@ impl Imports {
             .insert(key(module, &Symbol::Name(name.to_owned())));
     }
 
-    /// What `module`'s `symbol` is bound to. Asking changes nothing and runs nothing.
+    /// What `module`'s `symbol` is bound to. Asking runs nothing of the title's. For a
+    /// function passed through to the host it loads that Windows module, if it is not loaded
+    /// already, to see whether this Windows has the function.
     pub fn binding(&self, module: &str, symbol: &Symbol) -> Binding {
         let key = key(module, symbol);
         if self.riptide.contains_key(&key) {
@@ -180,11 +186,22 @@ fn host_address(module: &str, symbol: &Symbol) -> Option<usize> {
     let Symbol::Name(name) = symbol else {
         return None;
     };
+    // A bare module name only: a path would name a file of the title's choosing.
+    if module.contains(['/', '\\', ':']) {
+        return None;
+    }
     let module = CString::new(module).ok()?;
     let name = CString::new(name.as_str()).ok()?;
-    // SAFETY: both strings are null-terminated. Loading a module by name runs its
-    // initialisation, as it would for any program that imports it.
-    let handle = unsafe { sys::LoadLibraryA(module.as_ptr().cast()) };
+    // SAFETY: both strings are null-terminated. Loading a module runs its initialisation, as
+    // it would for any program that imports it; only Windows' own modules are looked for, so
+    // a file of the same name in the title's folder is never loaded.
+    let handle = unsafe {
+        sys::LoadLibraryExA(
+            module.as_ptr().cast(),
+            std::ptr::null_mut(),
+            sys::LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
     if handle.is_null() {
         return None;
     }
@@ -285,6 +302,8 @@ mod tests {
             imports.binding("console.dll", &Symbol::Ordinal(3)),
             Binding::Riptide
         );
+        // A module named without its extension is the same module.
+        assert_eq!(imports.binding("CONSOLE", &name("Built")), Binding::Riptide);
         // Function names keep their case.
         assert_eq!(
             imports.binding("console.dll", &name("built")),

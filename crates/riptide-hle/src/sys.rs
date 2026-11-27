@@ -11,7 +11,8 @@ pub const MEM_RELEASE: u32 = 0x8000;
 pub const PAGE_READWRITE: u32 = 0x04;
 pub const PAGE_EXECUTE_READ: u32 = 0x20;
 
-pub const EXCEPTION_NONCONTINUABLE: u32 = 0x1;
+/// Look for the module in Windows' own folder only, never beside the program or the title.
+pub const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
 
 /// Asks for a timer that fires when it says, not on the next timer tick. Windows 10 1803 on.
 pub const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x2;
@@ -37,8 +38,14 @@ unsafe extern "system" {
     ) -> i32;
     pub fn GetCurrentProcess() -> *mut c_void;
     pub fn FlushInstructionCache(process: *mut c_void, address: *const c_void, size: usize) -> i32;
-    pub fn RaiseException(code: u32, flags: u32, argument_count: u32, arguments: *const usize);
-    pub fn LoadLibraryA(name: *const u8) -> *mut c_void;
+    pub fn RtlCaptureStackBackTrace(
+        frames_to_skip: u32,
+        frames_to_capture: u32,
+        back_trace: *mut *mut c_void,
+        hash: *mut u32,
+    ) -> u16;
+    pub fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+    pub fn LoadLibraryExA(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void;
     pub fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     pub fn CreateWaitableTimerExW(
         attributes: *const c_void,

@@ -208,4 +208,11 @@ fn calling_a_stub_logs_its_name_once_and_fails() {
         ["riptide: unimplemented import standin_console.dll!StandInUnbuilt was called"],
         "{stderr}"
     );
+    // Where in the title the call was made is named too.
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("riptide: the call returns to stand-in-title.exe+0x")),
+        "{stderr}"
+    );
 }
