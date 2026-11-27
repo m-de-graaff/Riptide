@@ -1,15 +1,19 @@
-//! The GPU reads bytes the CPU wrote to title memory, and the CPU reads bytes the GPU wrote
-//! (decision D1). Needs a GPU, so it is ignored by default:
+//! The GPU reads bytes the CPU wrote to title memory, and the CPU reads bytes the GPU wrote,
+//! in place (decisions M1 and M3). Needs a GPU, so it is ignored by default:
 //!
 //!     cargo test -p riptide-mem --test gpu -- --ignored
 
-use riptide_mem::{PAGE, TitleMemory};
+use riptide_mem::{Access, BANK_BYTES, FRAME, Limits, TitleMemory};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
 use windows::core::{IUnknown, Interface, Result};
 
-const MIB: u64 = 1 << 20;
+const ANYWHERE: Limits = Limits {
+    lowest: 0x1_0000_0000,
+    highest: (1 << 40) - 1,
+    alignment: 0,
+};
 
 struct Gpu {
     device: ID3D12Device,
@@ -79,95 +83,99 @@ fn staging(gpu: &Gpu, heap: D3D12_HEAP_TYPE, bytes: u64) -> Result<(ID3D12Resour
     } else {
         D3D12_RESOURCE_STATE_COPY_DEST
     };
-    let props = D3D12_HEAP_PROPERTIES {
-        Type: heap,
-        ..Default::default()
-    };
-    let mut resource: Option<ID3D12Resource> = None;
-    let mut p = std::ptr::null_mut();
-    // SAFETY: valid descriptions and out-pointers; a buffer has one subresource.
+    // SAFETY: valid descriptors and out-pointers; the buffer stays mapped while it lives.
     unsafe {
+        let mut buffer: Option<ID3D12Resource> = None;
         gpu.device.CreateCommittedResource(
-            &props,
+            &D3D12_HEAP_PROPERTIES {
+                Type: heap,
+                ..Default::default()
+            },
             D3D12_HEAP_FLAG_NONE,
             &desc,
             state,
             None,
-            &mut resource,
+            &mut buffer,
         )?;
-        let resource = resource.expect("CreateCommittedResource succeeded without a resource");
-        resource.Map(0, None, Some(&mut p))?;
-        Ok((resource, p.cast()))
+        let buffer = buffer.expect("CreateCommittedResource succeeded without a resource");
+        let mut mapped = std::ptr::null_mut();
+        buffer.Map(0, None, Some(&mut mapped))?;
+        Ok((buffer, mapped.cast()))
     }
 }
 
 fn pattern(salt: u8, len: usize) -> Vec<u8> {
     (0..len)
-        .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8 ^ salt)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(salt))
         .collect()
 }
 
 #[test]
-#[ignore = "needs a D3D12 GPU"]
-fn the_gpu_and_the_cpu_see_each_others_writes_at_the_converted_offset() {
+#[ignore = "needs a GPU"]
+fn the_gpu_and_the_cpu_see_each_others_writes_where_the_page_table_says() {
+    const BYTES: usize = 64 * 1024;
     let gpu = open().unwrap();
-    let mem = TitleMemory::create(64 * MIB).unwrap();
-    let map = mem.address_map();
-    let heap = mem
-        .open_heap(&gpu.device, D3D12_RESOURCE_FLAG_NONE)
+    let memory = TitleMemory::new(BANK_BYTES);
+
+    // Physical pages mapped at two addresses: the CPU writes through one of them.
+    let range = memory.reserve(64 * FRAME, ANYWHERE).unwrap();
+    let frames = memory.allocate_frames(4).unwrap();
+    let (first, second) = (range + 4 * FRAME, range + 40 * FRAME);
+    memory
+        .map_frames(first, &frames, Access::ReadWrite)
         .unwrap();
-    let len = 16 * PAGE;
+    memory
+        .map_frames(second, &frames, Access::ReadWrite)
+        .unwrap();
+    // And committed memory, for the GPU to write into.
+    let pool = memory
+        .commit(None, 4 * FRAME, ANYWHERE, Access::ReadWrite)
+        .unwrap();
 
-    // Two allocations away from the start of the block, so a wrong offset shows.
-    mem.reserve(None, 3 * MIB).unwrap();
-    let written_by_cpu = mem.allocate(len).unwrap();
-    let written_by_gpu = mem.allocate(len).unwrap();
-    assert_ne!(map.offset(written_by_cpu), 0);
+    let heap = memory
+        .open_heap(0, &gpu.device, D3D12_RESOURCE_FLAG_NONE)
+        .unwrap();
 
-    // The CPU writes through the title's address; the GPU copies out from the offset.
-    let from_cpu = pattern(0x11, len as usize);
-    // SAFETY: `len` committed bytes at an address this test owns.
-    unsafe { std::slice::from_raw_parts_mut(written_by_cpu as *mut u8, len as usize) }
-        .copy_from_slice(&from_cpu);
-    let (readback, p) = staging(&gpu, D3D12_HEAP_TYPE_READBACK, len).unwrap();
+    // CPU to GPU: written through the second address, found through the first.
+    let from_cpu = pattern(0x11, BYTES);
+    // SAFETY: `second + FRAME` is mapped read-write for at least `BYTES`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(from_cpu.as_ptr(), (second + FRAME) as *mut u8, BYTES);
+    }
+    let place = memory.locate(first + FRAME, BYTES as u64).unwrap();
+    assert_eq!(place.len(), 1, "one frame is one part of one bank");
+    let (readback, read_at) = staging(&gpu, D3D12_HEAP_TYPE_READBACK, BYTES as u64).unwrap();
     submit(&gpu, |list| {
-        // SAFETY: both ranges lie inside their buffers.
-        unsafe {
-            list.CopyBufferRegion(&readback, 0, &heap.buffer, map.offset(written_by_cpu), len)
-        }
+        // SAFETY: both buffers hold the ranges copied.
+        unsafe { list.CopyBufferRegion(&readback, 0, &heap.buffer, place[0].offset, BYTES as u64) }
     })
     .unwrap();
-    // SAFETY: `readback` maps `len` bytes, all written by the finished copy.
-    let seen_by_gpu = unsafe { std::slice::from_raw_parts(p, len as usize) }.to_vec();
+    // SAFETY: the readback buffer is mapped for `BYTES`.
+    let seen_by_gpu = unsafe { std::slice::from_raw_parts(read_at, BYTES) };
     assert!(
         seen_by_gpu == from_cpu,
-        "the GPU did not read what the CPU wrote"
+        "the GPU did not see the CPU's bytes"
     );
 
-    // The GPU copies in at the offset; the CPU reads through the title's address.
-    let from_gpu = pattern(0x22, len as usize);
-    let (upload, p) = staging(&gpu, D3D12_HEAP_TYPE_UPLOAD, len).unwrap();
-    // SAFETY: `upload` maps `len` writable bytes.
-    unsafe { std::ptr::copy_nonoverlapping(from_gpu.as_ptr(), p, len as usize) };
+    // GPU to CPU: written at the pool's place in its bank, read at its address.
+    let from_gpu = pattern(0x22, BYTES);
+    let (upload, write_at) = staging(&gpu, D3D12_HEAP_TYPE_UPLOAD, BYTES as u64).unwrap();
+    // SAFETY: the upload buffer is mapped for `BYTES`.
+    unsafe { std::ptr::copy_nonoverlapping(from_gpu.as_ptr(), write_at, BYTES) };
+    let place = memory.locate(pool + 2 * FRAME, BYTES as u64).unwrap();
     submit(&gpu, |list| {
-        // SAFETY: both ranges lie inside their buffers.
-        unsafe { list.CopyBufferRegion(&heap.buffer, map.offset(written_by_gpu), &upload, 0, len) }
+        // SAFETY: both buffers hold the ranges copied.
+        unsafe { list.CopyBufferRegion(&heap.buffer, place[0].offset, &upload, 0, BYTES as u64) }
     })
     .unwrap();
-    // SAFETY: `len` committed bytes at an address this test owns.
-    let seen_by_cpu =
-        unsafe { std::slice::from_raw_parts(written_by_gpu as *const u8, len as usize) };
+    // SAFETY: `pool + 2 * FRAME` is mapped for at least `BYTES`.
+    let seen_by_cpu = unsafe { std::slice::from_raw_parts((pool + 2 * FRAME) as *const u8, BYTES) };
     assert!(
-        seen_by_cpu == from_gpu.as_slice(),
-        "the CPU did not read what the GPU wrote"
+        seen_by_cpu == from_gpu,
+        "the CPU did not see the GPU's bytes"
     );
 
-    // The neighbouring allocation is untouched by the GPU's write.
-    // SAFETY: as above.
-    let neighbour =
-        unsafe { std::slice::from_raw_parts(written_by_cpu as *const u8, len as usize) };
-    assert!(
-        neighbour == from_cpu.as_slice(),
-        "the GPU's write landed in the wrong place"
-    );
+    // The heap goes before the memory it lies on.
+    drop(heap);
+    drop(memory);
 }

@@ -1,19 +1,29 @@
-//! The title's memory: one committed block of RAM that is also a D3D12 heap, its allocator,
-//! write guards, and console-to-host address conversion. See README.md in this folder.
+//! The title's memory: banks of RAM the GPU uses in place, the frames they are made of, the
+//! title's addresses and what is mapped at them, write guards and the RAM budget.
+//!
+//! The design is `docs/design/2026-11-27-title-memory.md` (decisions M1 to M8). See
+//! README.md in this folder for the interface.
 
-mod block;
 mod budget;
+mod frames;
 mod guard;
-mod pages;
+mod os;
+mod space;
 
 pub use budget::{Pressure, RamBudget, RamUse, free_ram};
-pub use pages::{GRANULARITY, MemError, PAGE, Region, State};
+pub use frames::{BANK_BYTES, BANK_FRAMES, FRAME, FrameRun};
+pub use guard::PAGE;
+pub use os::Limits;
+pub use space::Located;
 
-use block::Block;
-use pages::PageMap;
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
+
+use frames::Frames;
+use os::Section;
+use space::Space;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
     D3D12_RESOURCE_FLAGS, D3D12_RESOURCE_STATE_COMMON, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
@@ -22,189 +32,461 @@ use windows::Win32::Graphics::Direct3D12::{
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
 use windows::core::Interface;
 
-/// Where title memory lies. Copy it to wherever addresses are converted; a shader gets `base`
-/// as a constant.
+/// Why a memory call failed. `riptide-hle` turns these into the console's error codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AddressMap {
-    pub base: u64,
-    pub size: u64,
+pub enum MemError {
+    /// The address is not in a reservation, or not in the state the call needs.
+    InvalidAddress,
+    /// A size or a frame number that cannot be right.
+    InvalidParameter,
+    /// No frames are left under the limit this title memory was made with.
+    OutOfMemory,
+    /// Windows refused, with this error code.
+    Os(u32),
 }
 
-impl AddressMap {
-    /// The offset in the one buffer of a title address: one subtraction (decision D2).
-    /// An address outside title memory gives an offset of `size` or more.
-    #[inline]
-    pub const fn offset(&self, address: u64) -> u64 {
-        address.wrapping_sub(self.base)
-    }
-
-    /// The offset of `address`, or `None` if it is outside title memory.
-    #[inline]
-    pub const fn checked_offset(&self, address: u64) -> Option<u64> {
-        let offset = self.offset(address);
-        if offset < self.size {
-            Some(offset)
-        } else {
-            None
+impl std::fmt::Display for MemError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MemError::InvalidAddress => write!(f, "the address is not usable for this call"),
+            MemError::InvalidParameter => write!(f, "a size or frame number is not valid"),
+            MemError::OutOfMemory => write!(f, "title memory is used up"),
+            MemError::Os(code) => write!(f, "Windows refused with error {code}"),
         }
     }
+}
 
-    /// The title address of an offset in the buffer.
-    #[inline]
-    pub const fn address(&self, offset: u64) -> u64 {
-        self.base.wrapping_add(offset)
+impl std::error::Error for MemError {}
+
+impl From<std::io::Error> for MemError {
+    fn from(error: std::io::Error) -> Self {
+        MemError::Os(error.raw_os_error().unwrap_or(0) as u32)
     }
 }
 
-/// Title memory opened for the GPU: the heap over the block, and the one buffer over all of
-/// it. Offset `n` of the buffer is the byte at title address `base + n`.
+/// How the CPU may reach mapped memory. The GPU reaches all of it regardless.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    ReadWrite,
+    ReadOnly,
+    None,
+}
+
+impl Access {
+    fn protection(self) -> u32 {
+        match self {
+            Access::ReadWrite => os::PAGE_READWRITE,
+            Access::ReadOnly => os::PAGE_READONLY,
+            Access::None => os::PAGE_NOACCESS,
+        }
+    }
+}
+
+/// A bank opened for the GPU: a D3D12 heap over the bank's RAM and one buffer over all of
+/// it. Offset `n` of the buffer is byte `n` of the bank.
 pub struct InPlaceHeap {
     pub heap: ID3D12Heap,
     pub buffer: ID3D12Resource,
 }
 
-/// All of a title's memory, and the allocator its memory calls go through.
+struct State {
+    frames: Frames,
+    /// One section per bank, in bank order.
+    sections: Vec<Section>,
+    space: Space,
+    /// Frames that have been handed out before. A bank's frames start as zeros; one that has
+    /// been used holds whatever it was left with, and is zeroed before it is handed out again.
+    used: BTreeSet<u32>,
+    /// Frames the title holds as physical pages. It frees them itself; unmapping does not.
+    held: BTreeSet<u32>,
+    /// Frames the title has freed that are still mapped somewhere. They go back when the
+    /// last mapping does.
+    leaving: BTreeSet<u32>,
+}
+
+/// All of a title's memory.
 ///
-/// A title's addresses are host addresses inside the block: the title's code runs natively
-/// and uses them as pointers. Pages are inaccessible until committed, as on the console.
+/// A title's addresses are host addresses: its code runs natively and uses them as pointers.
+/// Every [`InPlaceHeap`] opened on it must be dropped before it is.
 pub struct TitleMemory {
-    block: Block,
-    map: Mutex<PageMap>,
-    /// How many bytes are committed right now. Only changed while holding `map`.
-    committed: AtomicU64,
+    id: u64,
+    max_banks: usize,
+    state: Mutex<State>,
+    discard_failures: AtomicU64,
 }
 
 impl Drop for TitleMemory {
     fn drop(&mut self) {
-        guard::forget(self.span());
+        guard::forget(self.id);
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while let Some(start) = state.space.first_reservation() {
+            // A failure leaves address space reserved, which harms nothing.
+            if state.space.release(start, &state.sections).is_err() {
+                break;
+            }
+        }
     }
 }
 
+/// Groups frame numbers into runs of consecutive frames in one bank, in the order given.
+fn runs_of(frames: &[u32]) -> Vec<FrameRun> {
+    let mut runs: Vec<FrameRun> = Vec::new();
+    for &frame in frames {
+        match runs.last_mut() {
+            Some(run)
+                if run.first + run.count == frame
+                    && frame / BANK_FRAMES == run.first / BANK_FRAMES =>
+            {
+                run.count += 1;
+            }
+            _ => runs.push(FrameRun {
+                first: frame,
+                count: 1,
+            }),
+        }
+    }
+    runs
+}
+
 impl TitleMemory {
-    /// Creates a block of `bytes`, a non-zero multiple of [`GRANULARITY`]. All of it is
-    /// charged against the page file; `MemError::Os` carries Windows' reason if it will not fit.
-    pub fn create(bytes: u64) -> Result<TitleMemory, MemError> {
-        if bytes == 0 || !bytes.is_multiple_of(GRANULARITY) {
-            return Err(MemError::InvalidParameter);
+    /// Title memory that may grow to `max_bytes` of frames, rounded up to whole banks. No
+    /// bank is made until memory is first asked for.
+    pub fn new(max_bytes: u64) -> TitleMemory {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        TitleMemory {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            max_banks: max_bytes.div_ceil(BANK_BYTES) as usize,
+            state: Mutex::new(State {
+                frames: Frames::new(),
+                sections: Vec::new(),
+                space: Space::new(),
+                used: BTreeSet::new(),
+                held: BTreeSet::new(),
+                leaving: BTreeSet::new(),
+            }),
+            discard_failures: AtomicU64::new(0),
         }
-        Ok(TitleMemory {
-            block: Block::create(bytes)?,
-            map: Mutex::new(PageMap::new(bytes)),
-            committed: AtomicU64::new(0),
-        })
     }
 
-    pub fn address_map(&self) -> AddressMap {
-        AddressMap {
-            base: self.block.base(),
-            size: self.block.bytes(),
-        }
-    }
-
-    fn offset(&self, address: u64) -> Result<u64, MemError> {
-        self.address_map()
-            .checked_offset(address)
-            .ok_or(MemError::InvalidAddress)
-    }
-
-    fn map(&self) -> MutexGuard<'_, PageMap> {
-        // The map is changed in single steps, so it is whole even after a panic elsewhere.
-        self.map
+    fn state(&self) -> MutexGuard<'_, State> {
+        // Each call changes the state in steps that leave it whole.
+        self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// Reserves `size` bytes of addresses and returns where they start. With `address`, the
-    /// reservation starts there, rounded down to [`GRANULARITY`]; without, at the lowest free
-    /// place. Reserved pages stay inaccessible until committed.
-    pub fn reserve(&self, address: Option<u64>, size: u64) -> Result<u64, MemError> {
-        let at = address.map(|a| self.offset(a)).transpose()?;
-        let range = self.map().reserve(at, size)?;
-        Ok(self.block.base() + range.start)
-    }
-
-    /// Commits the pages covering `size` bytes at `address`, which must lie inside one
-    /// reservation, and returns the first page's address. New pages read as zero; pages
-    /// already committed keep their bytes.
-    pub fn commit(&self, address: u64, size: u64) -> Result<u64, MemError> {
-        let at = self.offset(address)?;
-        let mut map = self.map();
-        let (range, runs) = map.commit(at, size)?;
-        // The map already says every run is committed, so the count follows the map and
-        // every run is opened, whatever happens to one of them. The first failure is
-        // returned once all are done.
-        let mut result = Ok(());
-        for run in runs {
-            let bytes = run.range.end - run.range.start;
-            self.committed.fetch_add(bytes, Ordering::Relaxed);
-            let opened = self.block.open(run.range, run.stale);
-            result = result.and(opened);
+    /// Takes `count` frames, making banks as needed (decision M6).
+    fn take(&self, state: &mut State, count: u32) -> Result<Vec<FrameRun>, MemError> {
+        let max_banks = self.max_banks;
+        let mut refused = None;
+        let State {
+            frames, sections, ..
+        } = state;
+        let runs = frames.allocate(count, |frames| {
+            if frames.banks() >= max_banks {
+                return false;
+            }
+            match Section::create(BANK_BYTES) {
+                Ok(section) => {
+                    sections.push(section);
+                    frames.add_bank();
+                    true
+                }
+                Err(error) => {
+                    refused = Some(MemError::from(error));
+                    false
+                }
+            }
+        });
+        let runs = runs.ok_or(refused.unwrap_or(MemError::OutOfMemory))?;
+        for run in &runs {
+            for frame in run.first..run.first + run.count {
+                if !state.used.insert(frame) {
+                    let one = FrameRun {
+                        first: frame,
+                        count: 1,
+                    };
+                    // SAFETY: the frame was free, so nothing but the anchor maps it.
+                    unsafe { state.sections[one.bank()].zero(one.offset(), FRAME) };
+                }
+            }
         }
-        result?;
-        Ok(self.block.base() + range.start)
+        Ok(runs)
     }
 
-    /// Reserves and commits `size` bytes at the lowest free place.
-    pub fn allocate(&self, size: u64) -> Result<u64, MemError> {
-        let address = self.reserve(None, size)?;
-        match self.commit(address, size) {
-            Ok(_) => Ok(address),
-            Err(e) => {
-                let _ = self.release(address);
-                Err(e)
+    /// Gives frames back: their RAM returns to Windows at once (decision M8).
+    fn give_back(&self, state: &mut State, run: FrameRun) {
+        // SAFETY: the caller found the run unmapped everywhere, so only the anchor holds it.
+        let discarded = unsafe { state.sections[run.bank()].discard(run.offset(), run.bytes()) };
+        if !discarded {
+            self.discard_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        state.frames.free(run);
+    }
+
+    /// Deals with frames that have just been unmapped at `range`: ends the guards there,
+    /// and gives back every frame that is no longer mapped anywhere and that the title does
+    /// not hold as a physical page.
+    fn unmapped(&self, state: &mut State, range: Range<u64>, runs: Vec<FrameRun>) {
+        guard::end_overlapping(self.id, range);
+        for run in runs {
+            for frame in run.first..run.first + run.count {
+                let one = FrameRun {
+                    first: frame,
+                    count: 1,
+                };
+                if state.space.is_mapped(one) {
+                    continue;
+                }
+                if state.leaving.remove(&frame) || !state.held.contains(&frame) {
+                    self.give_back(state, one);
+                }
             }
         }
     }
 
-    /// Decommits the pages covering `size` bytes at `address`, which must lie inside one
-    /// reservation. A `size` of zero means the whole reservation that starts at `address`.
-    /// The pages become inaccessible and read as zero when committed again.
-    pub fn decommit(&self, address: u64, size: u64) -> Result<(), MemError> {
-        let at = self.offset(address)?;
-        let mut map = self.map();
-        let mut result = Ok(());
-        for run in map.decommit(at, size)? {
-            result = result.and(self.give_back(run));
-        }
-        result
+    /// Reserves `bytes` of addresses inside `limits`. Nothing is mapped there yet.
+    pub fn reserve(&self, bytes: u64, limits: Limits) -> Result<u64, MemError> {
+        self.state()
+            .space
+            .reserve(bytes.next_multiple_of(FRAME), limits)
     }
 
-    /// Frees the reservation that starts at `address`, decommitting whatever is committed.
+    /// Commits memory: takes frames and maps them. With `address`, at that address, which
+    /// must lie in a reservation; without, in a new reservation inside `limits`. Returns
+    /// where the memory starts. It reads as zero. Sizes are rounded up to whole frames.
+    pub fn commit(
+        &self,
+        address: Option<u64>,
+        bytes: u64,
+        limits: Limits,
+        access: Access,
+    ) -> Result<u64, MemError> {
+        if bytes == 0 {
+            return Err(MemError::InvalidParameter);
+        }
+        let mut state = self.state();
+        let (start, fresh) = match address {
+            Some(address) => (address / FRAME * FRAME, false),
+            None => (
+                state.space.reserve(bytes.next_multiple_of(FRAME), limits)?,
+                true,
+            ),
+        };
+        let end = address.unwrap_or(start) + bytes;
+        let count = u32::try_from((end.next_multiple_of(FRAME) - start) / FRAME)
+            .map_err(|_| MemError::InvalidParameter)?;
+        let runs = self.take(&mut state, count)?;
+        let mut at = start;
+        for (index, &run) in runs.iter().enumerate() {
+            let State {
+                space, sections, ..
+            } = &mut *state;
+            match space.map(at, run, sections, access.protection()) {
+                Ok(displaced) => self.unmapped(&mut state, at..at + run.bytes(), displaced),
+                Err(error) => {
+                    // Undo: what was mapped so far, the frames not yet mapped, the addresses.
+                    let State {
+                        space, sections, ..
+                    } = &mut *state;
+                    let mapped = space
+                        .unmap(start..at.max(start + FRAME), sections)
+                        .unwrap_or_default();
+                    self.unmapped(&mut state, start..at, mapped);
+                    for &left in &runs[index..] {
+                        state.frames.free(left);
+                    }
+                    if fresh {
+                        let State {
+                            space, sections, ..
+                        } = &mut *state;
+                        let _ = space.release(start, sections);
+                    }
+                    return Err(error);
+                }
+            }
+            at += run.bytes();
+        }
+        Ok(start)
+    }
+
+    /// Takes away what is mapped in `bytes` at `address` (whole frames). Frames the title
+    /// does not hold as physical pages go back to Windows.
+    pub fn unmap(&self, address: u64, bytes: u64) -> Result<(), MemError> {
+        let range = address / FRAME * FRAME..(address + bytes).next_multiple_of(FRAME);
+        let mut state = self.state();
+        let State {
+            space, sections, ..
+        } = &mut *state;
+        let removed = space.unmap(range.clone(), sections)?;
+        self.unmapped(&mut state, range, removed);
+        Ok(())
+    }
+
+    /// Gives back the reservation that starts at `address`, and what is mapped in it.
     pub fn release(&self, address: u64) -> Result<(), MemError> {
-        let at = self.offset(address)?;
-        let mut map = self.map();
-        let mut result = Ok(());
-        for run in map.release(at)?.1 {
-            result = result.and(self.give_back(run));
+        let mut state = self.state();
+        let bytes = state
+            .space
+            .reservation(address)
+            .ok_or(MemError::InvalidAddress)?;
+        let State {
+            space, sections, ..
+        } = &mut *state;
+        let removed = space.release(address, sections)?;
+        self.unmapped(&mut state, address..address + bytes, removed);
+        Ok(())
+    }
+
+    /// Hands the title `count` frames as physical pages, by number. They are mapped with
+    /// [`TitleMemory::map_frames`] and stay the title's until [`TitleMemory::free_frames`].
+    pub fn allocate_frames(&self, count: u32) -> Result<Vec<u32>, MemError> {
+        let mut state = self.state();
+        let runs = self.take(&mut state, count)?;
+        let frames: Vec<u32> = runs
+            .iter()
+            .flat_map(|run| run.first..run.first + run.count)
+            .collect();
+        state.held.extend(&frames);
+        Ok(frames)
+    }
+
+    /// Takes physical pages back. One that is still mapped stays readable there and goes
+    /// back to Windows when its last mapping does.
+    pub fn free_frames(&self, frames: &[u32]) -> Result<(), MemError> {
+        let mut state = self.state();
+        if frames.iter().any(|frame| !state.held.contains(frame)) {
+            return Err(MemError::InvalidParameter);
         }
-        result
+        for &frame in frames {
+            state.held.remove(&frame);
+            let one = FrameRun {
+                first: frame,
+                count: 1,
+            };
+            if state.space.is_mapped(one) {
+                state.leaving.insert(frame);
+            } else {
+                self.give_back(&mut state, one);
+            }
+        }
+        Ok(())
     }
 
-    /// Takes committed pages, given as offsets, away from the title: ends their guards,
-    /// gives their RAM back to Windows and makes them inaccessible.
+    /// Maps physical pages at `address`, one after another, in place of what is mapped
+    /// there. A frame may be mapped at several addresses at once.
+    pub fn map_frames(&self, address: u64, frames: &[u32], access: Access) -> Result<(), MemError> {
+        if !address.is_multiple_of(FRAME) {
+            return Err(MemError::InvalidAddress);
+        }
+        let mut state = self.state();
+        if frames.iter().any(|frame| !state.held.contains(frame)) {
+            return Err(MemError::InvalidParameter);
+        }
+        let mut at = address;
+        for run in runs_of(frames) {
+            let State {
+                space, sections, ..
+            } = &mut *state;
+            let displaced = space.map(at, run, sections, access.protection())?;
+            self.unmapped(&mut state, at..at + run.bytes(), displaced);
+            at += run.bytes();
+        }
+        Ok(())
+    }
+
+    /// Where in the banks `bytes` at `address` lie (decision M4), or `None` if any of it is
+    /// not mapped. One part means the range can be used by the GPU where it is; several
+    /// mean it has to be copied (decision M5).
+    pub fn locate(&self, address: u64, bytes: u64) -> Option<Vec<Located>> {
+        self.state().space.locate(address, bytes)
+    }
+
+    /// Write-protects the pages of `bytes` at `address`, at every address their frames are
+    /// mapped at, and guards them for `resource`, a number of the caller's choosing
+    /// (decisions D3, D4 and M7).
     ///
-    /// The map already says the pages are decommitted, so the count follows the map even if
-    /// Windows refuses to close them.
-    fn give_back(&self, run: Range<u64>) -> Result<(), MemError> {
-        let bytes = run.end - run.start;
-        self.end_guards(&run);
-        self.committed.fetch_sub(bytes, Ordering::Relaxed);
-        self.block.close(run)
+    /// The first write to any of those pages, through any of those addresses, takes the
+    /// protection off all of them, puts `resource` in the list [`TitleMemory::take_written`]
+    /// returns, and then goes on as if nothing had happened. Reads are never disturbed.
+    ///
+    /// Pages are protected whole. A write beside the resource but on one of its pages ends
+    /// the guard too: it is reported as written though it was not, which costs a copy and
+    /// never a wrong picture. Guard a resource before copying it, not after.
+    pub fn guard(&self, address: u64, bytes: u64, resource: u64) -> Result<(), MemError> {
+        if bytes == 0 {
+            return Err(MemError::InvalidParameter);
+        }
+        let state = self.state();
+        let parts = state
+            .space
+            .locate(address, bytes)
+            .ok_or(MemError::InvalidAddress)?;
+        let mut pages = Vec::new();
+        for part in parts {
+            let first = part.bank as u32 * BANK_FRAMES + (part.offset / FRAME) as u32;
+            let last =
+                part.bank as u32 * BANK_FRAMES + ((part.offset + part.bytes - 1) / FRAME) as u32;
+            let run = FrameRun {
+                first,
+                count: last - first + 1,
+            };
+            for (view, view_first) in state.space.views_of(run) {
+                // The part's bytes as addresses in this view.
+                let view_offset = u64::from(view_first % BANK_FRAMES) * FRAME;
+                let from = part.offset.max(view_offset);
+                let to = (part.offset + part.bytes).min(view_offset + (view.end - view.start));
+                if from < to {
+                    let at = view.start + (from - view_offset);
+                    pages.push(guard::pages_of(&(at..at + (to - from))));
+                }
+            }
+        }
+        // Holding the state keeps the mappings in place until the guard stands.
+        if guard::guard(self.id, resource, pages) {
+            Ok(())
+        } else {
+            Err(MemError::InvalidParameter)
+        }
     }
 
-    /// How often Windows refused to give decommitted pages' RAM back. The pages were zeroed
-    /// instead and their RAM stayed in use. Not zero means decommitting frees nothing on
-    /// this machine, which the RAM budget has to know.
-    pub fn discard_failures(&self) -> u64 {
-        self.block.discard_failures()
+    /// Ends the guard for `resource` without reporting it as written. Returns whether it
+    /// was guarded: false if a write, or an unmapping, ended the guard first.
+    pub fn unguard(&self, resource: u64) -> bool {
+        guard::unguard(self.id, resource)
     }
 
-    /// How many bytes of title memory are committed right now.
+    /// The resources whose guard was ended by a write, or by their pages being unmapped,
+    /// since the last call. Each appears once, in the order it first happened.
+    pub fn take_written(&self) -> Vec<u64> {
+        guard::take_written(self.id)
+    }
+
+    /// How many resources are guarded right now.
+    pub fn guard_count(&self) -> usize {
+        guard::count(self.id)
+    }
+
+    /// How many bytes of frames are handed out right now.
     pub fn committed_bytes(&self) -> u64 {
-        self.committed.load(Ordering::Relaxed)
+        self.state().frames.in_use() * FRAME
     }
 
-    /// The RAM this process uses now: title memory that is committed, and everything else
+    /// How many banks have been made.
+    pub fn bank_count(&self) -> usize {
+        self.state().sections.len()
+    }
+
+    /// How often Windows refused to give freed frames' RAM back. Their RAM stayed in use
+    /// until they were handed out again.
+    pub fn discard_failures(&self) -> u64 {
+        self.discard_failures.load(Ordering::Relaxed)
+    }
+
+    /// The RAM this process uses now: title memory that is handed out, and everything else
     /// the process has allocated. This is what the RAM budget is held against.
     pub fn ram_use(&self) -> RamUse {
         RamUse {
@@ -222,104 +504,28 @@ impl TitleMemory {
         }
     }
 
-    /// The block's addresses.
-    fn span(&self) -> Range<u64> {
-        let base = self.block.base();
-        base..base + self.block.bytes()
-    }
-
-    /// Ends the guards on pages that are about to be decommitted, given as offsets.
-    fn end_guards(&self, run: &Range<u64>) {
-        let base = self.block.base();
-        guard::end_overlapping(base, base + run.start..base + run.end);
-    }
-
-    /// Write-protects the pages covering `size` bytes at `address` and guards them for
-    /// `resource`, a number of the caller's choosing (decisions D3 and D4).
-    ///
-    /// The first write to any of those pages takes the protection off all of them, puts
-    /// `resource` in the list [`TitleMemory::take_written`] returns, and then goes on as if
-    /// nothing had happened. Reads are never disturbed.
-    ///
-    /// Pages are protected whole. A write beside the resource but on one of its pages ends
-    /// the guard too: it is reported as written though it was not, which costs a copy and
-    /// never a wrong picture. Two resources that share a page are both reported.
-    ///
-    /// Every page has to be committed. `resource` may be guarded once at a time.
-    pub fn guard(&self, address: u64, size: u64, resource: u64) -> Result<(), MemError> {
-        if size == 0 {
-            return Err(MemError::InvalidParameter);
-        }
-        let start = self.offset(address)?;
-        let end = start
-            .checked_add(size)
-            .filter(|&end| end <= self.block.bytes())
-            .ok_or(MemError::InvalidAddress)?;
-        // Holding the map keeps the pages committed until they are guarded.
-        let map = self.map();
-        let mut at = start;
-        while at < end {
-            let region = map.query(at)?;
-            if region.state != State::Committed {
-                return Err(MemError::InvalidAddress);
-            }
-            at = region.base + region.size;
-        }
-        let base = self.block.base();
-        if guard::guard(self.span(), resource, base + start..base + end) {
-            Ok(())
-        } else {
-            Err(MemError::InvalidParameter)
-        }
-    }
-
-    /// Ends the guard for `resource` and makes its pages writable again, without reporting
-    /// it as written. Returns whether it was guarded: false if a write, or a decommit,
-    /// ended the guard first.
-    pub fn unguard(&self, resource: u64) -> bool {
-        guard::unguard(self.block.base(), resource)
-    }
-
-    /// The resources whose guard was ended by a write, or by their pages being decommitted,
-    /// since the last call. Each appears once, in the order it first happened.
-    ///
-    /// Guard a resource before copying it, not after: a write between the copy and the
-    /// guard is never heard of. A report says a guard of that resource ended; if the
-    /// resource has been guarded again since, the new guard may still stand.
-    pub fn take_written(&self) -> Vec<u64> {
-        guard::take_written(self.block.base())
-    }
-
-    /// How many resources are guarded right now.
-    pub fn guard_count(&self) -> usize {
-        guard::count(self.block.base())
-    }
-
-    /// The run of pages around `address` that share one state.
-    pub fn query(&self, address: u64) -> Result<Region, MemError> {
-        let base = self.block.base();
-        let region = self.map().query(self.offset(address)?)?;
-        Ok(Region {
-            base: base + region.base,
-            allocation_base: region.allocation_base.map(|a| base + a),
-            ..region
-        })
-    }
-
-    /// Opens the block as a D3D12 heap with one buffer over all of it (decision D1).
+    /// Opens bank `bank` for the GPU (decision M1): a heap on the bank's RAM, opened from
+    /// its address, with one buffer over all of it.
     ///
     /// `flags` are added to `ALLOW_CROSS_ADAPTER`, which a buffer in such a heap must have.
-    /// The GPU reads and writes every page of the block, committed or not: page protection
-    /// applies to the CPU only.
+    /// The GPU reads and writes every byte of the bank, mapped or not: page protection
+    /// applies to the CPU only. The heap must be dropped before this title memory is.
     pub fn open_heap(
         &self,
+        bank: usize,
         device: &ID3D12Device,
         flags: D3D12_RESOURCE_FLAGS,
     ) -> windows::core::Result<InPlaceHeap> {
+        let anchor = self
+            .state()
+            .sections
+            .get(bank)
+            .map(Section::anchor)
+            .ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG))?;
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Alignment: 0,
-            Width: self.block.bytes(),
+            Width: BANK_BYTES,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
@@ -331,12 +537,12 @@ impl TitleMemory {
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             Flags: flags | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
         };
-        // SAFETY: the section handle is valid while `self` lives, and the heap keeps the
-        // section's memory alive after that. `desc` and the out-pointer are valid.
+        // SAFETY: the anchor view stays mapped for as long as `self` lives, and the caller
+        // drops the heap first. `desc` and the out-pointer are valid.
         unsafe {
             let heap: ID3D12Heap = device
                 .cast::<ID3D12Device3>()?
-                .OpenExistingHeapFromFileMapping(self.block.handle())?;
+                .OpenExistingHeapFromAddress(anchor.cast())?;
             let mut buffer: Option<ID3D12Resource> = None;
             device.CreatePlacedResource(
                 &heap,
@@ -357,189 +563,198 @@ impl TitleMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::System::Memory::{
-        MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE, VirtualQuery,
-    };
 
     const MIB: u64 = 1 << 20;
+    const ANYWHERE: Limits = Limits {
+        lowest: 0x1_0000_0000,
+        highest: (1 << 40) - 1,
+        alignment: 0,
+    };
 
-    fn memory() -> TitleMemory {
-        TitleMemory::create(64 * MIB).unwrap()
+    fn write(address: u64, value: u8) {
+        // SAFETY: every caller passes an address it has just mapped read-write.
+        unsafe { (address as *mut u8).write_volatile(value) }
     }
 
-    /// What Windows says the protection of the page at `address` is.
-    fn protection(address: u64) -> u32 {
-        let mut info = MEMORY_BASIC_INFORMATION::default();
-        // SAFETY: `info` is a valid out-pointer of the size passed.
-        let written = unsafe {
-            VirtualQuery(
-                Some(address as *const _),
-                &mut info,
-                size_of::<MEMORY_BASIC_INFORMATION>(),
-            )
+    fn read(address: u64) -> u8 {
+        // SAFETY: every caller passes an address it has just mapped.
+        unsafe { (address as *const u8).read_volatile() }
+    }
+
+    #[test]
+    fn frame_numbers_are_grouped_into_runs() {
+        assert_eq!(
+            runs_of(&[5, 6, 7, 9, 10, 3]),
+            [
+                FrameRun { first: 5, count: 3 },
+                FrameRun { first: 9, count: 2 },
+                FrameRun { first: 3, count: 1 }
+            ]
+        );
+        // Consecutive numbers across two banks are two runs.
+        assert_eq!(runs_of(&[BANK_FRAMES - 1, BANK_FRAMES]).len(), 2);
+    }
+
+    #[test]
+    fn committed_memory_is_usable_inside_its_limits_and_counted() {
+        let memory = TitleMemory::new(4 * BANK_BYTES);
+        let low = Limits {
+            lowest: 0x1_0000,
+            highest: u64::from(u32::MAX),
+            alignment: 0,
         };
-        assert_ne!(written, 0);
-        info.Protect.0
-    }
+        let at = memory
+            .commit(None, 3 * MIB, low, Access::ReadWrite)
+            .unwrap();
+        assert!(at + 3 * MIB - 1 <= u64::from(u32::MAX));
+        assert_eq!(read(at), 0);
+        write(at, 1);
+        write(at + 3 * MIB - 1, 2);
+        assert_eq!((read(at), read(at + 3 * MIB - 1)), (1, 2));
+        assert_eq!(memory.committed_bytes(), 3 * MIB);
+        assert_eq!(memory.bank_count(), 1);
 
-    fn bytes<'a>(address: u64, len: u64) -> &'a mut [u8] {
-        // SAFETY: each test passes a range it has committed and keeps to itself.
-        unsafe { std::slice::from_raw_parts_mut(address as *mut u8, len as usize) }
+        // One part: the GPU could use it where it is.
+        let parts = memory.locate(at, 3 * MIB).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            (parts[0].address, parts[0].bank, parts[0].bytes),
+            (at, 0, 3 * MIB)
+        );
+
+        memory.release(at).unwrap();
+        assert_eq!(memory.committed_bytes(), 0);
+        assert_eq!(memory.locate(at, 1), None);
     }
 
     #[test]
-    fn block_size_must_be_a_non_zero_multiple_of_64k() {
-        assert_eq!(
-            TitleMemory::create(0).err(),
-            Some(MemError::InvalidParameter)
-        );
-        assert_eq!(
-            TitleMemory::create(MIB + PAGE).err(),
-            Some(MemError::InvalidParameter)
-        );
-    }
-
-    #[test]
-    fn address_conversion_is_one_subtraction() {
-        let map = AddressMap {
-            base: 0x7ff0_0000_0000,
-            size: 14 << 30,
+    fn an_alignment_is_kept() {
+        let memory = TitleMemory::new(BANK_BYTES);
+        let aligned = Limits {
+            alignment: 2 * MIB,
+            ..ANYWHERE
         };
-        assert_eq!(map.offset(0x7ff0_0000_1234), 0x1234);
-        assert_eq!(map.address(0x1234), 0x7ff0_0000_1234);
-        assert_eq!(map.checked_offset(map.base), Some(0));
+        let at = memory
+            .commit(None, 4 * MIB, aligned, Access::ReadWrite)
+            .unwrap();
+        assert_eq!(at % (2 * MIB), 0);
+        assert!(at >= ANYWHERE.lowest);
+    }
+
+    #[test]
+    fn physical_pages_map_where_the_title_says_and_at_two_addresses_at_once() {
+        let memory = TitleMemory::new(BANK_BYTES);
+        let range = memory.reserve(64 * FRAME, ANYWHERE).unwrap();
+        let frames = memory.allocate_frames(4).unwrap();
+        assert_eq!(memory.locate(range, FRAME), None);
+
+        memory
+            .map_frames(range + 8 * FRAME, &frames, Access::ReadWrite)
+            .unwrap();
+        // The same pages again, elsewhere and in another order.
+        let again = [frames[2], frames[0]];
+        memory
+            .map_frames(range + 32 * FRAME, &again, Access::ReadWrite)
+            .unwrap();
+
+        write(range + 8 * FRAME + 5, 0xA5);
+        assert_eq!(read(range + 33 * FRAME + 5), 0xA5);
+        write(range + 32 * FRAME + 9, 0x5A);
+        assert_eq!(read(range + 10 * FRAME + 9), 0x5A);
+
+        // Four frames in a row are one part; the two out of order are two.
         assert_eq!(
-            map.checked_offset(map.base + map.size - 1),
-            Some(map.size - 1)
-        );
-        // Outside, below and above: the unchecked offset is out of range, the checked one refuses.
-        assert_eq!(map.checked_offset(map.base + map.size), None);
-        assert_eq!(map.checked_offset(map.base - 1), None);
-        assert!(map.offset(map.base - 1) >= map.size);
-    }
-
-    #[test]
-    fn title_addresses_are_host_addresses_inside_the_block() {
-        let mem = memory();
-        let map = mem.address_map();
-        let a = mem.allocate(MIB).unwrap();
-        assert_eq!(map.checked_offset(a), Some(0));
-        bytes(a, 4).copy_from_slice(&[1, 2, 3, 4]);
-        assert_eq!(bytes(map.address(2), 2), &[3, 4]);
-    }
-
-    #[test]
-    fn pages_are_inaccessible_until_committed_and_again_after_decommit() {
-        let mem = memory();
-        let a = mem.reserve(None, MIB).unwrap();
-        assert_eq!(protection(a), PAGE_NOACCESS.0);
-        assert_eq!(mem.query(a).unwrap().state, State::Reserved);
-
-        assert_eq!(mem.commit(a + PAGE + 100, 10), Ok(a + PAGE));
-        assert_eq!(protection(a), PAGE_NOACCESS.0);
-        assert_eq!(protection(a + PAGE), PAGE_READWRITE.0);
-        assert_eq!(protection(a + 2 * PAGE), PAGE_NOACCESS.0);
-
-        mem.decommit(a + PAGE, PAGE).unwrap();
-        assert_eq!(protection(a + PAGE), PAGE_NOACCESS.0);
-    }
-
-    #[test]
-    fn committed_pages_read_as_zero_also_after_a_decommit() {
-        let mem = memory();
-        let a = mem.allocate(4 * PAGE).unwrap();
-        assert!(bytes(a, 4 * PAGE).iter().all(|b| *b == 0));
-        bytes(a, 4 * PAGE).fill(0xAB);
-
-        mem.decommit(a + PAGE, 2 * PAGE).unwrap();
-        mem.commit(a, 4 * PAGE).unwrap();
-        // The pages that stayed committed keep their bytes; the two that came back are zero.
-        assert!(bytes(a, PAGE).iter().all(|b| *b == 0xAB));
-        assert!(bytes(a + PAGE, 2 * PAGE).iter().all(|b| *b == 0));
-        assert!(bytes(a + 3 * PAGE, PAGE).iter().all(|b| *b == 0xAB));
-    }
-
-    #[test]
-    fn a_released_range_is_inaccessible_free_and_zero_when_used_again() {
-        let mem = memory();
-        let a = mem.allocate(MIB).unwrap();
-        bytes(a, MIB).fill(0xCD);
-        mem.release(a).unwrap();
-        assert_eq!(protection(a), PAGE_NOACCESS.0);
-        assert_eq!(mem.query(a).unwrap().state, State::Free);
-        assert_eq!(mem.release(a), Err(MemError::InvalidAddress));
-
-        let again = mem.allocate(MIB).unwrap();
-        assert_eq!(again, a);
-        assert!(bytes(again, MIB).iter().all(|b| *b == 0));
-    }
-
-    #[test]
-    fn a_reservation_at_an_address_starts_there() {
-        let mem = memory();
-        let base = mem.address_map().base;
-        assert_eq!(mem.reserve(Some(base + 8 * MIB), MIB), Ok(base + 8 * MIB));
-        assert_eq!(
-            mem.reserve(Some(base + 8 * MIB), MIB),
-            Err(MemError::InvalidAddress)
+            memory.locate(range + 8 * FRAME, 4 * FRAME).unwrap().len(),
+            1
         );
         assert_eq!(
-            mem.reserve(Some(base - PAGE), MIB),
-            Err(MemError::InvalidAddress)
+            memory.locate(range + 32 * FRAME, 2 * FRAME).unwrap().len(),
+            2
         );
-        assert_eq!(
-            mem.reserve(Some(base + 64 * MIB), MIB),
-            Err(MemError::InvalidAddress)
-        );
+        // A range that runs into unmapped addresses is not located at all.
+        assert_eq!(memory.locate(range + 8 * FRAME, 5 * FRAME), None);
     }
 
     #[test]
-    fn query_reports_addresses() {
-        // As on Windows, the run starts at the page asked about, not at the start of its state.
-        let mem = memory();
-        let a = mem.reserve(None, MIB).unwrap();
-        mem.commit(a, 2 * PAGE).unwrap();
-        assert_eq!(
-            mem.query(a + PAGE),
-            Ok(Region {
-                base: a + PAGE,
-                allocation_base: Some(a),
-                size: PAGE,
-                state: State::Committed
-            })
-        );
-    }
-
-    #[test]
-    fn threads_allocate_side_by_side_without_sharing_a_range() {
-        let mem = memory();
-        let mut all: Vec<u64> = std::thread::scope(|scope| {
-            let threads: Vec<_> = (0..8)
-                .map(|t| {
-                    let mem = &mem;
-                    scope.spawn(move || {
-                        (0..16)
-                            .map(|_| {
-                                let a = mem.allocate(GRANULARITY).unwrap();
-                                bytes(a, GRANULARITY).fill(t);
-                                a
-                            })
-                            .collect::<Vec<u64>>()
-                    })
-                })
-                .collect();
-            threads
-                .into_iter()
-                .flat_map(|t| t.join().unwrap())
-                .collect()
-        });
-        all.sort_unstable();
-        all.dedup();
-        assert_eq!(all.len(), 8 * 16);
-        // Each range still holds one thread's byte throughout.
-        for a in all {
-            let range = bytes(a, GRANULARITY);
-            assert!(range.iter().all(|b| *b == range[0]));
+    fn unmapping_the_middle_keeps_the_rest_and_the_pages_keep_their_bytes() {
+        let memory = TitleMemory::new(BANK_BYTES);
+        let range = memory.reserve(16 * FRAME, ANYWHERE).unwrap();
+        let frames = memory.allocate_frames(6).unwrap();
+        memory
+            .map_frames(range, &frames, Access::ReadWrite)
+            .unwrap();
+        for index in 0..6 {
+            write(range + index * FRAME, index as u8 + 1);
         }
+        memory.unmap(range + 2 * FRAME, 2 * FRAME).unwrap();
+        assert_eq!((read(range), read(range + FRAME)), (1, 2));
+        assert_eq!((read(range + 4 * FRAME), read(range + 5 * FRAME)), (5, 6));
+        assert_eq!(memory.locate(range + 2 * FRAME, FRAME), None);
+
+        // The title still holds the pages, so mapping them again shows what they held.
+        memory
+            .map_frames(range + 10 * FRAME, &frames[2..4], Access::ReadWrite)
+            .unwrap();
+        assert_eq!((read(range + 10 * FRAME), read(range + 11 * FRAME)), (3, 4));
+        assert_eq!(memory.committed_bytes(), 6 * FRAME);
+    }
+
+    #[test]
+    fn freed_pages_go_back_when_their_last_mapping_does_and_read_as_zero_next_time() {
+        let memory = TitleMemory::new(BANK_BYTES);
+        let range = memory.reserve(8 * FRAME, ANYWHERE).unwrap();
+        let frames = memory.allocate_frames(2).unwrap();
+        memory
+            .map_frames(range, &frames, Access::ReadWrite)
+            .unwrap();
+        write(range, 9);
+
+        memory.free_frames(&frames).unwrap();
+        // Still mapped, so still there and still counted.
+        assert_eq!(read(range), 9);
+        assert_eq!(memory.committed_bytes(), 2 * FRAME);
+        memory.unmap(range, 2 * FRAME).unwrap();
+        assert_eq!(memory.committed_bytes(), 0);
+        assert_eq!(memory.discard_failures(), 0);
+
+        // The same frames come out again, empty.
+        let next = memory.allocate_frames(2).unwrap();
+        assert_eq!(next, frames);
+        memory.map_frames(range, &next, Access::ReadWrite).unwrap();
+        assert_eq!(read(range), 0);
+        // A page the title does not hold cannot be freed or mapped.
+        assert_eq!(
+            memory.free_frames(&[12345]),
+            Err(MemError::InvalidParameter)
+        );
+        assert_eq!(
+            memory.map_frames(range, &[12345], Access::ReadWrite),
+            Err(MemError::InvalidParameter)
+        );
+    }
+
+    #[test]
+    fn committed_memory_gives_its_frames_back_when_unmapped() {
+        let memory = TitleMemory::new(BANK_BYTES);
+        let at = memory
+            .commit(None, 8 * FRAME, ANYWHERE, Access::ReadWrite)
+            .unwrap();
+        write(at + 3 * FRAME, 7);
+        memory.unmap(at + 2 * FRAME, 4 * FRAME).unwrap();
+        assert_eq!(memory.committed_bytes(), 4 * FRAME);
+        // Committing there again gives zeroed memory.
+        memory
+            .commit(Some(at + 2 * FRAME), 4 * FRAME, ANYWHERE, Access::ReadWrite)
+            .unwrap();
+        assert_eq!(read(at + 3 * FRAME), 0);
+        assert_eq!(memory.committed_bytes(), 8 * FRAME);
+    }
+
+    #[test]
+    fn the_limit_is_kept() {
+        let memory = TitleMemory::new(BANK_BYTES);
+        assert!(memory.allocate_frames(BANK_FRAMES - 1).is_ok());
+        assert_eq!(memory.allocate_frames(1), Err(MemError::OutOfMemory));
+        assert_eq!(memory.bank_count(), 1);
     }
 }

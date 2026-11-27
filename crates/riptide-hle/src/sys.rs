@@ -134,41 +134,9 @@ impl Default for SYSTEM_INFO {
     }
 }
 
-/// `MEM_ADDRESS_REQUIREMENTS`: where `VirtualAlloc2` may place memory.
-#[repr(C)]
-pub struct MEM_ADDRESS_REQUIREMENTS {
-    pub lowest_starting_address: *mut c_void,
-    pub highest_ending_address: *mut c_void,
-    pub alignment: usize,
-}
-
-/// `MEM_EXTENDED_PARAMETER` holding a pointer: its type in the low bits of the first word.
-#[repr(C)]
-pub struct MEM_EXTENDED_PARAMETER {
-    pub kind: u64,
-    pub pointer: *mut c_void,
-}
-
-/// `MemExtendedParameterAddressRequirements`.
-pub const MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS: u64 = 1;
-
 #[link(name = "kernel32")]
 unsafe extern "system" {
     pub fn GetSystemInfo(info: *mut SYSTEM_INFO);
-}
-
-// `VirtualAlloc2` has no entry in kernel32's import library; it lives in kernelbase.
-#[link(name = "kernelbase", kind = "raw-dylib")]
-unsafe extern "system" {
-    pub fn VirtualAlloc2(
-        process: *mut c_void,
-        base: *mut c_void,
-        size: usize,
-        allocation_type: u32,
-        protection: u32,
-        parameters: *mut MEM_EXTENDED_PARAMETER,
-        parameter_count: u32,
-    ) -> *mut c_void;
 }
 
 unsafe extern "C" {
