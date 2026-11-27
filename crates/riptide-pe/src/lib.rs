@@ -12,6 +12,6 @@ mod load;
 mod parse;
 mod sys;
 
-pub use fault::{describe, report_unhandled_faults};
+pub use fault::{describe, report_unhandled_faults, report_unhandled_faults_to};
 pub use load::{LoadError, LoadedImage, Resolver, load};
 pub use parse::{Image, Import, ImportedModule, ParseError, Section, Symbol, Tls};

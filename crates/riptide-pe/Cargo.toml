@@ -10,3 +10,6 @@ publish = false
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+riptide-testkit = { path = "../riptide-testkit" }

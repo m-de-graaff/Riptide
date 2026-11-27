@@ -1578,9 +1578,13 @@ dependencies = [
 name = "riptide"
 version = "0.0.0"
 dependencies = [
+ "riptide-config",
  "riptide-gpu",
  "riptide-hle",
+ "riptide-log",
  "riptide-pe",
+ "riptide-preflight",
+ "riptide-testkit",
  "riptide-trace",
 ]
 
@@ -1612,6 +1616,7 @@ version = "0.0.0"
 dependencies = [
  "riptide-mem",
  "riptide-pe",
+ "riptide-testkit",
  "riptide-trace",
 ]
 
@@ -1641,6 +1646,9 @@ dependencies = [
 [[package]]
 name = "riptide-pe"
 version = "0.0.0"
+dependencies = [
+ "riptide-testkit",
+]
 
 [[package]]
 name = "riptide-preflight"
@@ -1661,6 +1669,10 @@ dependencies = [
 
 [[package]]
 name = "riptide-shader"
+version = "0.0.0"
+
+[[package]]
+name = "riptide-testkit"
 version = "0.0.0"
 
 [[package]]
