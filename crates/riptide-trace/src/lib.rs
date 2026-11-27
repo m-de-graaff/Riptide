@@ -1,11 +1,16 @@
 //! Frame timing and a per-stage cost ledger, so every other crate is measured from day one.
 //! See README.md in this folder.
 //!
-//! Three parts:
+//! Four parts:
 //! - [`Ledger`] and [`Recorder`]: other crates record named stages; [`Ledger::end_frame`]
 //!   turns what was recorded into a [`Frame`] with its [`Cause`].
 //! - [`TraceWriter`] and [`read`]: the trace file, one line per frame.
 //! - [`summarise`]: the figures `docs/measurements.md` asks for.
+//! - [`Readout`]: the rolling figures of the on-screen statistics window.
+
+mod readout;
+
+pub use readout::{Figures, GRAPH_FRAMES, NOW_WINDOW, RECENT_WINDOW, Readout};
 
 use std::cell::Cell;
 use std::fmt;

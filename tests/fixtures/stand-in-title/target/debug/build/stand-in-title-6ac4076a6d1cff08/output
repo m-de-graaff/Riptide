@@ -1,0 +1,3 @@
+cargo:rustc-link-arg-bins=/ENTRY:title_entry
+cargo:rustc-link-arg-bins=/NODEFAULTLIB
+cargo:rustc-link-arg-bins=/SUBSYSTEM:CONSOLE
