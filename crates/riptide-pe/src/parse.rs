@@ -14,6 +14,7 @@ const SECTION_EXECUTE: u32 = 0x2000_0000;
 const SECTION_READ: u32 = 0x4000_0000;
 const SECTION_WRITE: u32 = 0x8000_0000;
 
+const DIRECTORY_EXPORT: usize = 0;
 const DIRECTORY_IMPORT: usize = 1;
 const DIRECTORY_EXCEPTION: usize = 3;
 const DIRECTORY_BASE_RELOCATION: usize = 5;
@@ -25,6 +26,8 @@ const RELOCATION_DIR64: u8 = 10;
 
 /// The longest module or function name accepted.
 const MAX_NAME: u32 = 4096;
+/// More exported names than this is taken as a corrupt export table.
+const MAX_EXPORTS: u32 = 1 << 16;
 /// More sections than this is taken as a corrupt header. The format allows 96.
 const MAX_SECTIONS: usize = 96;
 
@@ -148,6 +151,9 @@ pub struct Image {
     /// How much stack the image asks for on its first thread, in bytes.
     pub stack_reserve: u64,
     pub sections: Vec<Section>,
+    /// What the image exports by name: each name with where it is in the mapped image.
+    /// Names forwarded to another module are left out.
+    pub exports: Vec<(String, u32)>,
     pub imports: Vec<ImportedModule>,
     /// Every 8-byte address in the image that moves with its base.
     pub relocations: Vec<u32>,
@@ -266,6 +272,7 @@ impl Image {
             entry_rva,
             stack_reserve,
             sections,
+            exports: Vec::new(),
             imports: Vec::new(),
             relocations: Vec::new(),
             relocatable: characteristics & RELOCS_STRIPPED == 0,
@@ -288,6 +295,10 @@ impl Image {
             file,
             image: &image,
         };
+        let exports = match directory(DIRECTORY_EXPORT)? {
+            Some((rva, length)) => mapped.exports(rva, length)?,
+            None => Vec::new(),
+        };
         let imports = match directory(DIRECTORY_IMPORT)? {
             Some((rva, _)) => mapped.imports(rva)?,
             None => Vec::new(),
@@ -306,6 +317,7 @@ impl Image {
             }
             image.exception_table = Some((rva, length));
         }
+        image.exports = exports;
         image.imports = imports;
         image.relocations = relocations;
         image.tls = tls;
@@ -497,6 +509,36 @@ impl<'a> Mapped<'a> {
             rest = &rest[block_size..];
         }
         Ok(relocations)
+    }
+
+    /// The export directory's named functions and data.
+    fn exports(&self, directory_rva: u32, length: u32) -> Result<Vec<(String, u32)>, ParseError> {
+        const WHAT: &str = "export table";
+        let name_count = self.u32(directory_rva + 24, WHAT)?;
+        let function_count = self.u32(directory_rva + 20, WHAT)?;
+        let functions = self.u32(directory_rva + 28, WHAT)?;
+        let names = self.u32(directory_rva + 32, WHAT)?;
+        let ordinals = self.u32(directory_rva + 36, WHAT)?;
+        if name_count > MAX_EXPORTS {
+            return Err(ParseError::Malformed(WHAT));
+        }
+        let mut exports = Vec::with_capacity(name_count as usize);
+        for index in 0..name_count {
+            let name_rva = self.u32(names + index * 4, WHAT)?;
+            let ordinal = self.get(ordinals + index * 2, 2, WHAT)?;
+            let ordinal = u32::from(u16::from_le_bytes([ordinal[0], ordinal[1]]));
+            if ordinal >= function_count {
+                return Err(ParseError::Malformed(WHAT));
+            }
+            let rva = self.u32(functions + ordinal * 4, WHAT)?;
+            // An address inside the export directory is a forwarder's name, not a function.
+            let forwarded = rva >= directory_rva && rva - directory_rva < length;
+            if rva == 0 || forwarded || rva >= self.image.size {
+                continue;
+            }
+            exports.push((self.name(name_rva, WHAT)?, rva));
+        }
+        Ok(exports)
     }
 
     fn tls(&self, directory_rva: u32) -> Result<Tls, ParseError> {

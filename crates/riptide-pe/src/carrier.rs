@@ -57,6 +57,34 @@ struct Served {
 
 static SERVED: Mutex<Vec<Served>> = Mutex::new(Vec::new());
 
+/// Whether thread starts and ends are passed on at all yet.
+static PASSING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From now on, every thread's start and end is passed on to loaded images' TLS callbacks.
+///
+/// Call it when the title's C runtime has run its initialisers. Before that, a thread that
+/// starts would run the title's thread-local initialisers against globals that are not
+/// constructed yet. In a title's own process no other thread exists that early; in this one
+/// Windows' worker threads come and go from the first moment.
+pub fn pass_thread_events() {
+    PASSING.store(true, Ordering::Release);
+}
+
+/// Threads whose start and end are not passed on: the ones an image's entry point runs on.
+static FIRST_THREADS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Marks the thread with this id as one an image's entry point runs on, before it starts.
+///
+/// Windows never tells an image that its first thread started: the image's own start-up
+/// code sets up that thread's data, at the point where it is ready to. Telling it earlier
+/// runs its thread-local initialisers before its C runtime is initialised.
+pub(crate) fn first_thread(id: u32) {
+    FIRST_THREADS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .push(id);
+}
+
 /// Every carrier's entry point jumps here, so Windows calls it for each thread that starts
 /// or ends while the carrier is loaded, on that thread.
 unsafe extern "system" fn on_thread(
@@ -64,7 +92,14 @@ unsafe extern "system" fn on_thread(
     reason: u32,
     _reserved: *mut c_void,
 ) -> i32 {
-    if reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH {
+    // SAFETY: the call has no preconditions.
+    let thread = unsafe { sys::GetCurrentThreadId() };
+    let first = FIRST_THREADS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .contains(&thread);
+    let passing = PASSING.load(Ordering::Acquire);
+    if passing && !first && (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH) {
         let found = {
             let served = SERVED.lock().unwrap_or_else(|poison| poison.into_inner());
             served
@@ -377,6 +412,7 @@ mod tests {
             }
         }
 
+        pass_thread_events();
         let carrier = Carrier::load(&[1, 2, 3], 0).unwrap();
         carrier.serve(0x1234_0000, vec![callback as *const () as usize]);
         // SAFETY: the call has no preconditions.

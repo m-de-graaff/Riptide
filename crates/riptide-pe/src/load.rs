@@ -177,6 +177,7 @@ pub struct LoadedImage {
     _carrier: Option<Carrier>,
     mapping: Mapping,
     entry_rva: u32,
+    exports: Vec<(String, u32)>,
     stack_reserve: u64,
     tls_callbacks: Vec<usize>,
     /// The unwind table registered with Windows, to take back on drop.
@@ -225,7 +226,12 @@ pub fn load(name: &str, bytes: &[u8], resolver: &dyn Resolver) -> Result<LoadedI
         return Err(LoadError::Unresolved(unresolved));
     }
 
-    let mut mapping = Mapping::new(image.preferred_base, image.size as usize)?;
+    // An image with thread-local data gets one more page after it, for the routines its
+    // thread-local accesses are pointed at (see `tls_sites.rs`).
+    let image_end = (image.size as usize).next_multiple_of(0x1000);
+    let thunks = image.tls.as_ref().map(|_| image_end);
+    let mapped_size = image_end + if thunks.is_some() { 0x1000 } else { 0 };
+    let mut mapping = Mapping::new(image.preferred_base, mapped_size)?;
     let base = mapping.address();
     let memory = mapping.bytes_mut();
 
@@ -274,8 +280,21 @@ pub fn load(name: &str, bytes: &[u8], resolver: &dyn Resolver) -> Result<LoadedI
             template.resize(template.len() + tls.zero_fill as usize, 0);
             let carrier =
                 Carrier::load(&template, tls.characteristics).map_err(LoadError::ThreadLocal)?;
+            // The image's code is made to read the carrier's entry wherever it reads the
+            // TLS array, so the index it adds on top of that is zero.
+            let code: Vec<std::ops::Range<usize>> = image
+                .sections
+                .iter()
+                .filter(|section| section.executable)
+                .map(|section| {
+                    let start = section.rva as usize;
+                    start..start + section.virtual_size.max(section.raw_size) as usize
+                })
+                .collect();
+            let thunks = thunks.expect("an image with TLS has the page");
+            crate::tls_sites::redirect(memory, &code, thunks, carrier.index());
             let at = tls.index_rva as usize;
-            memory[at..at + 4].copy_from_slice(&carrier.index().to_le_bytes());
+            memory[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
             Some(carrier)
         }
         None => None,
@@ -296,6 +315,9 @@ pub fn load(name: &str, bytes: &[u8], resolver: &dyn Resolver) -> Result<LoadedI
             (false, false) => sys::PAGE_READONLY,
         };
         mapping.protect(section.rva as usize, length, protection)?;
+    }
+    if let Some(thunks) = thunks {
+        mapping.protect(thunks, 0x1000, sys::PAGE_EXECUTE_READ)?;
     }
     // SAFETY: the range is this mapping. The call tells the CPU that new code lies there.
     unsafe {
@@ -336,6 +358,7 @@ pub fn load(name: &str, bytes: &[u8], resolver: &dyn Resolver) -> Result<LoadedI
         _carrier: carrier,
         mapping,
         entry_rva: image.entry_rva,
+        exports: image.exports,
         stack_reserve: image.stack_reserve,
         tls_callbacks,
         function_table,
@@ -382,6 +405,22 @@ impl LoadedImage {
         self.base() + self.entry_rva as usize
     }
 
+    /// Everything the image exports by name, as addresses.
+    pub fn exports(&self) -> Vec<(String, usize)> {
+        self.exports
+            .iter()
+            .map(|(name, rva)| (name.clone(), self.base() + *rva as usize))
+            .collect()
+    }
+
+    /// The address of what the image exports as `name`, if it exports that.
+    pub fn export(&self, name: &str) -> Option<usize> {
+        self.exports
+            .iter()
+            .find(|(exported, _)| exported == name)
+            .map(|&(_, rva)| self.base() + rva as usize)
+    }
+
     /// Whether `address` lies in this image.
     pub fn contains(&self, address: usize) -> bool {
         address >= self.base() && address - self.base() < self.size()
@@ -419,12 +458,15 @@ impl LoadedImage {
     }
 }
 
-/// A borrowed image that may be run on another thread while its owner waits.
-struct OnOwnThread<'a>(&'a LoadedImage);
-
-// SAFETY: the image's memory belongs to the process, not to a thread. The one thread this is
-// sent to runs the image while the thread that owns it does nothing but wait.
-unsafe impl Send for OnOwnThread<'_> {}
+/// Where a thread made by [`LoadedImage::run_on_own_thread`] starts.
+///
+/// # Safety
+/// `image` points at a [`LoadedImage`] that outlives the thread, whose code the caller of
+/// `run_on_own_thread` vouched for.
+unsafe extern "system" fn first_thread_start(image: *mut c_void) -> u32 {
+    // SAFETY: as this function's contract says.
+    unsafe { (*image.cast::<LoadedImage>()).run() }
+}
 
 impl LoadedImage {
     /// Runs the image as [`LoadedImage::run`] does, on a new thread with the stack the image
@@ -436,21 +478,36 @@ impl LoadedImage {
     /// As for [`LoadedImage::run`].
     pub unsafe fn run_on_own_thread(&self) -> std::io::Result<u32> {
         const MIB: usize = 1 << 20;
+        const CREATE_SUSPENDED: u32 = 0x4;
+        const STACK_SIZE_IS_A_RESERVATION: u32 = 0x1_0000;
+        const INFINITE: u32 = u32::MAX;
         let stack = usize::try_from(self.stack_reserve).unwrap_or(MIB).max(MIB);
-        let image = OnOwnThread(self);
-        std::thread::scope(|scope| {
-            let thread = std::thread::Builder::new()
-                .name(self.name.clone())
-                .stack_size(stack)
-                .spawn_scoped(scope, move || {
-                    let image = image;
-                    // SAFETY: the caller vouches for the image, as for `run`.
-                    unsafe { image.0.run() }
-                })?;
-            thread
-                .join()
-                .map_err(|_| std::io::Error::other("the title's thread panicked"))
-        })
+        let mut id = 0u32;
+        // SAFETY: the thread starts suspended, so it is marked as the image's first before
+        // it runs anything, and this call waits for it to end before `self` can go away.
+        unsafe {
+            let thread = sys::CreateThread(
+                std::ptr::null(),
+                stack,
+                first_thread_start,
+                std::ptr::from_ref(self).cast_mut().cast(),
+                CREATE_SUSPENDED | STACK_SIZE_IS_A_RESERVATION,
+                &mut id,
+            );
+            if thread.is_null() {
+                return Err(std::io::Error::last_os_error());
+            }
+            crate::carrier::first_thread(id);
+            sys::ResumeThread(thread);
+            sys::WaitForSingleObject(thread, INFINITE);
+            let mut exit_code = 0u32;
+            let read = sys::GetExitCodeThread(thread, &mut exit_code);
+            sys::CloseHandle(thread);
+            if read == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(exit_code)
+        }
     }
 }
 

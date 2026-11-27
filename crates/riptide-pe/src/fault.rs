@@ -106,15 +106,112 @@ unsafe extern "system" fn unhandled(pointers: *mut sys::EXCEPTION_POINTERS) -> i
     let place = match MODULES.try_lock() {
         Ok(modules) => describe_in(&modules, address),
         Err(_) => None,
-    };
-    let line = fault_line(record.ExceptionCode, address, access, place);
-    let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(stderr, "{line}");
-    let _ = stderr.flush();
-    if let Some(sink) = SINK.get() {
-        sink(line.trim_start_matches("riptide: "));
     }
+    .or_else(|| host_place(address));
+    let line = fault_line(record.ExceptionCode, address, access, place);
+    // SAFETY: Windows passes the faulting thread's context with the exception.
+    let more = unsafe { registers_and_callers((*pointers).ContextRecord.cast::<u8>()) };
+    let mut stderr = std::io::stderr().lock();
+    for line in std::iter::once(&line).chain(&more) {
+        let _ = writeln!(stderr, "{line}");
+        if let Some(sink) = SINK.get() {
+            sink(line.trim_start_matches("riptide: "));
+        }
+    }
+    let _ = stderr.flush();
     sys::EXCEPTION_EXECUTE_HANDLER
+}
+
+/// Two more lines for a fault: the registers a call passes its first arguments in, and the
+/// addresses on the faulting thread's stack that lie in a loaded image. Those are mostly
+/// return addresses, nearest caller first, though a stale one can be among them.
+///
+/// # Safety
+/// `context` is the x64 `CONTEXT` of a thread that is stopped.
+unsafe fn registers_and_callers(context: *const u8) -> Vec<String> {
+    if context.is_null() {
+        return Vec::new();
+    }
+    // Offsets of the general registers in the x64 CONTEXT.
+    // SAFETY: the context is 1232 bytes; every offset read lies inside it.
+    let register = |offset: usize| unsafe { context.add(offset).cast::<u64>().read_unaligned() };
+    let (rax, rcx, rdx, rsp) = (
+        register(0x78),
+        register(0x80),
+        register(0x88),
+        register(0x98),
+    );
+    let (r8, r9) = (register(0xB8), register(0xC0));
+    let mut lines = vec![format!(
+        "riptide: rax {rax:#x} rcx {rcx:#x} rdx {rdx:#x} r8 {r8:#x} r9 {r9:#x} rsp {rsp:#x}"
+    )];
+    // A register that points into one of Windows' modules is named: it is often what tells
+    // an argument of the wrong kind from a wrong value.
+    for (name, value) in [
+        ("rax", rax),
+        ("rcx", rcx),
+        ("rdx", rdx),
+        ("r8", r8),
+        ("r9", r9),
+    ] {
+        if let Some(place) = host_place(value as usize) {
+            lines.push(format!("riptide: {name} points at {place}"));
+        }
+    }
+
+    let mut callers = Vec::new();
+    if let Ok(modules) = MODULES.try_lock() {
+        for slot in 0..512usize {
+            let at = (rsp as usize).wrapping_add(slot * 8) as *const usize;
+            let mut info = [0usize; 6];
+            // SAFETY: any address may be queried; the buffer is the size passed.
+            let known = unsafe { sys::VirtualQuery(at.cast(), info.as_mut_ptr().cast(), 48) };
+            // State (committed) is the low half of the fifth word, protection the high half
+            // of it: stop where the stack is no longer readable.
+            const MEM_COMMIT: usize = 0x1000;
+            let state = info[4] & 0xFFFF_FFFF;
+            let protection = (info[4] >> 32) & 0xFF;
+            if known == 0 || state != MEM_COMMIT || protection & 0x66 == 0 {
+                break;
+            }
+            // SAFETY: the page was just found committed and readable.
+            let value = unsafe { at.read_unaligned() };
+            if let Some(place) = describe_in(&modules, value) {
+                callers.push(place);
+                if callers.len() == 10 {
+                    break;
+                }
+            }
+        }
+    }
+    if !callers.is_empty() {
+        lines.push(format!("riptide: on the stack: {}", callers.join(", ")));
+    }
+    lines
+}
+
+/// Names `address` as `module+0xoffset` if it lies in a module Windows loaded.
+fn host_place(address: usize) -> Option<String> {
+    const FROM_ADDRESS: u32 = 4;
+    const UNCHANGED_REFCOUNT: u32 = 2;
+    let mut module = std::ptr::null_mut();
+    // SAFETY: with FROM_ADDRESS the second argument is an address to look up, not a string.
+    let found = unsafe {
+        sys::GetModuleHandleExW(
+            FROM_ADDRESS | UNCHANGED_REFCOUNT,
+            address as *const u16,
+            &mut module,
+        )
+    };
+    if found == 0 || module.is_null() {
+        return None;
+    }
+    let mut path = [0u16; 512];
+    // SAFETY: the buffer is as long as the size passed.
+    let length = unsafe { sys::GetModuleFileNameW(module, path.as_mut_ptr(), 512) } as usize;
+    let path = String::from_utf16_lossy(&path[..length.min(512)]);
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(&path);
+    Some(format!("{name}+{:#x}", address - module as usize))
 }
 
 /// Also receives the line of an unhandled fault, without the `riptide: ` prefix.

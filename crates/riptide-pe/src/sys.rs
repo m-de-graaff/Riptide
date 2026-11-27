@@ -59,8 +59,22 @@ unsafe extern "system" {
         old_protection: *mut u32,
     ) -> i32;
     pub fn GetCurrentProcess() -> *mut c_void;
-    #[cfg(test)]
     pub fn GetCurrentThreadId() -> u32;
+    pub fn CreateThread(
+        attributes: *const c_void,
+        stack_size: usize,
+        start: unsafe extern "system" fn(*mut c_void) -> u32,
+        parameter: *mut c_void,
+        flags: u32,
+        thread_id: *mut u32,
+    ) -> *mut c_void;
+    pub fn ResumeThread(thread: *mut c_void) -> u32;
+    pub fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+    pub fn GetExitCodeThread(thread: *mut c_void, exit_code: *mut u32) -> i32;
+    pub fn CloseHandle(handle: *mut c_void) -> i32;
+    pub fn GetModuleHandleExW(flags: u32, address: *const u16, module: *mut *mut c_void) -> i32;
+    pub fn GetModuleFileNameW(module: *mut c_void, buffer: *mut u16, size: u32) -> u32;
+    pub fn VirtualQuery(address: *const c_void, info: *mut c_void, length: usize) -> usize;
     pub fn LoadLibraryW(name: *const u16) -> *mut c_void;
     pub fn FreeLibrary(module: *mut c_void) -> i32;
     pub fn FlushInstructionCache(process: *mut c_void, address: *const c_void, size: usize) -> i32;
