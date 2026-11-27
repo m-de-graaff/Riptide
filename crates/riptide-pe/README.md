@@ -8,7 +8,7 @@ Loading, mapping and binding the title image.
 - `load(name, bytes, &resolver)` maps the image into this process, relocates it if its preferred base is taken, writes the address of every import into the import address table, sets each section's protection, and registers the unwind table with Windows. It runs none of the image's code.
 - `Resolver` supplies the address of each imported function, by module and by name or ordinal. `riptide-hle` implements it; a closure works too. If any import has no function, `load` fails with `LoadError::Unresolved`, listing every one as `module!function`.
 - `LoadedImage::run()` runs the TLS callbacks and then the entry point on the calling thread, and returns the entry point's result, the title's exit code. It is `unsafe`: the title's code runs natively.
-- `report_unhandled_faults()` makes a fault that nothing handles print one line before the process ends, such as `riptide: unhandled fault 0xc0000005 (access violation writing 0x0) at title.exe+0x1a2b`. `describe(address)` gives the `module+0xoffset` part for any address.
+- `report_unhandled_faults()` makes a fault that nothing handles print one line before the process ends, such as `riptide: unhandled fault 0xc0000005 (access violation writing 0x0) at title.exe+0x1a2b`. `describe(address)` gives the `module+0xoffset` part for any address. `report_unhandled_faults_to(sink)` hands the line to a sink as well, so the runtime can put it in the session log.
 
 ## Decisions made without a design document
 

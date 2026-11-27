@@ -12,5 +12,11 @@ workspace = true
 [dependencies]
 riptide-hle = { path = "../riptide-hle" }
 riptide-pe = { path = "../riptide-pe" }
+riptide-config = { path = "../riptide-config" }
+riptide-log = { path = "../riptide-log" }
+riptide-preflight = { path = "../riptide-preflight" }
 riptide-gpu = { path = "../riptide-gpu" }
 riptide-trace = { path = "../riptide-trace" }
+
+[dev-dependencies]
+riptide-testkit = { path = "../riptide-testkit" }

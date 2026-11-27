@@ -13,3 +13,6 @@ workspace = true
 riptide-pe = { path = "../riptide-pe" }
 riptide-mem = { path = "../riptide-mem" }
 riptide-trace = { path = "../riptide-trace" }
+
+[dev-dependencies]
+riptide-testkit = { path = "../riptide-testkit" }

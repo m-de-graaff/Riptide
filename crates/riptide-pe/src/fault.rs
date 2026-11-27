@@ -4,7 +4,7 @@
 //! is the same place every time, and is what a crash report has to say.
 
 use std::io::Write;
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, Once, OnceLock};
 
 use crate::sys;
 
@@ -111,7 +111,23 @@ unsafe extern "system" fn unhandled(pointers: *mut sys::EXCEPTION_POINTERS) -> i
     let mut stderr = std::io::stderr().lock();
     let _ = writeln!(stderr, "{line}");
     let _ = stderr.flush();
+    if let Some(sink) = SINK.get() {
+        sink(line.trim_start_matches("riptide: "));
+    }
     sys::EXCEPTION_EXECUTE_HANDLER
+}
+
+/// Also receives the line of an unhandled fault, without the `riptide: ` prefix.
+static SINK: OnceLock<Sink> = OnceLock::new();
+
+type Sink = Box<dyn Fn(&str) + Send + Sync>;
+
+/// As [`report_unhandled_faults`], and hands the line to `sink` as well, so it can go into
+/// the session log. `sink` runs in a process that has just faulted: it should do little.
+/// Only the first sink given is kept.
+pub fn report_unhandled_faults_to(sink: impl Fn(&str) + Send + Sync + 'static) {
+    let _ = SINK.set(Box::new(sink));
+    report_unhandled_faults();
 }
 
 /// Makes a fault that nothing handles print one line to standard error, naming where it

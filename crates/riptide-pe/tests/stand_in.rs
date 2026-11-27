@@ -2,9 +2,7 @@
 //! from our own source when these tests run.
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
 
 use riptide_pe::{Image, LoadError, Symbol, describe, load, report_unhandled_faults};
 
@@ -27,32 +25,9 @@ const MODE_FAULT: u32 = 1;
 /// Set in the child process that the fault test starts.
 const FAULT_CHILD: &str = "RIPTIDE_PE_FAULT_CHILD";
 
-/// Builds the stand-in title once and returns its bytes.
+/// The stand-in title's image, built from source on first use.
 fn stand_in() -> &'static [u8] {
-    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
-    BYTES.get_or_init(|| {
-        let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/stand-in-title");
-        let target = fixture.join("target");
-        let output = Command::new(env!("CARGO"))
-            .arg("build")
-            .arg("--manifest-path")
-            .arg(fixture.join("Cargo.toml"))
-            .arg("--target-dir")
-            .arg(&target)
-            // The outer cargo's settings are for the workspace, not for this image.
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env_remove("CARGO_TARGET_DIR")
-            .output()
-            .expect("cargo runs");
-        assert!(
-            output.status.success(),
-            "the stand-in title did not build:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        std::fs::read(target.join("debug").join(NAME)).expect("the built image is readable")
-    })
+    riptide_testkit::stand_in_title_bytes()
 }
 
 // The functions the stand-in title imports. The title runs on the thread that called `run`,

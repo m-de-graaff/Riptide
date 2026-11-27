@@ -1,9 +1,7 @@
 //! Binds the stand-in title through the import table and runs it.
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
 
 use riptide_hle::{Binding, Imports, UNIMPLEMENTED_IMPORT};
 use riptide_pe::{Image, Symbol, load, report_unhandled_faults};
@@ -20,32 +18,9 @@ const REPORT_SLEPT: u32 = 8;
 /// Set in the child process that the stub test starts.
 const STUB_CHILD: &str = "RIPTIDE_HLE_STUB_CHILD";
 
-/// Builds the stand-in title once and returns its bytes. `riptide-pe`'s tests hold the same
-/// helper; it moves to a shared place when a third crate needs it.
+/// The stand-in title's image, built from source on first use.
 fn stand_in() -> &'static [u8] {
-    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
-    BYTES.get_or_init(|| {
-        let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/stand-in-title");
-        let target = fixture.join("target");
-        let output = Command::new(env!("CARGO"))
-            .arg("build")
-            .arg("--manifest-path")
-            .arg(fixture.join("Cargo.toml"))
-            .arg("--target-dir")
-            .arg(&target)
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env_remove("CARGO_TARGET_DIR")
-            .output()
-            .expect("cargo runs");
-        assert!(
-            output.status.success(),
-            "the stand-in title did not build:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        std::fs::read(target.join("debug").join(NAME)).expect("the built image is readable")
-    })
+    riptide_testkit::stand_in_title_bytes()
 }
 
 thread_local! {
