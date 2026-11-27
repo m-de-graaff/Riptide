@@ -76,6 +76,36 @@ pub(crate) extern "system" fn keep(_this: *mut c_void) -> u32 {
     1
 }
 
+/// Registers a callback for an event that never happens here: `(this, queue, context,
+/// callback, token)`. The callback is never called; the registration gets a token like any
+/// other, so the title can take it off again.
+///
+/// # Safety
+/// `token` is null or where the registration's token goes.
+pub(crate) unsafe extern "system" fn register_for_nothing(
+    _this: *mut c_void,
+    _queue: *const c_void,
+    _context: *mut c_void,
+    _callback: *const c_void,
+    token: *mut u64,
+) -> i32 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    if !token.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { token.write(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) };
+    }
+    0
+}
+
+/// Takes a registration made by [`register_for_nothing`] off: `(this, token, wait)`.
+pub(crate) extern "system" fn unregister_for_nothing(
+    _this: *mut c_void,
+    _token: u64,
+    _wait: bool,
+) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

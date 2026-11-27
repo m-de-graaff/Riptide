@@ -8,6 +8,7 @@ mod com;
 pub mod cores;
 pub mod dstorage;
 mod imports;
+mod network;
 pub mod process;
 pub mod runtime;
 pub mod saves;
@@ -16,6 +17,7 @@ mod sys;
 mod taskqueue;
 pub mod timers;
 mod trace;
+mod user;
 pub mod xmem;
 
 pub use imports::{Binding, Census, CensusLine, Imports};

@@ -247,16 +247,21 @@ unsafe extern "system" fn query_api_impl(
         .map(|&(_, _, object)| object);
     let object = known.unwrap_or_else(|| {
         // The areas with methods built, by interface id.
-        let (name, mut methods) = if interface == crate::taskqueue::INTERFACE {
-            (
-                format!("runtime area {}", crate::taskqueue::NAME),
-                crate::taskqueue::methods(),
-            )
+        let built = if interface == crate::taskqueue::INTERFACE {
+            Some((crate::taskqueue::NAME, crate::taskqueue::methods()))
+        } else if interface == crate::network::INTERFACE {
+            Some((crate::network::NAME, crate::network::methods()))
+        } else if interface == crate::user::INTERFACE {
+            Some((crate::user::NAME, crate::user::methods()))
         } else {
-            (
+            None
+        };
+        let (name, mut methods) = match built {
+            Some((name, methods)) => (format!("runtime area {name}"), methods),
+            None => (
                 format!("runtime area {}", guid(Some(&interface))),
                 Vec::new(),
-            )
+            ),
         };
         trace!(
             "runtime services: {name} asked for (interface {}, provider {}); {} of its \
