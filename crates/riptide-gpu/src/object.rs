@@ -15,6 +15,7 @@ pub(crate) const E_NOTIMPL: Hresult = 0x8000_4001_u32 as i32;
 pub(crate) const E_NOINTERFACE: Hresult = 0x8000_4002_u32 as i32;
 pub(crate) const E_POINTER: Hresult = 0x8000_4003_u32 as i32;
 pub(crate) const E_INVALIDARG: Hresult = 0x8007_0057_u32 as i32;
+pub(crate) const E_OUTOFMEMORY: Hresult = 0x8007_000e_u32 as i32;
 
 /// An interface id, as it lies in memory.
 pub(crate) type Iid = [u8; 16];
