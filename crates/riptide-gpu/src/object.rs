@@ -239,6 +239,31 @@ pub(crate) fn child_methods<T: Child>() -> [(usize, usize); 4] {
     ]
 }
 
+/// Which of a method's first two arguments is the object, and which the pointer for its
+/// result. A method that returns a structure takes a pointer for it, and which side of the
+/// object that is on differs from method to method; the object is the one that starts with
+/// its own table.
+///
+/// # Safety
+/// Each of `first` and `second` is null or points at 8 readable bytes, and one of them is a
+/// live `T` made on `table`.
+pub(crate) unsafe fn this_and_result<'a, T: Child, R>(
+    table: &'static [usize],
+    first: *const T,
+    second: *const T,
+) -> (&'a T, *mut R) {
+    // SAFETY: readable, as the contract says.
+    let first_is_object = !first.is_null()
+        && unsafe { first.cast::<usize>().read_unaligned() } == table.as_ptr() as usize;
+    if first_is_object {
+        // SAFETY: it starts with the table, so it is the object.
+        (unsafe { &*first }, second.cast_mut().cast())
+    } else {
+        // SAFETY: the other one is the object.
+        (unsafe { &*second }, first.cast_mut().cast())
+    }
+}
+
 /// What an unbuilt method is when this crate has not been given a stub maker (in its own
 /// tests): it fails, as an interface without the method would.
 extern "system" fn unbuilt() -> Hresult {

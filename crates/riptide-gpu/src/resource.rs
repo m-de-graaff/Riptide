@@ -3,8 +3,57 @@
 //! On the console the CPU and the GPU share one memory, so every heap type is ordinary
 //! title memory with different rules about who may touch it.
 
+use std::ffi::c_void;
+use std::sync::OnceLock;
+
 use crate::device::Device;
+use crate::object::{self, Child, E_INVALIDARG, Hresult, Iid, Object, S_OK, guid};
 use crate::trace;
+
+/// `ID3D12Resource`, `ID3D12Resource1` and `ID3D12Resource2`.
+const IIDS: [Iid; 3] = [
+    guid(
+        0x696442be,
+        0xa72e,
+        0x4059,
+        [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+    ),
+    guid(
+        0x9d5e227a,
+        0x4430,
+        0x4161,
+        [0x88, 0xb3, 0x3e, 0xca, 0x6b, 0xb1, 0x6e, 0x19],
+    ),
+    guid(
+        0xbe36ec3b,
+        0xea85,
+        0x4aeb,
+        [0xa4, 0x5a, 0xe9, 0xd7, 0x64, 0x04, 0xa4, 0x95],
+    ),
+];
+
+/// `D3D12_RESOURCE_DESC`, as on PC. The newer `D3D12_RESOURCE_DESC1` starts the same.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Description {
+    /// 1 buffer, 2 to 4 textures of one to three dimensions.
+    pub(crate) dimension: u32,
+    pub(crate) alignment: u64,
+    /// A buffer's size in bytes, or a texture's width.
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    pub(crate) depth_or_array_size: u16,
+    pub(crate) mip_levels: u16,
+    pub(crate) format: u32,
+    pub(crate) sample_count: u32,
+    pub(crate) sample_quality: u32,
+    pub(crate) layout: u32,
+    pub(crate) flags: u32,
+}
+
+const _: () = assert!(size_of::<Description>() == 56);
+
+const DIMENSION_BUFFER: u32 = 1;
 
 /// `D3D12_HEAP_PROPERTIES`.
 #[repr(C)]
@@ -73,9 +122,663 @@ pub(crate) unsafe extern "system" fn custom_heap_properties(
     out
 }
 
+/// `D3D12_RESOURCE_ALLOCATION_INFO`: the memory a resource, or several placed one after
+/// another, take.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AllocationInfo {
+    bytes: u64,
+    alignment: u64,
+}
+
+/// `D3D12_RESOURCE_ALLOCATION_INFO1`: where one of several resources goes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Placement {
+    offset: u64,
+    alignment: u64,
+    bytes: u64,
+}
+
+/// What the documented answer is for a description that cannot be sized.
+const UNKNOWN: AllocationInfo = AllocationInfo {
+    bytes: u64::MAX,
+    alignment: 0,
+};
+
+const KIB_64: u64 = 64 << 10;
+const MIB_4: u64 = 4 << 20;
+const DIMENSION_TEXTURE_3D: u32 = 4;
+
+/// The bytes one block of `format` takes and how many texels wide and high a block is:
+/// 4 for block-compressed formats, else 1. PC's formats, and the console's own: 116 and 117
+/// (10-bit float colour), 118 to 120 (16-bit depth with stencil, 3 bytes), 189 (signed
+/// 10-bit colour), 190 (two 4-bit channels) and 191 (24 and 8 bits). `None` for video and
+/// unknown formats.
+pub(crate) fn block(format: u32) -> Option<(u64, u64)> {
+    Some(match format {
+        1..=4 => (16, 1),
+        5..=8 => (12, 1),
+        9..=22 => (8, 1),
+        23..=47 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1),
+        118..=120 => (3, 1),
+        48..=59 | 68 | 69 | 85 | 86 | 115 => (2, 1),
+        60..=65 | 190 => (1, 1),
+        70..=72 | 79..=81 => (8, 4),
+        73..=78 | 82..=84 | 94..=99 => (16, 4),
+        _ => return None,
+    })
+}
+
+/// How many levels a texture has: what its description says, or with zero every level
+/// down to one texel.
+fn level_count(description: &Description) -> u32 {
+    if description.mip_levels != 0 {
+        return u32::from(description.mip_levels);
+    }
+    let depth = if description.dimension == DIMENSION_TEXTURE_3D {
+        u64::from(description.depth_or_array_size)
+    } else {
+        1
+    };
+    let largest = description
+        .width
+        .max(u64::from(description.height))
+        .max(depth)
+        .max(1);
+    64 - largest.leading_zeros()
+}
+
+/// The memory a resource takes: a buffer its width, a texture every level of every slice
+/// and sample packed one after another, each rounded up to 64 KiB.
+///
+/// For a texture this is not the console's own layout, which pads and interleaves, so it
+/// is smaller than what the console would say. It serves textures the title only renders
+/// to, whose bytes in title memory nobody reads; the console's layouts come with texture
+/// conversion (decision D4).
+pub(crate) fn footprint(description: &Description) -> Option<AllocationInfo> {
+    let d = description;
+    let bytes = if d.dimension == DIMENSION_BUFFER {
+        d.width
+    } else {
+        let (block_bytes, block_texels) = block(d.format)?;
+        let (depth, slices) = if d.dimension == DIMENSION_TEXTURE_3D {
+            (u64::from(d.depth_or_array_size), 1)
+        } else {
+            (1, u64::from(d.depth_or_array_size).max(1))
+        };
+        let mut chain = 0u64;
+        for level in 0..level_count(d).min(64) {
+            let width = (d.width >> level).max(1).div_ceil(block_texels);
+            let height = (u64::from(d.height) >> level).max(1).div_ceil(block_texels);
+            let depth = (depth >> level).max(1);
+            let level_bytes = width
+                .checked_mul(height)?
+                .checked_mul(depth)?
+                .checked_mul(block_bytes)?;
+            chain = chain.checked_add(level_bytes)?;
+        }
+        chain
+            .checked_mul(slices)?
+            .checked_mul(u64::from(d.sample_count.max(1)))?
+    };
+    if bytes == 0 {
+        return None;
+    }
+    let least = if d.sample_count > 1 { MIB_4 } else { KIB_64 };
+    let alignment = d.alignment.max(least);
+    if !alignment.is_power_of_two() {
+        return None;
+    }
+    Some(AllocationInfo {
+        bytes: bytes.checked_next_multiple_of(KIB_64)?,
+        alignment,
+    })
+}
+
+/// Places resources one after another, each at the next multiple of its alignment, tells
+/// `each` where every one went, and returns what they take together.
+fn place<'a>(
+    descriptions: impl Iterator<Item = &'a Description>,
+    mut each: impl FnMut(usize, Placement),
+) -> AllocationInfo {
+    let mut end = 0u64;
+    let mut alignment = KIB_64;
+    for (index, description) in descriptions.enumerate() {
+        let placed = footprint(description).and_then(|one| {
+            let offset = end.checked_next_multiple_of(one.alignment)?;
+            Some((offset, one, offset.checked_add(one.bytes)?))
+        });
+        let Some((offset, one, after)) = placed else {
+            trace!("a resource that cannot be sized was asked about: {description:?}");
+            each(
+                index,
+                Placement {
+                    offset: u64::MAX,
+                    alignment: 0,
+                    bytes: u64::MAX,
+                },
+            );
+            return UNKNOWN;
+        };
+        each(
+            index,
+            Placement {
+                offset,
+                alignment: one.alignment,
+                bytes: one.bytes,
+            },
+        );
+        end = after;
+        alignment = alignment.max(one.alignment);
+    }
+    match end.checked_next_multiple_of(alignment) {
+        Some(bytes) => AllocationInfo { bytes, alignment },
+        None => UNKNOWN,
+    }
+}
+
+/// Says what was asked and answered, for the first few distinct questions.
+fn show_sizes(descriptions: &[&Description], answer: AllocationInfo) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SHOWN: AtomicU32 = AtomicU32::new(0);
+    if SHOWN.fetch_add(1, Ordering::Relaxed) < 12 {
+        trace!("resources sized: {descriptions:?} take {answer:x?}");
+    }
+}
+
+/// `ID3D12Device::GetResourceAllocationInfo`: `(visible nodes, count, descriptions)`, with
+/// the result returned through a pointer passed before the device, as
+/// [`custom_heap_properties`] does.
+///
+/// # Safety
+/// `out` is null or room for the result; `descriptions` is null or `count` descriptions.
+pub(crate) unsafe extern "system" fn allocation_info(
+    out: *mut AllocationInfo,
+    _this: *const Device,
+    _visible: u32,
+    count: u32,
+    descriptions: *const Description,
+) -> *mut AllocationInfo {
+    let descriptions: Vec<&Description> = if descriptions.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: the title passes `count` descriptions.
+        unsafe { std::slice::from_raw_parts(descriptions, count as usize) }
+            .iter()
+            .collect()
+    };
+    let total = place(descriptions.iter().copied(), |_, _| {});
+    show_sizes(&descriptions, total);
+    // SAFETY: the caller's result pointer; null is tolerated.
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = total;
+    }
+    out
+}
+
+/// `D3D12_RESOURCE_DESC1`: the description, then a mip region for sampler feedback.
+#[repr(C)]
+pub(crate) struct Description1 {
+    description: Description,
+    mip_region: [u32; 3],
+}
+
+const _: () = assert!(size_of::<Description1>() == 72);
+
+/// `ID3D12Device8::GetResourceAllocationInfo2`: as [`allocation_info`] for the newer
+/// descriptions, also telling where each resource goes.
+///
+/// # Safety
+/// As [`allocation_info`]; `each` is null or room for `count` placements.
+pub(crate) unsafe extern "system" fn allocation_info2(
+    out: *mut AllocationInfo,
+    _this: *const Device,
+    _visible: u32,
+    count: u32,
+    descriptions: *const Description1,
+    each: *mut Placement,
+) -> *mut AllocationInfo {
+    let descriptions: Vec<&Description> = if descriptions.is_null() {
+        Vec::new()
+    } else {
+        // SAFETY: the title passes `count` descriptions.
+        unsafe { std::slice::from_raw_parts(descriptions, count as usize) }
+            .iter()
+            .map(|one| &one.description)
+            .collect()
+    };
+    let total = place(descriptions.iter().copied(), |index, placement| {
+        if !each.is_null() {
+            // SAFETY: the title passes room for `count` placements.
+            unsafe { each.add(index).write_unaligned(placement) };
+        }
+    });
+    show_sizes(&descriptions, total);
+    // SAFETY: the caller's result pointer; null is tolerated.
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = total;
+    }
+    out
+}
+
+/// A resource as a title's code sees it.
+///
+/// On the console a resource is a description of some memory: its GPU address is the
+/// address the title's CPU code reaches it at. So a resource here records where in title
+/// memory it lies, and the host objects that show that memory to the GPU are found when a
+/// command or a view first needs them.
+#[repr(C)]
+pub(crate) struct Resource {
+    object: Object,
+    description: Description,
+    heap: HeapProperties,
+    heap_flags: u32,
+    /// The title address of its first byte.
+    address: u64,
+}
+
+// SAFETY: `Resource` is `#[repr(C)]` and starts with its header.
+unsafe impl Child for Resource {
+    const NAME: &'static str = "resource";
+    const IIDS: &'static [Iid] = &IIDS;
+
+    fn header(&self) -> &Object {
+        &self.object
+    }
+}
+
+impl Resource {
+    pub(crate) fn description(&self) -> &Description {
+        &self.description
+    }
+
+    /// The title address of its first byte, which is also its GPU address.
+    pub(crate) fn address(&self) -> u64 {
+        self.address
+    }
+}
+
+/// The resource for memory a title placed itself and describes in a view, with no resource
+/// object of its own: one per address and description, made the first time it is named and
+/// kept for the run, since records anywhere in title memory may name it.
+pub(crate) fn placed(address: u64, description: &Description) -> *const Resource {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    /// The description's fields, without the padding between them.
+    type Key = (u64, [u64; 2], [u32; 7], [u16; 2]);
+    static PLACED: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
+    let d = description;
+    let key: Key = (
+        address,
+        [d.alignment, d.width],
+        [
+            d.dimension,
+            d.height,
+            d.format,
+            d.sample_count,
+            d.sample_quality,
+            d.layout,
+            d.flags,
+        ],
+        [d.depth_or_array_size, d.mip_levels],
+    );
+    let mut placed = PLACED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let at = *placed
+        .get_or_insert_with(HashMap::new)
+        .entry(key)
+        .or_insert_with(|| {
+            Box::into_raw(Box::new(Resource {
+                object: Object::new(table(), 1),
+                description: *description,
+                heap: HeapProperties {
+                    kind: HEAP_DEFAULT,
+                    cpu_pages: 0,
+                    pool: 0,
+                    creation_nodes: 1,
+                    visible_nodes: 1,
+                },
+                heap_flags: 0,
+                address,
+            })) as usize
+        });
+    at as *const Resource
+}
+
+/// More positions than the resource's table has.
+const SLOTS: usize = 24;
+
+/// The resource's methods by position. Positions 0 to 14 are the PC resource's.
+const NAMES: [(usize, &str); 15] = [
+    (0, "QueryInterface"),
+    (1, "AddRef"),
+    (2, "Release"),
+    (3, "GetPrivateData"),
+    (4, "SetPrivateData"),
+    (5, "SetPrivateDataInterface"),
+    (6, "SetName"),
+    (7, "GetDevice"),
+    (8, "Map"),
+    (9, "Unmap"),
+    (10, "GetDesc"),
+    (11, "GetGPUVirtualAddress"),
+    (12, "WriteToSubresource"),
+    (13, "ReadFromSubresource"),
+    (14, "GetHeapProperties"),
+];
+
+fn table() -> &'static [usize] {
+    static TABLE: OnceLock<&'static [usize]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut methods = object::child_methods::<Resource>().to_vec();
+        methods.extend([
+            (8, map as *const () as usize),
+            (9, unmap as *const () as usize),
+            (10, describe as *const () as usize),
+            (11, gpu_address as *const () as usize),
+            (14, heap_properties as *const () as usize),
+        ]);
+        object::table("ID3D12Resource", SLOTS, &NAMES, &methods)
+    })
+}
+
+/// `ID3D12Device::CreateResourceAtAddressX`: `(address, description, first layout, clear
+/// value, interface id, resource out)`. The resource is memory the title has mapped itself.
+///
+/// # Safety
+/// The title's pointers: each null or valid.
+pub(crate) unsafe extern "system" fn create_at_address(
+    _device: *const Device,
+    address: u64,
+    description: *const Description,
+    layout: u32,
+    _clear: *const c_void,
+    iid: *const Iid,
+    out: *mut *const Resource,
+) -> Hresult {
+    // SAFETY: the title's description; null is refused.
+    let Some(&description) = (unsafe { description.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    if address == 0 {
+        return E_INVALIDARG;
+    }
+    // SAFETY: the title's id and out-pointer.
+    if let Err(code) = unsafe { object::accepts(iid, out) } {
+        return code;
+    }
+    let resource = Box::new(Resource {
+        object: Object::new(table(), 1),
+        description,
+        heap: HeapProperties {
+            kind: HEAP_DEFAULT,
+            cpu_pages: 0,
+            pool: 0,
+            creation_nodes: 1,
+            visible_nodes: 1,
+        },
+        heap_flags: 0,
+        address,
+    });
+    trace!(
+        "resource {:p} made at address {address:#x}, first layout {layout:#x}: {description:?}",
+        &raw const *resource
+    );
+    // SAFETY: `accepts` checked the out-pointer.
+    unsafe { object::hand_out(resource, out) }
+}
+
+/// `Map`: `(subresource, range read, pointer out)`. The memory is the title's and always
+/// mapped; a null `out` only asks that it be.
+///
+/// # Safety
+/// `out` is null or where the pointer goes.
+unsafe extern "system" fn map(
+    this: &Resource,
+    _subresource: u32,
+    _read: *const c_void,
+    out: *mut u64,
+) -> Hresult {
+    // SAFETY: the title's out-pointer; null is tolerated.
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = this.address;
+    }
+    S_OK
+}
+
+/// `Unmap`: `(subresource, range written)`. Nothing to do: the GPU reads the same memory.
+extern "system" fn unmap(_this: &Resource, _subresource: u32, _written: *const c_void) {}
+
+/// `GetDesc`.
+///
+/// # Safety
+/// As [`object::this_and_result`]; the result pointer is null or room for a description.
+unsafe extern "system" fn describe(
+    first: *const Resource,
+    second: *const Resource,
+) -> *mut Description {
+    // SAFETY: as received.
+    let (resource, out) =
+        unsafe { object::this_and_result::<Resource, Description>(table(), first, second) };
+    // SAFETY: the caller's result pointer; null is tolerated.
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = resource.description;
+    }
+    out
+}
+
+/// `GetGPUVirtualAddress`: the title address.
+extern "system" fn gpu_address(this: &Resource) -> u64 {
+    this.address
+}
+
+/// `GetHeapProperties`: `(properties out, heap flags out)`.
+///
+/// # Safety
+/// Each pointer is null or room for its value.
+unsafe extern "system" fn heap_properties(
+    this: &Resource,
+    properties: *mut HeapProperties,
+    flags: *mut u32,
+) -> Hresult {
+    // SAFETY: the title's out-pointers; null is tolerated.
+    unsafe {
+        if let Some(properties) = properties.as_mut() {
+            *properties = this.heap;
+        }
+        if let Some(flags) = flags.as_mut() {
+            *flags = this.heap_flags;
+        }
+    }
+    S_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::{E_NOINTERFACE, method};
+
+    fn texture(width: u64, height: u32, levels: u16, format: u32) -> Description {
+        Description {
+            dimension: 3,
+            alignment: 0,
+            width,
+            height,
+            depth_or_array_size: 1,
+            mip_levels: levels,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        }
+    }
+
+    #[test]
+    fn a_buffer_takes_its_width_in_whole_64_kib() {
+        let buffer = Description {
+            dimension: DIMENSION_BUFFER,
+            width: 100_000,
+            height: 1,
+            ..texture(0, 1, 1, 0)
+        };
+        assert_eq!(
+            footprint(&buffer),
+            Some(AllocationInfo {
+                bytes: 2 * KIB_64,
+                alignment: KIB_64
+            })
+        );
+        assert_eq!(footprint(&Description { width: 0, ..buffer }), None);
+    }
+
+    #[test]
+    fn a_texture_takes_every_level_and_slice() {
+        // 256 x 256 of 4 bytes: 262,144 bytes, and with every level a third more.
+        assert_eq!(
+            footprint(&texture(256, 256, 1, 28)).unwrap().bytes,
+            4 * KIB_64
+        );
+        let chain: u64 = (0..9).map(|level| (256u64 >> level).pow(2) * 4).sum();
+        assert_eq!(
+            footprint(&texture(256, 256, 0, 28)).unwrap().bytes,
+            chain.next_multiple_of(KIB_64)
+        );
+        // Block-compressed: 8 bytes for every 4 x 4 texels.
+        assert_eq!(
+            footprint(&texture(1024, 1024, 1, 71)).unwrap().bytes,
+            8 * KIB_64
+        );
+        let six = Description {
+            depth_or_array_size: 6,
+            ..texture(256, 256, 1, 28)
+        };
+        assert_eq!(footprint(&six).unwrap().bytes, 24 * KIB_64);
+        // Multisampled textures are aligned to 4 MiB; unknown formats have no size.
+        let samples = Description {
+            sample_count: 4,
+            ..texture(256, 256, 1, 28)
+        };
+        assert_eq!(footprint(&samples).unwrap().alignment, MIB_4);
+        assert_eq!(footprint(&texture(256, 256, 1, 104)), None);
+    }
+
+    #[test]
+    fn resources_asked_about_together_are_placed_one_after_another() {
+        let both = [
+            Description1 {
+                description: texture(256, 256, 1, 28),
+                mip_region: [0; 3],
+            },
+            Description1 {
+                description: Description {
+                    alignment: 2 << 20,
+                    ..texture(64, 64, 1, 28)
+                },
+                mip_region: [0; 3],
+            },
+        ];
+        let mut total = UNKNOWN;
+        let mut each = [Placement {
+            offset: 0,
+            alignment: 0,
+            bytes: 0,
+        }; 2];
+        // SAFETY: two descriptions, and room for the results.
+        unsafe {
+            let returned = allocation_info2(
+                &mut total,
+                std::ptr::null(),
+                0,
+                2,
+                both.as_ptr(),
+                each.as_mut_ptr(),
+            );
+            assert!(std::ptr::eq(returned, &raw const total));
+        }
+        assert_eq!((each[0].offset, each[0].bytes), (0, 4 * KIB_64));
+        assert_eq!((each[1].offset, each[1].bytes), (2 << 20, KIB_64));
+        assert_eq!(
+            total,
+            AllocationInfo {
+                bytes: 4 << 20,
+                alignment: 2 << 20
+            }
+        );
+
+        // One that cannot be sized makes the whole answer unknown.
+        let unknown = [texture(256, 256, 1, 104)];
+        // SAFETY: one description, and room for the result.
+        unsafe { allocation_info(&mut total, std::ptr::null(), 0, 1, unknown.as_ptr()) };
+        assert_eq!(total, UNKNOWN);
+    }
+
+    #[test]
+    fn a_resource_at_an_address_is_that_memory() {
+        let description = Description {
+            dimension: DIMENSION_BUFFER,
+            alignment: 0,
+            width: 0x1_0000,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 1,
+            flags: 0,
+        };
+        let device = std::ptr::null();
+        let clear = std::ptr::null();
+        let mut made: *const Resource = std::ptr::null();
+        // SAFETY: valid pointers, and the null ones under test; the table has these
+        // methods at these positions.
+        unsafe {
+            assert_eq!(
+                create_at_address(device, 0, &description, 0, clear, &IIDS[0], &mut made),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                create_at_address(device, 0x4000, &description, 0, clear, &[9; 16], &mut made),
+                E_NOINTERFACE
+            );
+            assert_eq!(
+                create_at_address(device, 0x4000, &description, 0, clear, &IIDS[2], &mut made),
+                S_OK
+            );
+            let resource = &*made;
+            assert_eq!(gpu_address(resource), 0x4000);
+            let mut mapped = 0;
+            assert_eq!(map(resource, 0, std::ptr::null(), &mut mapped), S_OK);
+            assert_eq!(mapped, 0x4000);
+            assert_eq!(
+                map(resource, 0, std::ptr::null(), std::ptr::null_mut()),
+                S_OK
+            );
+
+            // The description comes back whichever side its pointer is on.
+            let mut described = [Description {
+                width: 0,
+                ..description
+            }; 2];
+            let room = described.as_mut_ptr().cast::<Resource>().cast_const();
+            describe(made, room);
+            assert_eq!(described[0], description);
+            described[0].width = 0;
+            describe(room, made);
+            assert_eq!(described[0], description);
+
+            let mut heap = as_custom(HEAP_UPLOAD, 1);
+            let mut flags = 7;
+            assert_eq!(heap_properties(resource, &mut heap, &mut flags), S_OK);
+            assert_eq!((heap.kind, flags), (HEAP_DEFAULT, 0));
+
+            let release: unsafe extern "system" fn(*const Resource) -> u32 = method(made.cast(), 2);
+            assert_eq!(release(made), 0);
+        }
+    }
 
     #[test]
     fn standard_heaps_are_system_memory_with_their_own_cpu_rules() {

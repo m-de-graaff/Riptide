@@ -30,12 +30,12 @@ pub(crate) const SAMPLERS: u32 = 1;
 /// The bytes one descriptor of each heap type takes: 32 for a view and 16 for a sampler,
 /// the sizes of the console GPU's own image and sampler records, so a title that copies
 /// descriptors as bytes moves whole ones. Render and depth target records are read only
-/// here, never by the GPU, and are given 32 as well.
+/// here, never by the GPU, and take 48: the resource and the title's description.
 pub(crate) const fn increment(kind: u32) -> Option<u32> {
     match kind {
         VIEWS => Some(32),
         SAMPLERS => Some(16),
-        2 | 3 => Some(32),
+        2 | 3 => Some(48),
         _ => None,
     }
 }
@@ -244,33 +244,14 @@ pub(crate) unsafe extern "system" fn create(
     unsafe { object::hand_out(heap, out) }
 }
 
-/// Which of a method's first two arguments is the heap. A method that returns a structure
-/// takes a pointer for the result, and which side of the object it is on depends on how the
-/// title was compiled; the heap is the one that starts with the heap's table.
-///
-/// # Safety
-/// Each of `first` and `second` is null or points at 8 readable bytes, and one is a heap.
-unsafe fn heap_and_result<'a, T>(first: *const Heap, second: *const Heap) -> (&'a Heap, *mut T) {
-    let ours = table().as_ptr() as usize;
-    // SAFETY: readable, as the contract says.
-    let first_is_heap =
-        !first.is_null() && unsafe { first.cast::<usize>().read_unaligned() } == ours;
-    if first_is_heap {
-        // SAFETY: it starts with the heap's table, so it is a heap.
-        (unsafe { &*first }, second.cast_mut().cast())
-    } else {
-        // SAFETY: the other one is the heap.
-        (unsafe { &*second }, first.cast_mut().cast())
-    }
-}
-
 /// `GetDesc`.
 ///
 /// # Safety
-/// As [`heap_and_result`]; the result pointer is null or room for a description.
+/// As [`object::this_and_result`]; the result pointer is null or room for a description.
 unsafe extern "system" fn describe(first: *const Heap, second: *const Heap) -> *mut Description {
     // SAFETY: as received.
-    let (heap, out) = unsafe { heap_and_result::<Description>(first, second) };
+    let (heap, out) =
+        unsafe { object::this_and_result::<Heap, Description>(table(), first, second) };
     // SAFETY: the caller's result pointer; null is tolerated.
     if let Some(out) = unsafe { out.as_mut() } {
         *out = heap.description;
@@ -283,7 +264,7 @@ unsafe extern "system" fn describe(first: *const Heap, second: *const Heap) -> *
 /// also through the result pointer if the title passed one.
 ///
 /// # Safety
-/// As [`heap_and_result`], except that there may be no second argument at all: then the
+/// As [`object::this_and_result`], except that there may be no second argument at all: then the
 /// first is the heap and the second is never read.
 unsafe extern "system" fn start(first: *const Heap, second: *const Heap) -> u64 {
     let ours = table().as_ptr() as usize;
@@ -294,7 +275,7 @@ unsafe extern "system" fn start(first: *const Heap, second: *const Heap) -> u64 
     }
     // SAFETY: the first was not the heap, so it is the result pointer and the second is
     // the heap.
-    let (heap, out) = unsafe { heap_and_result::<u64>(first, second) };
+    let (heap, out) = unsafe { object::this_and_result::<Heap, u64>(table(), first, second) };
     // SAFETY: the caller's result pointer.
     if let Some(out) = unsafe { out.as_mut() } {
         *out = heap.start;
@@ -326,8 +307,8 @@ mod tests {
         let device = crate::device::device();
         assert_eq!(increment_size(device, VIEWS), 32);
         assert_eq!(increment_size(device, SAMPLERS), 16);
-        assert_eq!(increment_size(device, 2), 32);
-        assert_eq!(increment_size(device, 3), 32);
+        assert_eq!(increment_size(device, 2), 48);
+        assert_eq!(increment_size(device, 3), 48);
         assert_eq!(increment_size(device, 4), 0);
     }
 

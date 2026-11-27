@@ -15,6 +15,7 @@ mod list;
 mod object;
 mod queue;
 mod resource;
+mod view;
 
 use std::sync::{Arc, OnceLock};
 
