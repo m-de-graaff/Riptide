@@ -17,6 +17,9 @@ pub const EXCEPTION_NONCONTINUABLE: u32 = 0x1;
 pub const CREATE_WAITABLE_TIMER_HIGH_RESOLUTION: u32 = 0x2;
 pub const TIMER_ALL_ACCESS: u32 = 0x1F_0003;
 
+/// `RelationProcessorCore`: ask for one record per physical core.
+pub const RELATION_PROCESSOR_CORE: i32 = 0;
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     pub fn VirtualAlloc(
@@ -60,4 +63,22 @@ unsafe extern "system" {
     ) -> u32;
     pub fn CloseHandle(handle: *mut c_void) -> i32;
     pub fn Sleep(milliseconds: u32);
+    pub fn GetLogicalProcessorInformationEx(
+        relationship: i32,
+        buffer: *mut u8,
+        length: *mut u32,
+    ) -> i32;
+    pub fn GetCurrentThread() -> *mut c_void;
+    pub fn GetCurrentProcessorNumber() -> u32;
+    pub fn SetThreadAffinityMask(thread: *mut c_void, mask: usize) -> usize;
+    pub fn SetThreadIdealProcessor(thread: *mut c_void, processor: u32) -> u32;
+    pub fn CreateThread(
+        attributes: *const c_void,
+        stack_size: usize,
+        start: *const c_void,
+        parameter: *const c_void,
+        flags: u32,
+        thread_id: *mut u32,
+    ) -> *mut c_void;
+    pub fn ResumeThread(thread: *mut c_void) -> u32;
 }

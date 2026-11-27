@@ -4,7 +4,7 @@ Console API implementations, and mapping title threads onto host cores.
 
 ## Interface
 
-So far: the import table, and sleeps and timed waits.
+So far: the import table, sleeps and timed waits, and title threads on their own cores.
 
 - `Imports` decides what each function a title imports is bound to. It is the `Resolver` that `riptide-pe::load` binds a title with. There are three answers:
   - **riptide**: Riptide's own implementation, added with `implement(module, symbol, address)`;
@@ -13,8 +13,10 @@ So far: the import table, and sleeps and timed waits.
 - `Imports::census(&image)` lists every import of a parsed image with its binding, sorted, with totals. It loads and runs nothing. `riptide census <image>` prints it.
 - A **stub** is a few bytes of generated code, one per import. Calling it logs `unimplemented import module!function was called`, once per import, and raises the exception `UNIMPLEMENTED_IMPORT` (`0xE0524950`), which cannot be continued. Unhandled, it ends the process with that exit code. A stub never returns a value.
 - `timers::sleep` and `timers::wait_for_single_object` are the title's `Sleep` and `WaitForSingleObject` (smaller decision S1). They wait on a high-resolution waitable timer, one per thread, so a 1 ms sleep takes about 1 ms and not Windows' 15.6 ms tick. `Imports::new()` binds them to `kernel32.dll!Sleep` and `kernel32.dll!WaitForSingleObject`.
+- `cores::CoreMap` lays the console's seven title cores over the host's (decision D8). Console core `n` is the first hardware thread of the `n`th physical core, fastest cores first. Riptide's own threads get everything else: the remaining cores and the second hardware thread of the title's cores. On the 7800X3D that is processors 0, 2, 4, ... 12 for the title and 1, 3, ... 13, 14, 15 for Riptide.
+- The title's `CreateThread`, `SetThreadAffinityMask`, `SetThreadIdealProcessor` and `GetCurrentProcessorNumber` speak the console's core numbers and are turned into the host's and back. A thread the title creates may run on the title's processors only. `cores::pin_riptide_thread()` keeps one of Riptide's own threads off them.
 
-Still to come: the other console functions, threads and core mapping, the file path, runtime services.
+Still to come: the other console functions, the file path, runtime services.
 
 ## Decisions made without a design document
 
@@ -24,6 +26,11 @@ Still to come: the other console functions, threads and core mapping, the file p
 - **A sleep of zero or forever, and a wait of zero or forever, go to Windows unchanged.** Only a real timeout needs the timer.
 - **If Windows gives no high-resolution timer, the sleep falls back to Windows' own**, late but not lost.
 - **Not covered yet:** `SleepEx`, `WaitForMultipleObjects`, and the timeouts of condition variables and critical sections.
+- **The title has seven cores, numbered 0 to 6.** That is the README's figure for what the console gives a title. A bit for any other core in an affinity mask is dropped, and a mask left empty means all seven.
+- **A host with fewer than eight physical cores shares them**, console cores wrapping around. It runs, and it is not what Riptide is built for.
+- **A processor that is no console core's** counts as the console core on the same physical core, or else as core 0, when the title asks where it is running.
+- **Only the first processor group is read**: 64 logical processors.
+- **Not covered yet:** what the title is told about the machine (`GetSystemInfo`, `GetProcessAffinityMask`), thread priorities, and threads the title creates in other ways.
 - **Pass-through is per function, never per module.** A function the table passes through but this Windows lacks becomes a stub.
 - **Module names compare without case; function names with it**, as Windows does.
 - **Stub code is never writable while executable.** Each block is one page of identical code and one page of data. The code page is filled once and made execute-only; a stub finds its own name through the data page.
@@ -40,4 +47,4 @@ Still to come: the other console functions, threads and core mapping, the file p
 
 ## Status
 
-Import resolution and 1 ms timers are built. Piece 4 of the build order, together with `riptide-pe`.
+Import resolution, 1 ms timers and the core map are built. Whether the one-core budget holds (open question Q7) has to be measured on the target machine. Piece 4 of the build order, together with `riptide-pe`.
