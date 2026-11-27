@@ -75,3 +75,13 @@ With the file-mapping heap, a view of part of the section mapped at its own addr
 Single runs move committed memory by up to about 60 MiB either way from other programs, which is why the first two rows are four runs each.
 
 Spread between runs of the probe: three runs of the probe that day gave 102 to 146 GiB/s for the video-to-video copy and 7,000 to 21,300 us for protecting 1 GiB. The other figures moved by less than 10 %.
+
+### 2026-11-27 · banks opened as heaps leave nothing committed · commit 5228dad
+
+Driver 32.0.32029.2010, Windows 11 build 26200. `cargo test -p riptide-mem --test gpu -- --ignored`, debug build: each run makes title memory, opens a 2 GiB bank as a heap from its address, checks that the GPU and the CPU see each other's writes at the places the page table gives, and exits. Committed memory read from Windows before the first run and five seconds after the last.
+
+| Runs | Passed | Committed before | Committed after | Change |
+| --- | --- | --- | --- | --- |
+| 4 | 4 | 24,990 MiB | 25,004 MiB | +14 MiB |
+
+A leak of the kind measured for file-mapping heaps would have been 8 GiB. One run of the real title on the same memory (about 4.7 GiB committed by the title in banks, none opened as a heap yet) moved the figure by under 100 MiB, inside what other programs move it by.

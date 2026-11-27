@@ -49,3 +49,7 @@ Still to come: the other console functions, the file path, runtime services.
 ## Status
 
 Import resolution, 1 ms timers and the core map are built. Whether the one-core budget holds (open question Q7) has to be measured on the target machine. Piece 4 of the build order, together with `riptide-pe`.
+
+Built since, against the real title: console memory calls on `riptide-mem`, the package drive, DirectStorage's file path (no BCPack, issue #33), and the parts of the runtime services (`xgameruntime.dll`) the title calls on its way to the graphics device: task queues, networking (offline), users (change events only), packages (fully installed), persistent local storage (`%LOCALAPPDATA%\Riptide	itles\<package identity>\local-storage`) and display (no HDR). Every method of those areas that is not built names itself and stops the title when called.
+
+With this the real title runs its start-up, opens its archives and calls `D3D12XboxCreateDevice`, which is not built: the graphics device is the next piece.

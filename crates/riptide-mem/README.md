@@ -55,6 +55,6 @@ Piece 3 of the build order, rebuilt on 2026-11-27 for decisions M1 to M8. `ripti
 
 Working and tested without a GPU (`cargo test -p riptide-mem`): frames, reservations, commit, physical pages at one and at several addresses, the page table, write guards through any address, and frames going back.
 
-Not yet run: the GPU test with the new banks (`cargo test -p riptide-mem --test gpu -- --ignored`). The way it opens a bank was measured on the target machine with a one-off test (see `docs/measurements.md`): it works, the GPU sees writes made through a second mapping, and nothing stays committed after the process exits.
+Run on the target machine (`cargo test -p riptide-mem --test gpu -- --ignored`, see `docs/measurements.md`): a bank opened as a heap, the GPU and the CPU seeing each other's writes where the page table says, and nothing left committed after the process exits. The real title makes its memory requests on it.
 
 Not built: nothing acts on the budget yet, and 2 MiB large pages (Q12) are not used.
