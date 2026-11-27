@@ -122,6 +122,7 @@ impl Imports {
         crate::timers::register(&mut imports);
         crate::process::register(&mut imports);
         crate::xmem::register(&mut imports);
+        crate::dstorage::register(&mut imports);
         crate::cores::register(&mut imports);
         imports
     }

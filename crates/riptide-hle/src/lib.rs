@@ -4,7 +4,9 @@
 //! the title's sleeps and timed waits, and title threads on their own cores.
 //! See README.md in this folder.
 
+mod com;
 pub mod cores;
+pub mod dstorage;
 mod imports;
 pub mod process;
 pub mod saves;
