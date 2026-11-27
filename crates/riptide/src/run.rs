@@ -249,7 +249,9 @@ fn run_with(args: &RunArgs, gather: impl FnOnce(&Settings, &Path) -> Machine) ->
         ));
         return EXIT_LOAD;
     }
-    riptide_hle::process::set_title(loaded.base(), &image_path);
+    riptide_hle::process::set_title(loaded.base(), &image_path, loaded.exports());
+    let trace_log = log.clone();
+    riptide_hle::set_trace(Arc::new(move |line: &str| trace_log.info(line)));
 
     log.info(format!("Running {name}, loaded at {:#x}.", loaded.base()));
     // SAFETY: running the title is what the user asked for. Its imports are bound to

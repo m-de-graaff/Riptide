@@ -95,3 +95,69 @@ unsafe extern "system" {
     ) -> *mut c_void;
     pub fn ResumeThread(thread: *mut c_void) -> u32;
 }
+
+/// `SYSTEM_INFO`, as `GetSystemInfo` fills it.
+#[repr(C)]
+pub struct SYSTEM_INFO {
+    pub processor_architecture: u16,
+    pub reserved: u16,
+    pub page_size: u32,
+    pub minimum_application_address: *mut c_void,
+    pub maximum_application_address: *mut c_void,
+    pub active_processor_mask: usize,
+    pub number_of_processors: u32,
+    pub processor_type: u32,
+    pub allocation_granularity: u32,
+    pub processor_level: u16,
+    pub processor_revision: u16,
+}
+
+impl Default for SYSTEM_INFO {
+    fn default() -> Self {
+        // SAFETY: every field is a number or a pointer, for which zero is a value.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// `MEM_ADDRESS_REQUIREMENTS`: where `VirtualAlloc2` may place memory.
+#[repr(C)]
+pub struct MEM_ADDRESS_REQUIREMENTS {
+    pub lowest_starting_address: *mut c_void,
+    pub highest_ending_address: *mut c_void,
+    pub alignment: usize,
+}
+
+/// `MEM_EXTENDED_PARAMETER` holding a pointer: its type in the low bits of the first word.
+#[repr(C)]
+pub struct MEM_EXTENDED_PARAMETER {
+    pub kind: u64,
+    pub pointer: *mut c_void,
+}
+
+/// `MemExtendedParameterAddressRequirements`.
+pub const MEM_EXTENDED_PARAMETER_ADDRESS_REQUIREMENTS: u64 = 1;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    pub fn GetSystemInfo(info: *mut SYSTEM_INFO);
+}
+
+// `VirtualAlloc2` has no entry in kernel32's import library; it lives in kernelbase.
+#[link(name = "kernelbase", kind = "raw-dylib")]
+unsafe extern "system" {
+    pub fn VirtualAlloc2(
+        process: *mut c_void,
+        base: *mut c_void,
+        size: usize,
+        allocation_type: u32,
+        protection: u32,
+        parameters: *mut MEM_EXTENDED_PARAMETER,
+        parameter_count: u32,
+    ) -> *mut c_void;
+}
+
+unsafe extern "C" {
+    pub fn _aligned_malloc(size: usize, alignment: usize) -> *mut c_void;
+    pub fn _aligned_free(block: *mut c_void);
+    pub fn _initterm(first: *const c_void, last: *const c_void);
+}

@@ -19,6 +19,8 @@ const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
 struct Title {
     base: usize,
+    /// What the title exports by name, as addresses.
+    exports: Vec<(String, usize)>,
     /// The image's full path, null-terminated, as UTF-16 and in the ANSI code page's place
     /// as UTF-8 bytes.
     path_wide: Vec<u16>,
@@ -45,7 +47,7 @@ static TITLE: OnceLock<Title> = OnceLock::new();
 
 /// Tells this module which image is the title. Called once, after the title is loaded and
 /// before it runs. Until then every question is passed to Windows unchanged.
-pub fn set_title(base: usize, path: &Path) {
+pub fn set_title(base: usize, path: &Path, exports: Vec<(String, usize)>) {
     let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     let text = path.to_string_lossy().replace('\0', "");
     let path_narrow = CString::new(text.clone()).expect("no null bytes");
@@ -56,6 +58,7 @@ pub fn set_title(base: usize, path: &Path) {
     ]));
     let _ = TITLE.set(Title {
         base,
+        exports,
         path_wide,
         path_narrow,
         command_line,
@@ -64,6 +67,16 @@ pub fn set_title(base: usize, path: &Path) {
             array: array.as_mut_ptr(),
         },
     });
+}
+
+/// The address of what the title exports as `name`, if a title is set and exports it.
+pub(crate) fn title_export(name: &str) -> Option<usize> {
+    TITLE
+        .get()?
+        .exports
+        .iter()
+        .find(|(exported, _)| exported == name)
+        .map(|&(_, address)| address)
 }
 
 /// Whether `module` means the title: null, which asks for "this program", or its base.
@@ -191,9 +204,37 @@ pub extern "C" fn narrow_winmain_command_line() -> *const c_char {
     c"".as_ptr()
 }
 
+/// The filter the title asked to have called for exceptions nothing handles.
+static TITLE_FILTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The title's `SetUnhandledExceptionFilter`. The filter is remembered and not installed:
+/// Riptide's own stays, so a crash is named in the session log as module plus offset
+/// instead of going to a crash reporter that has no console to report to.
+pub extern "system" fn set_unhandled_exception_filter(filter: usize) -> usize {
+    TITLE_FILTER.swap(filter, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The C runtime's `_initterm`: runs a table of initialisers. The title's start-up code
+/// calls it for its C++ constructors; once they have run, the title is ready to be told of
+/// threads starting and ending.
+///
+/// # Safety
+/// `first` and `last` bound a table of initialiser addresses, as the C runtime expects.
+pub unsafe extern "C" fn initterm(first: *const c_void, last: *const c_void) {
+    // SAFETY: passed through as received.
+    unsafe { sys::_initterm(first, last) };
+    riptide_pe::pass_thread_events();
+}
+
 pub(crate) fn register(imports: &mut Imports) {
     const RUNTIME: &str = "api-ms-win-crt-runtime-l1-1-0.dll";
-    let functions: [(&str, &str, usize); 8] = [
+    let functions: [(&str, &str, usize); 10] = [
+        (RUNTIME, "_initterm", initterm as *const () as usize),
+        (
+            "kernel32.dll",
+            "SetUnhandledExceptionFilter",
+            set_unhandled_exception_filter as *const () as usize,
+        ),
         (
             "kernel32.dll",
             "GetModuleHandleW",

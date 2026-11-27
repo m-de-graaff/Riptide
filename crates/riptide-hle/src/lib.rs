@@ -11,6 +11,9 @@ pub mod saves;
 mod stub;
 mod sys;
 pub mod timers;
+mod trace;
+pub mod xmem;
 
 pub use imports::{Binding, Census, CensusLine, Imports};
 pub use stub::{Log, UNIMPLEMENTED_IMPORT};
+pub use trace::set_trace;

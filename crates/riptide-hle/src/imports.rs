@@ -83,6 +83,8 @@ const HOST_MODULES: &[&str] = &[
     "advapi32.dll",
     "mfplat.dll",
     "mfreadwrite.dll",
+    // The input library is the same on the console and on Windows.
+    "gameinput.dll",
 ];
 
 /// The table of what every import is bound to. It is the [`Resolver`] `riptide-pe` binds a
@@ -119,6 +121,7 @@ impl Imports {
         imports.host_modules = true;
         crate::timers::register(&mut imports);
         crate::process::register(&mut imports);
+        crate::xmem::register(&mut imports);
         crate::cores::register(&mut imports);
         imports
     }
