@@ -53,6 +53,8 @@ pub enum LoadError {
     NoEntryPoint,
     /// A table that is only readable once mapped points outside the image.
     Malformed(&'static str),
+    /// Windows would not take the image's unwind table.
+    FunctionTable,
 }
 
 impl fmt::Display for LoadError {
@@ -72,6 +74,7 @@ impl fmt::Display for LoadError {
             LoadError::Unsupported(what) => write!(f, "the image uses {what}, not built yet"),
             LoadError::NoEntryPoint => write!(f, "the image has no entry point"),
             LoadError::Malformed(what) => write!(f, "the mapped image's {what} is malformed"),
+            LoadError::FunctionTable => write!(f, "Windows refused the image's unwind table"),
         }
     }
 }
@@ -232,7 +235,8 @@ pub fn load(name: &str, bytes: &[u8], resolver: &dyn Resolver) -> Result<LoadedI
 
     let delta = (base as u64).wrapping_sub(image.preferred_base);
     if delta != 0 {
-        if !image.relocatable || image.relocations.is_empty() {
+        // An image that may be moved and lists no fixups holds no absolute addresses.
+        if !image.relocatable {
             return Err(LoadError::NotRelocatable {
                 preferred_base: image.preferred_base,
             });
@@ -280,14 +284,23 @@ pub fn load(name: &str, bytes: &[u8], resolver: &dyn Resolver) -> Result<LoadedI
 
     // Give Windows the image's unwind table, so exceptions and stack walks pass through
     // title frames as they do for any loaded module.
-    let function_table = image.exception_table.and_then(|(rva, length)| {
-        // SAFETY: the parser checked the table lies inside the image; it stays mapped until
-        // this LoadedImage is dropped, which takes the table back first.
-        let table = unsafe { mapping.base.as_ptr().add(rva as usize) }.cast::<c_void>();
-        // SAFETY: `table` holds `length / 12` RUNTIME_FUNCTION entries relative to `base`.
-        let added = unsafe { sys::RtlAddFunctionTable(table, length / 12, base as u64) };
-        (added != 0).then_some(table.cast_const())
-    });
+    let function_table = match image.exception_table {
+        Some((rva, length)) => {
+            // SAFETY: the parser checked the table lies inside the image; it stays mapped
+            // until this LoadedImage is dropped, which takes the table back first.
+            let table = unsafe { mapping.base.as_ptr().add(rva as usize) }.cast::<c_void>();
+            // SAFETY: `table` holds `length / 12` RUNTIME_FUNCTION entries relative to
+            // `base`.
+            let added = unsafe { sys::RtlAddFunctionTable(table, length / 12, base as u64) };
+            if added == 0 {
+                // Without the table an exception in title code cannot unwind; refuse now
+                // instead of failing at the title's first exception.
+                return Err(LoadError::FunctionTable);
+            }
+            Some(table.cast_const())
+        }
+        None => None,
+    };
 
     fault::register(name, base, mapping.size);
     Ok(LoadedImage {

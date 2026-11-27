@@ -185,6 +185,24 @@ fn two_copies_load_at_different_bases_and_both_run() {
     let preferred = Image::parse(stand_in()).unwrap().preferred_base as usize;
     assert!(first.base() != preferred || second.base() != preferred);
 
+    // The value the title reports through its pointer is the same in every copy, so an
+    // unrelocated pointer into another copy would read it too. Read the pointers themselves:
+    // every relocated slot must point into its own copy.
+    let relocations = Image::parse(stand_in()).unwrap().relocations;
+    for loaded in [&first, &second] {
+        for &rva in &relocations {
+            // SAFETY: the parser checked the slot lies in the image, which is mapped and
+            // readable for as long as `loaded` lives.
+            let pointer =
+                unsafe { ((loaded.base() + rva as usize) as *const u64).read_unaligned() };
+            assert!(
+                loaded.contains(pointer as usize),
+                "the slot at {rva:#x} holds {pointer:#x}, outside the copy at {:#x}",
+                loaded.base()
+            );
+        }
+    }
+
     for loaded in [&first, &second] {
         take_reports();
         // SAFETY: as in the test above.

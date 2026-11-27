@@ -238,6 +238,16 @@ impl Image {
             {
                 return Err(ParseError::Malformed("section placement"));
             }
+            // Sections come in ascending order and do not overlap, as the linker writes
+            // them. Otherwise the tables checked here would not be the bytes that end up
+            // mapped.
+            if let Some(previous) = sections
+                .last()
+                .map(|s: &Section| u64::from(s.rva) + u64::from(s.virtual_size.max(s.raw_size)))
+                && u64::from(section.rva) < previous
+            {
+                return Err(ParseError::Malformed("section placement"));
+            }
             if u64::from(section.raw_offset) + u64::from(section.raw_size) > bytes.len() as u64 {
                 return Err(ParseError::Truncated("section data"));
             }
@@ -259,10 +269,11 @@ impl Image {
         };
 
         if entry_rva != 0
-            && !image
-                .sections
-                .iter()
-                .any(|s| s.executable && entry_rva >= s.rva && entry_rva - s.rva < s.virtual_size)
+            && !image.sections.iter().any(|s| {
+                s.executable
+                    && entry_rva >= s.rva
+                    && entry_rva - s.rva < s.virtual_size.max(s.raw_size)
+            })
         {
             return Err(ParseError::Malformed("entry point"));
         }
