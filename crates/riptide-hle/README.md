@@ -15,6 +15,7 @@ So far: the import table, sleeps and timed waits, and title threads on their own
 - `timers::sleep` and `timers::wait_for_single_object` are the title's `Sleep` and `WaitForSingleObject` (smaller decision S1). They wait on a high-resolution waitable timer, one per thread, so a 1 ms sleep takes about 1 ms and not Windows' 15.6 ms tick. `Imports::new()` binds them to `kernel32.dll!Sleep` and `kernel32.dll!WaitForSingleObject`.
 - `cores::CoreMap` lays the console's seven title cores over the host's (decision D8). Console core `n` is the first hardware thread of the `n`th physical core, fastest cores first. Riptide's own threads get everything else: the remaining cores and the second hardware thread of the title's cores. On the 7800X3D that is processors 0, 2, 4, ... 12 for the title and 1, 3, ... 13, 14, 15 for Riptide.
 - The title's `CreateThread`, `SetThreadAffinityMask`, `SetThreadIdealProcessor` and `GetCurrentProcessorNumber` speak the console's core numbers and are turned into the host's and back. A thread the title creates may run on the title's processors only. `cores::pin_riptide_thread()` keeps one of Riptide's own threads off them.
+- `saves::write` and `saves::read` are saves that cannot be half-written (smaller decision S6): a save is written beside the old one, flushed, and renamed over it. Nothing calls them yet; the console's save functions will.
 
 Still to come: the other console functions, the file path, runtime services.
 
