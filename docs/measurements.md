@@ -48,4 +48,14 @@ Driver 32.0.32029.2010. Debug test builds, as `cargo test` makes them.
 
 The 1 ms sleep is under the 2 ms the tests ask for, and half a millisecond over the 1 ms the console gives.
 
+### 2026-11-27 · committed memory left behind by in-place heaps · commit 47fcedc
+
+Driver 32.0.32029.2010, Windows 11 build 26200.
+
+A section that has been opened as a D3D12 heap stays charged against the commit limit after the process that made it has exited. Seen after the probe runs above: Windows reported 102.2 GiB committed of a 105.0 GiB limit, while the private memory of every running process summed to 14.3 GiB. The figure did not fall over the following minutes. The page file had grown to 73.8 GiB to carry it.
+
+Checked on a small scale: two runs of `cargo test -p riptide-mem --test gpu -- --ignored`, which opens one 64 MiB block as a heap and exits, raised committed memory by 82 MiB and then 56 MiB.
+
+Not yet known: whether restarting the graphics driver gives the memory back without a reboot, whether the driver or Windows holds it, and whether sections the heap was never opened on are affected (the 14 GiB section whose heap open failed appears not to be: the total fits the heaps that did open).
+
 Spread between runs of the probe: three runs of the probe that day gave 102 to 146 GiB/s for the video-to-video copy and 7,000 to 21,300 us for protecting 1 GiB. The other figures moved by less than 10 %.
