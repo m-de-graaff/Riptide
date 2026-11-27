@@ -1,0 +1,6 @@
+[alias]
+xtask = "run --package xtask --"
+# Release build for the target machine's Ryzen 7 7800X3D (Zen 4, AVX-512). The result does
+# not run on CPUs without Zen 4's instruction set, so it is opt-in:
+#   cargo build-7800x3d
+build-7800x3d = "build --release --config .cargo/znver4.toml"

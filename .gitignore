@@ -1,0 +1,4 @@
+.opensrc/
+/target/
+# Local runs: logs, captures, caches. They can contain game data and never leave this machine.
+/local/

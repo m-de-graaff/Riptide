@@ -1,0 +1,15 @@
+[package]
+name = "riptide"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+riptide-hle = { path = "../riptide-hle" }
+riptide-gpu = { path = "../riptide-gpu" }
+riptide-trace = { path = "../riptide-trace" }
