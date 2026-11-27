@@ -8,6 +8,7 @@
 mod device;
 mod fence;
 mod host;
+mod list;
 mod object;
 mod queue;
 mod resource;

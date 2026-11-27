@@ -198,7 +198,10 @@ pub(crate) fn device() -> &'static Device {
             (2, release as *const () as usize),
             (7, node_count as *const () as usize),
             (8, crate::queue::create as *const () as usize),
+            (9, crate::list::create_allocator as *const () as usize),
+            (12, crate::list::create_list as *const () as usize),
             (36, crate::fence::create as *const () as usize),
+            (73, crate::list::create_list_x as *const () as usize),
             (48, crate::queue::create_x as *const () as usize),
             (
                 26,

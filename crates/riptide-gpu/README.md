@@ -26,4 +26,6 @@ Started. The real title creates its device (on the RX 7900 XTX, from a 0x40-byte
 
 Built: device creation, `GetNodeCount`, `GetCustomHeapProperties`, command queues (`CreateCommandQueue`, `CreateCommandQueueX`, `Signal`, `Wait`) and fences (`GetCompletedValue`, `SetEventOnCompletion`, `Signal`, `GetCreationFlags`), each on a host object of the same kind.
 
-Not built: command allocators and lists, submission, resources, descriptors, pipelines and presenting. No unit test makes a host object yet; the host side has only run under the real title. Piece 6 of the build order.
+Written but not yet run, not even once: command allocators and lists (`CreateCommandAllocator`, `CreateCommandList`, `CreateCommandListX`, allocator `Reset`, list `GetType`, `Close` and `Reset`), each on a host object. A list keeps the console's layout with its put pointer and limits at zero, so the title's code calls every command instead of writing packets.
+
+Not built: every recording method of a list, submission, resources, descriptors, pipelines and presenting. No unit test makes a host object yet; the host side has only run under the real title. Piece 6 of the build order.
