@@ -4,12 +4,28 @@ The title's memory: one committed block of RAM that is also a D3D12 heap, its al
 
 ## Interface
 
-Reserve and commit ranges the way the console's memory APIs do; convert a console GPU address to an offset in the one buffer (one subtraction); write-protect a range and report the first write to it.
+**The block.** `TitleMemory::create(bytes)` makes one committed section of RAM and maps it once. A title's addresses are host addresses inside that view: the title's code runs natively and uses them as pointers. The whole block is charged against the page file at once; only pages that are touched use RAM.
+
+**The allocator.** The title's memory calls go through these, which behave as the console's (and Windows') virtual memory calls do:
+
+- `reserve(address, size)` reserves addresses, at `address` or at the lowest free place. A reservation starts on a 64 KiB boundary (`GRANULARITY`) and covers whole 4 KiB pages (`PAGE`).
+- `commit(address, size)` commits the pages covering a range inside one reservation. New pages read as zero; pages already committed keep their bytes.
+- `decommit(address, size)` makes pages inaccessible again; a size of zero means the whole reservation. They read as zero when committed again.
+- `release(address)` frees the reservation that starts at `address`.
+- `allocate(size)` reserves and commits in one call. `query(address)` reports the run of pages around an address that share one state: free, reserved or committed.
+
+Pages that are not committed are inaccessible to the CPU, so a stray access faults as it would on the console. Failures are a `MemError`, which `riptide-hle` turns into the console's error codes. All calls can be made from any thread.
+
+**Address conversion.** `address_map()` gives an `AddressMap { base, size }`. `map.offset(address)` is the offset in the buffer: one subtraction. `checked_offset` refuses an address outside title memory, and `address(offset)` goes the other way.
+
+**The heap.** `open_heap(device, flags)` opens the block as a D3D12 heap with one buffer over all of it. Offset `n` of the buffer is the byte at title address `base + n`. The GPU reads and writes every page, committed or not: page protection applies to the CPU only.
 
 ## Depends on
 
-- `riptide-trace`
+- `riptide-trace` (not used yet)
 
 ## Status
 
-Not started. Piece 3 of the build order.
+Piece 3 of the build order. Working: the block, the allocator, address conversion and the heap. The GPU test (`cargo test -p riptide-mem --test gpu -- --ignored`) needs a GPU and has passed on a development laptop with a 64 MiB block; it has not run on the target machine, and the 14 GiB block waits for the probe's answer to open question Q1.
+
+Not built yet: write guards, the RAM budget, and returning freed pages to Windows. Until the last one, decommitted pages keep their RAM, and are zeroed when committed again.

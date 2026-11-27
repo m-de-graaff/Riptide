@@ -1629,6 +1629,7 @@ name = "riptide-mem"
 version = "0.0.0"
 dependencies = [
  "riptide-trace",
+ "windows",
 ]
 
 [[package]]
