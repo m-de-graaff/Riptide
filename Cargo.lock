@@ -1634,6 +1634,7 @@ version = "0.0.0"
 name = "riptide-mem"
 version = "0.0.0"
 dependencies = [
+ "riptide-config",
  "riptide-trace",
  "windows",
 ]
