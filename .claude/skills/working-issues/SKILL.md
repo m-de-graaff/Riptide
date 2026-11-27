@@ -16,7 +16,7 @@ gh issue view <n> --repo m-de-graaff/Riptide --json title,body,labels,comments
 
 The body names its sources ("From:") and its finish line ("Done when:"). Read the design in
 `docs/design/` and the plan in `docs/plans/` if it names them. A design or plan in the repo is
-already approved: execute it. If there is none, state the design in the pull request and the
+already approved: execute it. If there is none, state the design in the issue comment and the
 crate's README, under a heading that says these decisions were made without a design document.
 
 ## 2. Find out which machine this is
@@ -48,26 +48,27 @@ question.
 
 ## 4. Build, verify, push
 
-- One branch per issue, from `main`: `<area>/issue-<n>` (`probe/issue-1`, `trace/issue-3`).
+- Work directly on `main`. One person works on this project: no branch per issue and no pull
+  requests.
 - Verify with what the issue's crate has: `cargo test -p <crate>`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check -p <crate>`.
   A script is run for real, in PowerShell 7 and in Windows PowerShell 5.1.
-- Commit, push, and open a pull request against `main`. Its body says `Closes #<n>` when every
-  "Done when" line is met, and `Refs #<n>` when something is still open.
-- Merging is the user's.
+- Commit finished, verified work to `main` and push it. Stage files by path, never
+  `git add -A`. The commit message says `Closes #<n>` when every "Done when" line is met, and
+  `Refs #<n>` when something is still open.
 
 ## 5. Comment on the issue
 
 One comment, with these parts in this order:
 
-1. **Status line**: `## Status: <built / partly built>, <what is still owed>`, then the branch
-   and pull request.
+1. **Status line**: `## Status: <built / partly built>, <what is still owed>`, then the
+   commits on `main`.
 2. **Done**: what exists and how it was verified, with the counts (tests passed, ignored).
 3. **Open**: each "Done when" line not yet met, and who or what it waits for.
 4. **Decisions or deviations**: anything decided without a design document, and every place
    the work departed from the plan.
 5. **To run**: every command the user has to run, each in its own `powershell` code block with
-   a line above it saying what it does and what to expect. Start with fetching the branch.
+   a line above it saying what it does and what to expect. Start with `git pull` on `main`.
 
 ## This laptop's build environment
 
