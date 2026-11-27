@@ -62,6 +62,9 @@ pub struct Facts {
     pub in_place_1gib: Option<bool>,
     /// The same at the title block's size.
     pub in_place_14gib: Option<bool>,
+    /// The title block's size as seven 2 GiB heaps open at once, each with data crossing
+    /// both ways. Only tried when one heap of that size would not open. `None`: not tried.
+    pub in_place_14gib_split: Option<bool>,
     pub gpu_copy: Vec<GpuCopy>,
     pub gpu_random_read: Vec<RandomRead>,
     /// A shader reading in-place memory computed the same sums as from a video-memory copy.
@@ -105,6 +108,16 @@ pub fn evaluate(f: &Facts) -> Vec<Check> {
             detail: format!(
                 "1 GiB: {:?}, 14 GiB: {:?}",
                 f.in_place_1gib, f.in_place_14gib
+            ),
+        },
+        Check {
+            id: "in_place_split",
+            question: "Q1",
+            required: false,
+            passed: f.in_place_14gib == Some(true) || f.in_place_14gib_split == Some(true),
+            detail: format!(
+                "14 GiB as seven 2 GiB heaps: {:?} (only tried when one heap fails)",
+                f.in_place_14gib_split
             ),
         },
         Check {

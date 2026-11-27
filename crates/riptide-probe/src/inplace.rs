@@ -130,7 +130,40 @@ fn try_size(gpu: &Gpu, bytes: u64, facts: &mut Facts) -> bool {
 pub fn check_in_place(gpu: &Gpu, facts: &mut Facts) {
     facts.in_place_1gib = Some(try_size(gpu, GIB, facts));
     facts.in_place_14gib = Some(try_size(gpu, 14 * GIB, facts));
+    if facts.in_place_14gib == Some(false) {
+        facts.in_place_14gib_split = Some(try_split(gpu, facts));
+    }
 }
+
+/// Q1's fallback: the title block's 14 GiB as several heaps of [`SPLIT_BYTES`], all open at
+/// once, each with data crossing both ways.
+fn try_split(gpu: &Gpu, facts: &mut Facts) -> bool {
+    let count = 14 * GIB / SPLIT_BYTES;
+    let mut heaps = Vec::new();
+    for index in 0..count {
+        match open(gpu, SPLIT_BYTES, D3D12_RESOURCE_FLAG_NONE) {
+            Ok(mem) => heaps.push(mem),
+            Err(e) => {
+                facts.notes.push(format!(
+                    "in-place 14 GiB as {count} heaps: heap {index} would not open: {e}"
+                ));
+                return false;
+            }
+        }
+    }
+    heaps.iter().enumerate().all(|(index, mem)| {
+        let intact = round_trip(gpu, mem);
+        if !matches!(intact, Ok(true)) {
+            facts.notes.push(format!(
+                "in-place 14 GiB as {count} heaps: heap {index}: {intact:?}"
+            ));
+        }
+        matches!(intact, Ok(true))
+    })
+}
+
+/// The size of each heap when the block is split.
+const SPLIT_BYTES: u64 = 2 * GIB;
 
 #[cfg(test)]
 mod tests {
@@ -143,6 +176,11 @@ mod tests {
         let mut facts = Facts::default();
         check_in_place(&gpu, &mut facts);
         assert_eq!(facts.in_place_1gib, Some(true), "notes: {:?}", facts.notes);
-        assert_eq!(facts.in_place_14gib, Some(true), "notes: {:?}", facts.notes);
+        // As one heap, or as several: either way the design has a way to hold the block.
+        assert!(
+            facts.in_place_14gib == Some(true) || facts.in_place_14gib_split == Some(true),
+            "notes: {:?}",
+            facts.notes
+        );
     }
 }
