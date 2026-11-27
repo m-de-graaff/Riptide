@@ -7,6 +7,7 @@
 mod com;
 pub mod cores;
 pub mod dstorage;
+mod files;
 mod imports;
 mod network;
 pub mod process;

@@ -79,6 +79,13 @@ pub(crate) fn title_export(name: &str) -> Option<usize> {
         .map(|&(_, address)| address)
 }
 
+/// The folder the title's image is in, once a title is set.
+pub(crate) fn title_folder() -> Option<std::path::PathBuf> {
+    let title = TITLE.get()?;
+    let path = String::from_utf16_lossy(&title.path_wide[..title.path_wide.len() - 1]);
+    Path::new(&path).parent().map(Path::to_path_buf)
+}
+
 /// Whether `module` means the title: null, which asks for "this program", or its base.
 fn is_title(title: &Title, module: *mut c_void) -> bool {
     module.is_null() || module as usize == title.base

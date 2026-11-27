@@ -55,6 +55,19 @@ unsafe extern "system" {
     pub fn GetModuleFileNameA(module: *mut c_void, buffer: *mut u8, size: u32) -> u32;
     pub fn GetCommandLineA() -> *const std::ffi::c_char;
     pub fn SetLastError(code: u32);
+    pub fn GetLastError() -> u32;
+    pub fn CreateFileW(
+        name: *const u16,
+        access: u32,
+        share: u32,
+        security: *const c_void,
+        disposition: u32,
+        flags: u32,
+        template: *mut c_void,
+    ) -> *mut c_void;
+    pub fn GetFileAttributesW(name: *const u16) -> u32;
+    pub fn GetFileAttributesExW(name: *const u16, level: u32, out: *mut c_void) -> i32;
+    pub fn FindFirstFileW(name: *const u16, out: *mut c_void) -> *mut c_void;
     pub fn CreateWaitableTimerExW(
         attributes: *const c_void,
         name: *const u16,
@@ -162,4 +175,5 @@ unsafe extern "C" {
     pub fn _aligned_malloc(size: usize, alignment: usize) -> *mut c_void;
     pub fn _aligned_free(block: *mut c_void);
     pub fn _initterm(first: *const c_void, last: *const c_void);
+    pub fn _wfopen(name: *const u16, mode: *const u16) -> *mut c_void;
 }
