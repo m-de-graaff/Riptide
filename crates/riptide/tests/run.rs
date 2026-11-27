@@ -148,8 +148,8 @@ fn the_stand_in_title_starts_and_stops_at_its_first_unbuilt_import() {
     assert_eq!(code, UNIMPLEMENTED_IMPORT as i32, "{log}");
     assert!(
         lines.contains(
-            &"stand-in-title.exe: 7 imports: 1 implemented by Riptide, 0 passed to the host, \
-              6 stubs."
+            &"stand-in-title.exe: 7 imports: 1 implemented by Riptide, 1 passed to the host, \
+              5 stubs."
         ),
         "{log}"
     );

@@ -177,6 +177,7 @@ pub struct LoadedImage {
     _carrier: Option<Carrier>,
     mapping: Mapping,
     entry_rva: u32,
+    stack_reserve: u64,
     tls_callbacks: Vec<usize>,
     /// The unwind table registered with Windows, to take back on drop.
     function_table: Option<*const c_void>,
@@ -335,6 +336,7 @@ pub fn load(name: &str, bytes: &[u8], resolver: &dyn Resolver) -> Result<LoadedI
         _carrier: carrier,
         mapping,
         entry_rva: image.entry_rva,
+        stack_reserve: image.stack_reserve,
         tls_callbacks,
         function_table,
     })
@@ -414,6 +416,41 @@ impl LoadedImage {
         let entry = unsafe { std::mem::transmute::<usize, EntryPoint>(self.entry_point()) };
         // SAFETY: as above.
         unsafe { entry() }
+    }
+}
+
+/// A borrowed image that may be run on another thread while its owner waits.
+struct OnOwnThread<'a>(&'a LoadedImage);
+
+// SAFETY: the image's memory belongs to the process, not to a thread. The one thread this is
+// sent to runs the image while the thread that owns it does nothing but wait.
+unsafe impl Send for OnOwnThread<'_> {}
+
+impl LoadedImage {
+    /// Runs the image as [`LoadedImage::run`] does, on a new thread with the stack the image
+    /// asks for (at least 1 MiB), and waits for it. A title's first thread expects the stack
+    /// size written in its header, which is often larger than this program's own.
+    ///
+    /// # Safety
+    ///
+    /// As for [`LoadedImage::run`].
+    pub unsafe fn run_on_own_thread(&self) -> std::io::Result<u32> {
+        const MIB: usize = 1 << 20;
+        let stack = usize::try_from(self.stack_reserve).unwrap_or(MIB).max(MIB);
+        let image = OnOwnThread(self);
+        std::thread::scope(|scope| {
+            let thread = std::thread::Builder::new()
+                .name(self.name.clone())
+                .stack_size(stack)
+                .spawn_scoped(scope, move || {
+                    let image = image;
+                    // SAFETY: the caller vouches for the image, as for `run`.
+                    unsafe { image.0.run() }
+                })?;
+            thread
+                .join()
+                .map_err(|_| std::io::Error::other("the title's thread panicked"))
+        })
     }
 }
 

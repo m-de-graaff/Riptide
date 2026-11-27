@@ -41,12 +41,49 @@ impl fmt::Display for Binding {
 type Key = (String, Symbol);
 
 fn key(module: &str, symbol: &Symbol) -> Key {
+    (canonical(module), symbol.clone())
+}
+
+/// A module's name in lower case with its extension.
+fn normalised(module: &str) -> String {
     let mut module = module.to_ascii_lowercase();
     if !module.contains('.') {
         module.push_str(".dll");
     }
-    (module, symbol.clone())
+    module
 }
+
+/// The name a module's functions are kept under. Titles import Windows' core functions
+/// through API-set names (`api-ms-win-core-synch-l1-2-0.dll` for `Sleep`), which are other
+/// names for `kernel32.dll`: all of them are kept as `kernel32.dll`, so a function is
+/// implemented once whatever name a title imports it by.
+fn canonical(module: &str) -> String {
+    let module = normalised(module);
+    if module.starts_with("api-ms-win-core-") || module == "kernelbase.dll" {
+        "kernel32.dll".to_owned()
+    } else {
+        module
+    }
+}
+
+/// Windows' own modules and the C and C++ runtime: a title's imports from these are the
+/// host's functions unless Riptide implements them. Matched against the start of the
+/// module's name. Console modules are never listed here: theirs are implemented or stubs.
+const HOST_MODULES: &[&str] = &[
+    "api-ms-win-",
+    "ext-ms-win-",
+    "kernel32.dll",
+    "kernelbase.dll",
+    "vcruntime140",
+    "msvcp140",
+    "ucrtbase.dll",
+    "ws2_32.dll",
+    "winhttp.dll",
+    "bcrypt.dll",
+    "advapi32.dll",
+    "mfplat.dll",
+    "mfreadwrite.dll",
+];
 
 /// The table of what every import is bound to. It is the [`Resolver`] `riptide-pe` binds a
 /// title with.
@@ -55,6 +92,8 @@ fn key(module: &str, symbol: &Symbol) -> Key {
 pub struct Imports {
     riptide: HashMap<Key, usize>,
     host: HashSet<Key>,
+    /// Whether [`HOST_MODULES`] are passed to the host whole.
+    host_modules: bool,
     stubs: Mutex<StubState>,
 }
 
@@ -77,7 +116,9 @@ impl Imports {
     /// As [`Imports::new`], with each stub's first call reported to `log` instead.
     pub fn with_log(log: Log) -> Imports {
         let mut imports = Imports::empty(log);
+        imports.host_modules = true;
         crate::timers::register(&mut imports);
+        crate::process::register(&mut imports);
         crate::cores::register(&mut imports);
         imports
     }
@@ -87,6 +128,7 @@ impl Imports {
         Imports {
             riptide: HashMap::new(),
             host: HashSet::new(),
+            host_modules: false,
             stubs: Mutex::new(StubState {
                 stubs: Stubs::new(log),
                 made: HashMap::new(),
@@ -120,7 +162,7 @@ impl Imports {
         let key = key(module, symbol);
         if self.riptide.contains_key(&key) {
             Binding::Riptide
-        } else if self.host.contains(&key) && host_address(module, symbol).is_some() {
+        } else if self.is_host(module, &key) && host_address(module, symbol).is_some() {
             Binding::Host
         } else {
             Binding::Stub
@@ -149,6 +191,17 @@ impl Imports {
     }
 }
 
+impl Imports {
+    /// Whether an import that Riptide does not implement goes to the host.
+    fn is_host(&self, module: &str, key: &Key) -> bool {
+        if self.host.contains(key) {
+            return true;
+        }
+        let module = normalised(module);
+        self.host_modules && HOST_MODULES.iter().any(|host| module.starts_with(host))
+    }
+}
+
 impl Default for Imports {
     fn default() -> Self {
         Imports::new()
@@ -163,7 +216,7 @@ impl Resolver for Imports {
         if let Some(&address) = self.riptide.get(&key) {
             return Some(address);
         }
-        if self.host.contains(&key)
+        if self.is_host(module, &key)
             && let Some(address) = host_address(module, symbol)
         {
             return Some(address);
@@ -183,15 +236,15 @@ impl Resolver for Imports {
 
 /// The address of the host's own function, if this Windows has that module and function.
 fn host_address(module: &str, symbol: &Symbol) -> Option<usize> {
-    let Symbol::Name(name) = symbol else {
-        return None;
-    };
     // A bare module name only: a path would name a file of the title's choosing.
     if module.contains(['/', '\\', ':']) {
         return None;
     }
     let module = CString::new(module).ok()?;
-    let name = CString::new(name.as_str()).ok()?;
+    let name = match symbol {
+        Symbol::Name(name) => Some(CString::new(name.as_str()).ok()?),
+        Symbol::Ordinal(_) => None,
+    };
     // SAFETY: both strings are null-terminated. Loading a module runs its initialisation, as
     // it would for any program that imports it; only Windows' own modules are looked for, so
     // a file of the same name in the title's folder is never loaded.
@@ -205,8 +258,16 @@ fn host_address(module: &str, symbol: &Symbol) -> Option<usize> {
     if handle.is_null() {
         return None;
     }
-    // SAFETY: `handle` is a loaded module and `name` is null-terminated.
-    let address = unsafe { sys::GetProcAddress(handle, name.as_ptr().cast()) };
+    // A function is asked for by its name, or by its ordinal passed in place of the name's
+    // address, which is how Windows takes one.
+    let wanted = match (&name, symbol) {
+        (Some(name), _) => name.as_ptr().cast::<u8>(),
+        (None, Symbol::Ordinal(ordinal)) => usize::from(*ordinal) as *const u8,
+        (None, Symbol::Name(_)) => return None,
+    };
+    // SAFETY: `handle` is a loaded module and `wanted` is a null-terminated name or an
+    // ordinal below 65536.
+    let address = unsafe { sys::GetProcAddress(handle, wanted) };
     (!address.is_null()).then_some(address as usize)
 }
 

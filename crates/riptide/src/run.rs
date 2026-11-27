@@ -242,11 +242,26 @@ fn run_with(args: &RunArgs, gather: impl FnOnce(&Settings, &Path) -> Machine) ->
         }
     };
 
+    // The title finds its files beside itself, and asks Windows who it is.
+    if let Err(error) = std::env::set_current_dir(&folder) {
+        log.error(format!(
+            "Not started: the game folder cannot be made the working folder: {error}."
+        ));
+        return EXIT_LOAD;
+    }
+    riptide_hle::process::set_title(loaded.base(), &image_path);
+
     log.info(format!("Running {name}, loaded at {:#x}.", loaded.base()));
     // SAFETY: running the title is what the user asked for. Its imports are bound to
     // Riptide's implementations, to host functions listed as the same, or to stubs that stop
     // the title when called.
-    let exit_code = unsafe { loaded.run() };
+    let exit_code = match unsafe { loaded.run_on_own_thread() } {
+        Ok(exit_code) => exit_code,
+        Err(error) => {
+            log.error(format!("{name} could not be started: {error}."));
+            return EXIT_LOAD;
+        }
+    };
     log.info(format!("{name} ended with exit code {exit_code}."));
     exit_code as i32
 }
@@ -427,8 +442,8 @@ mod tests {
         );
         assert!(
             lines.contains(
-                &"stand-in-title.exe: 7 imports: 1 implemented by Riptide, 0 passed to the \
-                  host, 6 stubs."
+                &"stand-in-title.exe: 7 imports: 1 implemented by Riptide, 1 passed to the \
+                  host, 5 stubs."
             ),
             "{text}"
         );

@@ -47,6 +47,12 @@ unsafe extern "system" {
     pub fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
     pub fn LoadLibraryExA(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void;
     pub fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    pub fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+    pub fn GetModuleHandleA(name: *const u8) -> *mut c_void;
+    pub fn GetModuleFileNameW(module: *mut c_void, buffer: *mut u16, size: u32) -> u32;
+    pub fn GetModuleFileNameA(module: *mut c_void, buffer: *mut u8, size: u32) -> u32;
+    pub fn GetCommandLineA() -> *const std::ffi::c_char;
+    pub fn SetLastError(code: u32);
     pub fn CreateWaitableTimerExW(
         attributes: *const c_void,
         name: *const u16,

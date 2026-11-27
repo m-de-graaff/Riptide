@@ -6,6 +6,7 @@
 
 pub mod cores;
 mod imports;
+pub mod process;
 pub mod saves;
 mod stub;
 mod sys;
