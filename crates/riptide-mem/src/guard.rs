@@ -12,7 +12,7 @@
 
 use std::ffi::c_void;
 use std::ops::Range;
-use std::sync::{Mutex, MutexGuard, Once};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use windows::Win32::System::Memory::{
     MEMORY_BASIC_INFORMATION, PAGE_PROTECTION_FLAGS, PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
@@ -170,6 +170,12 @@ unsafe extern "system" fn on_exception(pointers: *mut ExceptionPointers) -> i32 
     let address = record.parameters[1] as u64;
 
     let mut registry = registry();
+    // A write fault outside every block that has had a guard is none of our business, and
+    // is passed on without any further work.
+    let ours = registry.blocks.iter().any(|block| block.contains(&address));
+    if !ours {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     // Pages are protected whole, so a write anywhere on a guarded page ends every guard
     // that touches that page: after it, none of them would hear of a write there.
     let hit = registry.remove(|guard| guard.pages.contains(&address));
@@ -183,28 +189,32 @@ unsafe extern "system" fn on_exception(pointers: *mut ExceptionPointers) -> i32 
     // No guard covers the address. If another thread's write to the same resource ended
     // the guard a moment ago, this fault is a late one: the page is writable by now, and
     // the write only has to be tried again.
-    let ours = registry.blocks.iter().any(|block| block.contains(&address));
     drop(registry);
-    if ours && writable(address) {
+    if writable(address) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     EXCEPTION_CONTINUE_SEARCH
 }
 
-fn install_handler() {
-    static INSTALLED: Once = Once::new();
-    INSTALLED.call_once(|| {
+/// Installs the handler, once. Returns whether Windows took it: without it a protected page
+/// would turn the title's next write into a crash, so nothing may be protected then.
+fn install_handler() -> bool {
+    static INSTALLED: OnceLock<bool> = OnceLock::new();
+    *INSTALLED.get_or_init(|| {
         // SAFETY: `on_exception` has the signature Windows calls and lives as long as the
-        // process. It is put first, so it sees a guarded write before the title's handlers.
-        unsafe { AddVectoredExceptionHandler(1, on_exception) };
-    });
+        // process. It is put first, so it sees a guarded write before the handlers that are
+        // registered by then. A handler put first later runs ahead of it.
+        !unsafe { AddVectoredExceptionHandler(1, on_exception) }.is_null()
+    })
 }
 
 /// Write-protects the whole pages covering `range` and guards them for `resource`.
 /// `block` is the title memory block the range lies in. Returns false if `resource` is
 /// already guarded in that block, or Windows will not protect the pages.
 pub(crate) fn guard(block: Range<u64>, resource: u64, range: Range<u64>) -> bool {
-    install_handler();
+    if !install_handler() {
+        return false;
+    }
     let pages = range.start / PAGE * PAGE..range.end.div_ceil(PAGE) * PAGE;
     let mut registry = registry();
     if registry
@@ -250,12 +260,13 @@ pub(crate) fn end_overlapping(owner: u64, range: Range<u64>) {
         .extend(ended.iter().map(|guard| (guard.owner, guard.resource)));
 }
 
-/// The resources of `owner` written since the last call, in the order they were written.
+/// The resources of `owner` written since the last call, in the order they were first
+/// written. A resource guarded again and written again in between appears once.
 pub(crate) fn take_written(owner: u64) -> Vec<u64> {
     let mut registry = registry();
     let mut taken = Vec::new();
     registry.written.retain(|&(whose, resource)| {
-        if whose == owner {
+        if whose == owner && !taken.contains(&resource) {
             taken.push(resource);
         }
         whose != owner

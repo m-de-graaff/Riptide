@@ -2,6 +2,7 @@
 
 use crate::pages::MemError;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -13,7 +14,9 @@ use windows::core::PCWSTR;
 #[link(name = "kernel32")]
 unsafe extern "system" {
     /// Throws away the contents of committed pages and frees the RAM behind them at once.
-    /// The pages stay committed and read as zero afterwards. Returns zero on success.
+    /// The pages stay committed. Windows documents what they hold afterwards as undefined;
+    /// on a page-file-backed section they read as zero, which the tests check. Returns zero
+    /// on success.
     fn DiscardVirtualMemory(address: *mut core::ffi::c_void, size: usize) -> u32;
 }
 
@@ -25,6 +28,7 @@ pub(crate) struct Block {
     handle: HANDLE,
     view: *mut u8,
     bytes: u64,
+    discard_failures: AtomicU64,
 }
 
 // SAFETY: the handle and the view belong to the process, not to a thread. `Block` hands out
@@ -55,6 +59,7 @@ impl Block {
                 handle,
                 view: std::ptr::null_mut(),
                 bytes,
+                discard_failures: AtomicU64::new(0),
             };
             block.view = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, bytes as usize)
                 .Value
@@ -98,31 +103,56 @@ impl Block {
         .map_err(os)
     }
 
-    /// Makes pages readable and writable. They read as zero: a block starts as zeros, and
-    /// [`Block::close`] leaves zeros behind.
-    pub fn open(&self, range: Range<u64>) -> Result<(), MemError> {
-        self.protect(range, PAGE_READWRITE)
+    /// Makes pages readable and writable, reading as zero. `stale` says the pages were open
+    /// before and closed since.
+    ///
+    /// A block starts as zeros and [`Block::close`] leaves zeros behind, but a stale page
+    /// may have been written after it was closed: by a thread whose write was already past
+    /// the write guard when the page was taken away, or by the GPU, which page protection
+    /// does not bind. So stale pages are emptied once more here.
+    pub fn open(&self, range: Range<u64>, stale: bool) -> Result<(), MemError> {
+        self.protect(range.clone(), PAGE_READWRITE)?;
+        if stale {
+            self.empty(range);
+        }
+        Ok(())
+    }
+
+    /// Throws away what writable pages hold, giving their RAM back to Windows, so they read
+    /// as zero.
+    fn empty(&self, range: Range<u64>) {
+        let length = (range.end - range.start) as usize;
+        if length == 0 {
+            return;
+        }
+        assert!(range.end <= self.bytes);
+        // SAFETY: the range lies inside the view and is writable. The caller holds the
+        // allocator's lock and the title does not own these pages, so no one may be using
+        // them.
+        unsafe {
+            let start = self.view.add(range.start as usize);
+            if DiscardVirtualMemory(start.cast(), length) != 0 {
+                // Windows would not discard them. Zero them instead: the RAM stays in use,
+                // but the pages still read as zero.
+                self.discard_failures.fetch_add(1, Ordering::Relaxed);
+                std::ptr::write_bytes(start, 0, length);
+            }
+        }
+    }
+
+    /// How often Windows refused to discard pages, which were zeroed instead.
+    pub fn discard_failures(&self) -> u64 {
+        self.discard_failures.load(Ordering::Relaxed)
     }
 
     /// Gives the pages' RAM back to Windows at once and makes them inaccessible
     /// (decision D10). Whatever they held is gone; they read as zero when opened again.
     pub fn close(&self, range: Range<u64>) -> Result<(), MemError> {
-        let length = (range.end - range.start) as usize;
-        if length > 0 {
-            assert!(range.end <= self.bytes);
+        if range.end > range.start {
             // The pages may be write-protected by a guard that has just ended, and may never
             // have been opened at all; discarding and zeroing both need them writable.
             self.protect(range.clone(), PAGE_READWRITE)?;
-            // SAFETY: the range lies inside the view. The caller holds the allocator's lock
-            // and is taking these pages away from the title, so no one may be using them.
-            unsafe {
-                let start = self.view.add(range.start as usize);
-                if DiscardVirtualMemory(start.cast(), length) != 0 {
-                    // Windows would not discard them. Zero them instead: the RAM stays in
-                    // use, but the pages still read as zero when opened again.
-                    std::ptr::write_bytes(start, 0, length);
-                }
-            }
+            self.empty(range.clone());
         }
         self.protect(range, PAGE_NOACCESS)
     }

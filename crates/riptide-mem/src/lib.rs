@@ -130,11 +130,17 @@ impl TitleMemory {
         let at = self.offset(address)?;
         let mut map = self.map();
         let (range, runs) = map.commit(at, size)?;
+        // The map already says every run is committed, so the count follows the map and
+        // every run is opened, whatever happens to one of them. The first failure is
+        // returned once all are done.
+        let mut result = Ok(());
         for run in runs {
             let bytes = run.range.end - run.range.start;
-            self.block.open(run.range)?;
             self.committed.fetch_add(bytes, Ordering::Relaxed);
+            let opened = self.block.open(run.range, run.stale);
+            result = result.and(opened);
         }
+        result?;
         Ok(self.block.base() + range.start)
     }
 
@@ -156,30 +162,41 @@ impl TitleMemory {
     pub fn decommit(&self, address: u64, size: u64) -> Result<(), MemError> {
         let at = self.offset(address)?;
         let mut map = self.map();
+        let mut result = Ok(());
         for run in map.decommit(at, size)? {
-            self.give_back(run)?;
+            result = result.and(self.give_back(run));
         }
-        Ok(())
+        result
     }
 
     /// Frees the reservation that starts at `address`, decommitting whatever is committed.
     pub fn release(&self, address: u64) -> Result<(), MemError> {
         let at = self.offset(address)?;
         let mut map = self.map();
+        let mut result = Ok(());
         for run in map.release(at)?.1 {
-            self.give_back(run)?;
+            result = result.and(self.give_back(run));
         }
-        Ok(())
+        result
     }
 
     /// Takes committed pages, given as offsets, away from the title: ends their guards,
     /// gives their RAM back to Windows and makes them inaccessible.
+    ///
+    /// The map already says the pages are decommitted, so the count follows the map even if
+    /// Windows refuses to close them.
     fn give_back(&self, run: Range<u64>) -> Result<(), MemError> {
         let bytes = run.end - run.start;
         self.end_guards(&run);
-        self.block.close(run)?;
         self.committed.fetch_sub(bytes, Ordering::Relaxed);
-        Ok(())
+        self.block.close(run)
+    }
+
+    /// How often Windows refused to give decommitted pages' RAM back. The pages were zeroed
+    /// instead and their RAM stayed in use. Not zero means decommitting frees nothing on
+    /// this machine, which the RAM budget has to know.
+    pub fn discard_failures(&self) -> u64 {
+        self.block.discard_failures()
     }
 
     /// How many bytes of title memory are committed right now.
@@ -264,7 +281,11 @@ impl TitleMemory {
     }
 
     /// The resources whose guard was ended by a write, or by their pages being decommitted,
-    /// since the last call. Each appears once, in the order it happened.
+    /// since the last call. Each appears once, in the order it first happened.
+    ///
+    /// Guard a resource before copying it, not after: a write between the copy and the
+    /// guard is never heard of. A report says a guard of that resource ended; if the
+    /// resource has been guarded again since, the new guard may still stand.
     pub fn take_written(&self) -> Vec<u64> {
         guard::take_written(self.block.base())
     }

@@ -43,7 +43,7 @@ pub struct RamUse {
 
 impl RamUse {
     pub fn total(&self) -> u64 {
-        self.title + self.private
+        self.title.saturating_add(self.private)
     }
 }
 
