@@ -4,8 +4,12 @@
 //! A reservation is cut into pieces. A piece is either empty address space or a view of
 //! consecutive frames of one bank. The pieces are the page table: finding the frames behind
 //! an address is finding its piece.
+//!
+//! A title can also cut a reservation into parts of its own, each of which it then fills,
+//! empties and gives back by itself. A cut is a place where empty pieces are never joined,
+//! so what Windows holds there stays what the title made.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::MemError;
@@ -31,8 +35,11 @@ impl Piece {
 struct Reservation {
     bytes: u64,
     /// Every piece by where it starts. Together they cover the reservation exactly, and no
-    /// two empty pieces are neighbours.
+    /// two empty pieces are neighbours unless a cut lies between them.
     pieces: BTreeMap<u64, Piece>,
+    /// Where the title cut the reservation into parts: addresses strictly inside it. A
+    /// piece never reaches across one.
+    cuts: BTreeSet<u64>,
 }
 
 /// Part of a bank that a range of title addresses lies in.
@@ -63,8 +70,14 @@ impl Space {
         }
         let start = os::reserve(bytes, limits)?;
         let pieces = BTreeMap::from([(start, Piece { bytes, frame: None })]);
-        self.reservations
-            .insert(start, Reservation { bytes, pieces });
+        self.reservations.insert(
+            start,
+            Reservation {
+                bytes,
+                pieces,
+                cuts: BTreeSet::new(),
+            },
+        );
         Ok(start)
     }
 
@@ -86,9 +99,24 @@ impl Space {
         self.reservations.keys().next().copied()
     }
 
-    /// The size of the reservation that starts exactly at `address`.
-    pub(crate) fn reservation(&self, address: u64) -> Option<u64> {
-        self.reservations.get(&address).map(|r| r.bytes)
+    /// The part that starts exactly at `address`: a whole reservation, or what lies between
+    /// two of the title's cuts in one.
+    pub(crate) fn part(&self, address: u64) -> Option<Range<u64>> {
+        let (&start, reservation) = self.reservations.range(..=address).next_back()?;
+        let end = start + reservation.bytes;
+        if address >= end || (address != start && !reservation.cuts.contains(&address)) {
+            return None;
+        }
+        let next = reservation.cuts.range(address + 1..).next().copied();
+        Some(address..next.unwrap_or(end))
+    }
+
+    /// Whether `address` lies in a reservation.
+    pub(crate) fn holds(&self, address: u64) -> bool {
+        self.reservations
+            .range(..=address)
+            .next_back()
+            .is_some_and(|(&start, reservation)| address < start + reservation.bytes)
     }
 
     /// The pieces that overlap `range`, as (start, piece).
@@ -107,19 +135,21 @@ impl Space {
     }
 
     /// Joins the empty piece at `at` with empty neighbours, in the bookkeeping and in
-    /// Windows.
+    /// Windows. Nothing is joined across a cut.
     fn join_around(reservation: &mut Reservation, at: u64) -> Result<(), MemError> {
         let mut start = at;
         let mut end = at + reservation.pieces[&at].bytes;
         let mut joined = 1;
         while let Some((&before, piece)) = reservation.pieces.range(..start).next_back()
             && piece.frame.is_none()
+            && !reservation.cuts.contains(&start)
         {
             start = before;
             joined += 1;
         }
         while let Some(piece) = reservation.pieces.get(&end)
             && piece.frame.is_none()
+            && !reservation.cuts.contains(&end)
         {
             end += piece.bytes;
             joined += 1;
@@ -278,22 +308,120 @@ impl Space {
         let displaced = self.unmap(range.clone(), sections)?;
         let holder = self.holding(&range)?;
         let reservation = self.reservations.get_mut(&holder).expect("found above");
-        Self::place(reservation, at, run, sections, protection)?;
+        // A view cannot reach across a cut, so the run is mapped part by part.
+        let mut bounds = vec![range.start];
+        bounds.extend(reservation.cuts.range(range.start + 1..range.end));
+        bounds.push(range.end);
+        for pair in bounds.windows(2) {
+            let part = FrameRun {
+                first: run.first + ((pair[0] - at) / FRAME) as u32,
+                count: ((pair[1] - pair[0]) / FRAME) as u32,
+            };
+            Self::place(reservation, pair[0], part, sections, protection)?;
+        }
         Ok(displaced)
     }
 
-    /// Gives a whole reservation's addresses back. Returns the frames that were mapped in
-    /// it.
+    /// Makes `range` a part of its own in its reservation: what is mapped there is taken
+    /// away, and its ends become cuts. Returns the frames that were mapped there.
+    pub(crate) fn cut(
+        &mut self,
+        range: Range<u64>,
+        sections: &[Section],
+    ) -> Result<Vec<FrameRun>, MemError> {
+        let removed = self.unmap(range.clone(), sections)?;
+        let holder = self.holding(&range)?;
+        let reservation = self.reservations.get_mut(&holder).expect("found above");
+        let whole = holder..holder + reservation.bytes;
+        for at in [range.start, range.end] {
+            if at == whole.start || at == whole.end || reservation.cuts.contains(&at) {
+                continue;
+            }
+            let (&start, &piece) = reservation
+                .pieces
+                .range(..=at)
+                .next_back()
+                .ok_or(MemError::InvalidAddress)?;
+            let end = start + piece.bytes;
+            if start < at {
+                // The range was emptied, so a piece that reaches across one of its ends is
+                // empty too.
+                if piece.frame.is_some() {
+                    return Err(MemError::InvalidAddress);
+                }
+                // SAFETY: `at..end` lies inside the empty piece `start..end` and is smaller.
+                unsafe { os::split(at..end)? };
+                for (from, to) in [(start, at), (at, end)] {
+                    reservation.pieces.insert(
+                        from,
+                        Piece {
+                            bytes: to - from,
+                            frame: None,
+                        },
+                    );
+                }
+            }
+            reservation.cuts.insert(at);
+        }
+        Ok(removed)
+    }
+
+    /// Takes away the cuts strictly inside `range`, and joins the empty pieces they kept
+    /// apart.
+    pub(crate) fn uncut(&mut self, range: Range<u64>) -> Result<(), MemError> {
+        let holder = self.holding(&range)?;
+        let reservation = self.reservations.get_mut(&holder).expect("found above");
+        let inside: Vec<u64> = reservation
+            .cuts
+            .range(range.start + 1..range.end)
+            .copied()
+            .collect();
+        for at in &inside {
+            reservation.cuts.remove(at);
+        }
+        for at in inside {
+            if reservation
+                .pieces
+                .get(&at)
+                .is_some_and(|piece| piece.frame.is_none())
+            {
+                Self::join_around(reservation, at)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Gives the addresses of the part that starts at `start` back: a whole reservation, or
+    /// one of the parts the title cut it into. Returns the frames that were mapped in it.
+    /// What is left of the reservation on either side goes on as a reservation of its own.
     pub(crate) fn release(
         &mut self,
         start: u64,
         sections: &[Section],
     ) -> Result<Vec<FrameRun>, MemError> {
-        let bytes = self.reservation(start).ok_or(MemError::InvalidAddress)?;
-        let removed = self.unmap(start..start + bytes, sections)?;
-        // SAFETY: everything in it was unmapped and joined above: one unused placeholder.
+        let part = self.part(start).ok_or(MemError::InvalidAddress)?;
+        let removed = self.unmap(part.clone(), sections)?;
+        // SAFETY: everything in it was unmapped and joined above, and nothing joins across
+        // its ends: one unused placeholder.
         unsafe { os::release(start)? };
-        self.reservations.remove(&start);
+        let holder = self.holding(&part)?;
+        let reservation = self.reservations.remove(&holder).expect("found above");
+        for (from, to) in [(holder, part.start), (part.end, holder + reservation.bytes)] {
+            if from < to {
+                self.reservations.insert(
+                    from,
+                    Reservation {
+                        bytes: to - from,
+                        pieces: reservation
+                            .pieces
+                            .range(from..to)
+                            .map(|(&at, &piece)| (at, piece))
+                            .collect(),
+                        cuts: reservation.cuts.range(from + 1..to).copied().collect(),
+                    },
+                );
+            }
+        }
         Ok(removed)
     }
 

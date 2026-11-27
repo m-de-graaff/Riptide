@@ -326,19 +326,55 @@ impl TitleMemory {
         Ok(())
     }
 
-    /// Gives back the reservation that starts at `address`, and what is mapped in it.
+    /// Gives back the part that starts at `address`, and what is mapped in it: a whole
+    /// reservation, or one of the parts the title cut it into with [`TitleMemory::cut`].
     pub fn release(&self, address: u64) -> Result<(), MemError> {
         let mut state = self.state();
-        let bytes = state
-            .space
-            .reservation(address)
-            .ok_or(MemError::InvalidAddress)?;
+        let part = state.space.part(address).ok_or(MemError::InvalidAddress)?;
         let State {
             space, sections, ..
         } = &mut *state;
         let removed = space.release(address, sections)?;
-        self.unmapped(&mut state, address..address + bytes, removed);
+        self.unmapped(&mut state, part, removed);
         Ok(())
+    }
+
+    /// Whether `address` lies in a reservation of this title memory.
+    pub fn holds(&self, address: u64) -> bool {
+        self.state().space.holds(address)
+    }
+
+    /// The size of the part that starts exactly at `address`: a whole reservation, or what
+    /// lies between two cuts in one.
+    pub fn part(&self, address: u64) -> Option<u64> {
+        let part = self.state().space.part(address)?;
+        Some(part.end - part.start)
+    }
+
+    /// Makes `bytes` at `address` a part of its own in its reservation, as a title does
+    /// before it fills the parts of a reservation separately. What is mapped there is taken
+    /// away. Whole frames only.
+    pub fn cut(&self, address: u64, bytes: u64) -> Result<(), MemError> {
+        let range = address
+            ..address
+                .checked_add(bytes)
+                .ok_or(MemError::InvalidParameter)?;
+        let mut state = self.state();
+        let State {
+            space, sections, ..
+        } = &mut *state;
+        let removed = space.cut(range.clone(), sections)?;
+        self.unmapped(&mut state, range, removed);
+        Ok(())
+    }
+
+    /// Undoes the cuts strictly inside `bytes` at `address`. Nothing mapped changes.
+    pub fn uncut(&self, address: u64, bytes: u64) -> Result<(), MemError> {
+        let range = address
+            ..address
+                .checked_add(bytes)
+                .ok_or(MemError::InvalidParameter)?;
+        self.state().space.uncut(range)
     }
 
     /// Hands the title `count` frames as physical pages, by number. They are mapped with
@@ -639,6 +675,93 @@ mod tests {
     fn read(address: u64) -> u8 {
         // SAFETY: every caller passes an address it has just mapped.
         unsafe { (address as *const u8).read_volatile() }
+    }
+
+    /// What a title does with one reservation for several kinds of graphics memory: cuts
+    /// it into parts, fills each with physical pages, and gives the parts back one by one.
+    #[test]
+    fn a_reservation_cut_into_parts_is_filled_and_given_back_part_by_part() {
+        let memory = TitleMemory::new(BANK_BYTES);
+        let base = memory.reserve(64 * FRAME, ANYWHERE).unwrap();
+        let parts = [(0, 10), (10, 1), (11, 27), (38, 26)];
+        for (first, count) in parts {
+            memory.cut(base + first * FRAME, count * FRAME).unwrap();
+        }
+        for (first, count) in parts {
+            assert_eq!(memory.part(base + first * FRAME), Some(count * FRAME));
+        }
+        assert_eq!(memory.part(base + 5 * FRAME), None);
+
+        let frames = memory.allocate_frames(27).unwrap();
+        memory
+            .map_frames(base + 11 * FRAME, &frames, Access::ReadWrite)
+            .unwrap();
+        write(base + 11 * FRAME, 7);
+        write(base + 37 * FRAME, 9);
+        assert_eq!((read(base + 11 * FRAME), read(base + 37 * FRAME)), (7, 9));
+
+        // Emptying a part leaves it a part: its neighbours are not joined to it.
+        memory.unmap(base + 11 * FRAME, 27 * FRAME).unwrap();
+        assert_eq!(memory.part(base + 11 * FRAME), Some(27 * FRAME));
+        memory
+            .map_frames(base + 11 * FRAME, &frames, Access::ReadWrite)
+            .unwrap();
+
+        // A middle part goes; the parts on either side stay, and each still goes alone.
+        memory.release(base + 11 * FRAME).unwrap();
+        assert!(!memory.holds(base + 11 * FRAME));
+        assert_eq!(
+            memory.release(base + 11 * FRAME),
+            Err(MemError::InvalidAddress)
+        );
+        assert_eq!(memory.part(base), Some(10 * FRAME));
+        assert_eq!(memory.part(base + 10 * FRAME), Some(FRAME));
+        memory.release(base + 10 * FRAME).unwrap();
+        memory.release(base).unwrap();
+        memory.release(base + 38 * FRAME).unwrap();
+        assert!(!memory.holds(base) && !memory.holds(base + 63 * FRAME));
+        memory.free_frames(&frames).unwrap();
+    }
+
+    #[test]
+    fn pages_mapped_across_a_cut_lie_on_both_sides_of_it() {
+        let memory = TitleMemory::new(BANK_BYTES);
+        let base = memory.reserve(16 * FRAME, ANYWHERE).unwrap();
+        memory.cut(base + 4 * FRAME, 4 * FRAME).unwrap();
+        let at = memory
+            .commit(
+                Some(base + 2 * FRAME),
+                8 * FRAME,
+                ANYWHERE,
+                Access::ReadWrite,
+            )
+            .unwrap();
+        assert_eq!(at, base + 2 * FRAME);
+        for frame in 2..10 {
+            write(base + frame * FRAME, frame as u8);
+        }
+        assert_eq!(read(base + 9 * FRAME), 9);
+        assert!(memory.locate(base + 2 * FRAME, 8 * FRAME).is_some());
+
+        // Cutting through mapped memory takes away what lies in the new part only.
+        memory.cut(base + 8 * FRAME, FRAME).unwrap();
+        assert_eq!(memory.locate(base + 8 * FRAME, FRAME), None);
+        assert_eq!((read(base + 7 * FRAME), read(base + 9 * FRAME)), (7, 9));
+        memory.release(base).unwrap();
+    }
+
+    #[test]
+    fn parts_joined_again_are_one_part() {
+        let memory = TitleMemory::new(BANK_BYTES);
+        let base = memory.reserve(8 * FRAME, ANYWHERE).unwrap();
+        memory.cut(base + 2 * FRAME, 2 * FRAME).unwrap();
+        assert_eq!(memory.part(base), Some(2 * FRAME));
+        memory.uncut(base, 8 * FRAME).unwrap();
+        assert_eq!(memory.part(base), Some(8 * FRAME));
+        assert_eq!(memory.part(base + 2 * FRAME), None);
+        // One placeholder again: Windows gives all of it back at once.
+        memory.release(base).unwrap();
+        assert!(!memory.holds(base));
     }
 
     #[test]

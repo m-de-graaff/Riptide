@@ -155,8 +155,13 @@ pub unsafe extern "system" fn virtual_alloc(
         memory().commit(at, size as u64, limits, access(protect))
     } else if !base.is_null() {
         if allocation_type & MEM_REPLACE_PLACEHOLDER != 0 {
-            // The title is carving up a reservation it already has; nothing changes.
-            Ok(base as u64)
+            // The title takes a part it cut out of a reservation it already has, with
+            // `VirtualFree`. The part stays empty address space until it is filled.
+            if memory().part(base as u64) == Some(size as u64) {
+                Ok(base as u64)
+            } else {
+                Err(riptide_mem::MemError::InvalidAddress)
+            }
         } else {
             // A reservation at an address of the title's choosing has not been needed.
             Err(riptide_mem::MemError::InvalidParameter)
@@ -182,6 +187,82 @@ pub unsafe extern "system" fn virtual_alloc(
 }
 
 const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+const ERROR_INVALID_ADDRESS: u32 = 487;
+
+const MEM_DECOMMIT: u32 = 0x4000;
+const MEM_RELEASE: u32 = 0x8000;
+const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
+const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
+
+/// What a `VirtualFree` of title memory does, by its `free_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Freeing {
+    /// Takes the memory away and keeps the addresses.
+    Decommit,
+    /// Gives the addresses back, with what is mapped there.
+    Release,
+    /// Makes the range a part of its own in its reservation.
+    Cut,
+    /// Makes the parts in the range one part again.
+    Join,
+}
+
+fn freeing(free_type: u32) -> Option<Freeing> {
+    const CUT: u32 = MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER;
+    const JOIN: u32 = MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS;
+    match free_type {
+        MEM_DECOMMIT => Some(Freeing::Decommit),
+        MEM_RELEASE => Some(Freeing::Release),
+        CUT => Some(Freeing::Cut),
+        JOIN => Some(Freeing::Join),
+        _ => None,
+    }
+}
+
+/// `kernel32.dll!VirtualFree`. A title frees what `XMemVirtualAlloc` gave it with this, and
+/// cuts a reservation into parts with it. Title memory is ours to keep the books of, so
+/// those calls are done here; any other address goes to Windows.
+///
+/// # Safety
+/// The arguments are the title's own.
+pub unsafe extern "system" fn virtual_free(
+    address: *mut c_void,
+    size: usize,
+    free_type: u32,
+) -> i32 {
+    let at = address as u64;
+    if !memory().holds(at) {
+        // SAFETY: not title memory: the title's own call, passed on unchanged.
+        return unsafe { sys::VirtualFree(address, size, free_type) };
+    }
+    let bytes = size as u64;
+    let result = match freeing(free_type) {
+        // With no size, all of the part that starts there.
+        Some(Freeing::Decommit) if size == 0 => memory()
+            .part(at)
+            .ok_or(riptide_mem::MemError::InvalidAddress)
+            .and_then(|bytes| memory().unmap(at, bytes)),
+        Some(Freeing::Decommit) => memory().unmap(at, bytes),
+        Some(Freeing::Release) if size == 0 => memory().release(at),
+        Some(Freeing::Cut) => memory().cut(at, bytes),
+        Some(Freeing::Join) => memory().uncut(at, bytes),
+        Some(Freeing::Release) | None => Err(riptide_mem::MemError::InvalidParameter),
+    };
+    if free_type != MEM_DECOMMIT || result.is_err() {
+        trace!(
+            "VirtualFree({address:p}, size {size:#x}, type {free_type:#x}) on title memory{}",
+            match result {
+                Ok(()) => String::new(),
+                Err(error) => format!(": {error}"),
+            }
+        );
+    }
+    if result.is_err() {
+        // SAFETY: the call has no preconditions.
+        unsafe { sys::SetLastError(ERROR_INVALID_ADDRESS) };
+    }
+    i32::from(result.is_ok())
+}
 
 type AllocRoutine = unsafe extern "system" fn(usize, u64) -> *mut c_void;
 type FreeRoutine = unsafe extern "system" fn(*mut c_void, u64);
@@ -423,7 +504,12 @@ pub unsafe extern "system" fn map_physical_pages_scatter(
 }
 
 pub(crate) fn register(imports: &mut Imports) {
-    let functions: [(&str, &str, usize); 11] = [
+    let functions: [(&str, &str, usize); 12] = [
+        (
+            "kernel32.dll",
+            "VirtualFree",
+            virtual_free as *const () as usize,
+        ),
         (
             "d3d12_xs.dll",
             "D3D12ConfigureVirtualMemoryX",
@@ -545,15 +631,22 @@ mod tests {
                 0x801,
             );
             assert!(!range.is_null());
-            // Carving it up is answered without changing anything.
-            let part = virtual_alloc(
-                range,
-                FRAME as usize,
-                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | PAGES_2M | PAGES_64K_BIT,
-                0x3,
-                0x801,
-            );
-            assert_eq!(part, range);
+            // The title cuts a part off with `VirtualFree` and then takes it. A part it has
+            // not cut is not there to take.
+            let take = |size: u64| {
+                virtual_alloc(
+                    range,
+                    size as usize,
+                    MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | PAGES_2M | PAGES_64K_BIT,
+                    0x3,
+                    0x801,
+                )
+            };
+            assert!(take(FRAME).is_null());
+            let cut = MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER;
+            assert_eq!(virtual_free(range, FRAME as usize, cut), 1);
+            assert_eq!(take(FRAME), range);
+            assert!(take(2 * FRAME).is_null());
 
             let mut count = 3usize;
             let mut pages = [0usize; 3];
@@ -592,7 +685,35 @@ mod tests {
             );
             assert_eq!(free_physical_pages(3, pages.as_ptr()), 1);
             assert_eq!(free_physical_pages(3, pages.as_ptr()), 0);
-            memory().release(range as u64).unwrap();
+
+            // Each part is given back by itself, and then is title memory no more.
+            let rest = range.cast::<u8>().add(FRAME as usize).cast::<c_void>();
+            assert_eq!(virtual_free(range, 0, MEM_RELEASE), 1);
+            assert!(!memory().holds(range as u64) && memory().holds(rest as u64));
+            assert_eq!(virtual_free(rest, FRAME as usize, MEM_RELEASE), 0);
+            assert_eq!(virtual_free(rest, 0, MEM_RELEASE), 1);
+            assert!(!memory().holds(rest as u64));
+        }
+    }
+
+    #[test]
+    fn a_free_type_says_what_a_free_of_title_memory_does() {
+        assert_eq!(freeing(0x4000), Some(Freeing::Decommit));
+        assert_eq!(freeing(0x8000), Some(Freeing::Release));
+        assert_eq!(freeing(0x8002), Some(Freeing::Cut));
+        assert_eq!(freeing(0x8001), Some(Freeing::Join));
+        assert_eq!(freeing(0xC000), None);
+        assert_eq!(freeing(0), None);
+    }
+
+    #[test]
+    fn a_free_of_memory_that_is_not_the_titles_goes_to_windows() {
+        // SAFETY: a block from Windows, freed once, through the function under test.
+        unsafe {
+            let block = sys::VirtualAlloc(std::ptr::null_mut(), 0x1_0000, 0x3000, PAGE_READWRITE);
+            assert!(!block.is_null());
+            assert!(!memory().holds(block as u64));
+            assert_eq!(virtual_free(block.cast(), 0, MEM_RELEASE), 1);
         }
     }
 
