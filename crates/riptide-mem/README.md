@@ -27,12 +27,24 @@ Pages that are not committed are inaccessible to the CPU, so a stray access faul
 - The fault is caught by a vectored exception handler, which Windows calls before the title's own handlers. It answers only for write faults on guarded pages and passes every other fault on, so a title's exception handling keeps working.
 - When several threads write one guarded resource at once, the first ends the guard and the others find the page writable and try again. One report, no lost write.
 
+**Freed pages go back to Windows at once** (decision D10). `decommit` and `release` discard the pages' contents and free the RAM behind them before making them inaccessible. The pages read as zero when committed again.
+
+**The RAM budget** (decision D10).
+
+- `RamBudget::from_settings(&settings)` sets the limit once, at launch: the `ram_budget_mib` setting if there is one, otherwise the RAM that is free, and never more than 16 GiB. `RamBudget::new(setting, free_ram)` is the same rule without reading the machine.
+- `memory.ram_use()` is what the process uses now: `title`, the title memory that is committed, and `private`, everything else the process has allocated. `committed_bytes()` is kept as pages are committed and freed, so it is always current.
+- `budget.pressure(use)` says `Under`, `Near` (90% or more) or `Over`, and `budget.headroom(use)` what is left.
+- `memory.sample(video_bytes)` gives the figures `riptide-trace` asks for at the end of each frame.
+
+Title memory is a shared section, so Windows does not count it in the process's "private bytes"; it shows in the working set. `RamUse` adds the two, and that sum is what the budget, and the `private_bytes` field of a trace frame, mean by Riptide's memory.
+
 ## Depends on
 
-- `riptide-trace` (not used yet)
+- `riptide-config`
+- `riptide-trace`
 
 ## Status
 
-Piece 3 of the build order. Working: the block, the allocator, address conversion, the heap and write guards. The GPU test (`cargo test -p riptide-mem --test gpu -- --ignored`) needs a GPU and has passed on a development laptop with a 64 MiB block; it has not run on the target machine, and the 14 GiB block waits for the probe's answer to open question Q1.
+Piece 3 of the build order. Working: the block, the allocator, address conversion, the heap, write guards, the RAM budget, and returning freed pages to Windows. The GPU test (`cargo test -p riptide-mem --test gpu -- --ignored`) needs a GPU and has passed on a development laptop with a 64 MiB block; it has not run on the target machine, and the 14 GiB block waits for the probe's answer to open question Q1.
 
-Not built yet: the RAM budget, and returning freed pages to Windows. Until the last one, decommitted pages keep their RAM, and are zeroed when committed again.
+Nothing acts on the budget yet: near the limit, `riptide-gpu` is to drop video-memory copies, and the runtime is to log the pressure.

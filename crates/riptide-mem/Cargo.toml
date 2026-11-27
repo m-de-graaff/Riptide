@@ -10,6 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
+riptide-config = { path = "../riptide-config" }
 riptide-trace = { path = "../riptide-trace" }
 windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
@@ -18,4 +19,7 @@ windows = { version = "=0.62.2", features = [
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
 ] }

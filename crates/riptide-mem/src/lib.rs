@@ -2,14 +2,17 @@
 //! write guards, and console-to-host address conversion. See README.md in this folder.
 
 mod block;
+mod budget;
 mod guard;
 mod pages;
 
+pub use budget::{Pressure, RamBudget, RamUse, free_ram};
 pub use pages::{GRANULARITY, MemError, PAGE, Region, State};
 
 use block::Block;
 use pages::PageMap;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
@@ -67,6 +70,8 @@ pub struct InPlaceHeap {
 pub struct TitleMemory {
     block: Block,
     map: Mutex<PageMap>,
+    /// How many bytes are committed right now. Only changed while holding `map`.
+    committed: AtomicU64,
 }
 
 impl Drop for TitleMemory {
@@ -85,6 +90,7 @@ impl TitleMemory {
         Ok(TitleMemory {
             block: Block::create(bytes)?,
             map: Mutex::new(PageMap::new(bytes)),
+            committed: AtomicU64::new(0),
         })
     }
 
@@ -125,7 +131,9 @@ impl TitleMemory {
         let mut map = self.map();
         let (range, runs) = map.commit(at, size)?;
         for run in runs {
-            self.block.open(run.range, run.stale)?;
+            let bytes = run.range.end - run.range.start;
+            self.block.open(run.range)?;
+            self.committed.fetch_add(bytes, Ordering::Relaxed);
         }
         Ok(self.block.base() + range.start)
     }
@@ -149,8 +157,7 @@ impl TitleMemory {
         let at = self.offset(address)?;
         let mut map = self.map();
         for run in map.decommit(at, size)? {
-            self.end_guards(&run);
-            self.block.close(run)?;
+            self.give_back(run)?;
         }
         Ok(())
     }
@@ -160,10 +167,42 @@ impl TitleMemory {
         let at = self.offset(address)?;
         let mut map = self.map();
         for run in map.release(at)?.1 {
-            self.end_guards(&run);
-            self.block.close(run)?;
+            self.give_back(run)?;
         }
         Ok(())
+    }
+
+    /// Takes committed pages, given as offsets, away from the title: ends their guards,
+    /// gives their RAM back to Windows and makes them inaccessible.
+    fn give_back(&self, run: Range<u64>) -> Result<(), MemError> {
+        let bytes = run.end - run.start;
+        self.end_guards(&run);
+        self.block.close(run)?;
+        self.committed.fetch_sub(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// How many bytes of title memory are committed right now.
+    pub fn committed_bytes(&self) -> u64 {
+        self.committed.load(Ordering::Relaxed)
+    }
+
+    /// The RAM this process uses now: title memory that is committed, and everything else
+    /// the process has allocated. This is what the RAM budget is held against.
+    pub fn ram_use(&self) -> RamUse {
+        RamUse {
+            title: self.committed_bytes(),
+            private: budget::private_bytes(),
+        }
+    }
+
+    /// The memory figures `riptide-trace` asks for at the end of a frame. `video_bytes`
+    /// comes from `riptide-gpu`, which accounts for video memory.
+    pub fn sample(&self, video_bytes: u64) -> riptide_trace::Sample {
+        riptide_trace::Sample {
+            private_bytes: self.ram_use().total(),
+            video_bytes,
+        }
     }
 
     /// The block's addresses.
