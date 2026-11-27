@@ -26,9 +26,12 @@ const REPORT_ADD: u32 = 3;
 const REPORT_ORDINAL: u32 = 4;
 const REPORT_RELOCATED: u32 = 5;
 const REPORT_COUNTER: u32 = 6;
+const REPORT_THREAD: u32 = 7;
 
 /// `StandInMode` answers this to ask for a write to address zero.
 const MODE_FAULT: u32 = 1;
+/// `StandInMode` answers this to ask for a call to `StandInUnbuilt`.
+const MODE_UNBUILT: u32 = 2;
 
 #[link(name = "standin_console", kind = "raw-dylib")]
 unsafe extern "C" {
@@ -36,8 +39,18 @@ unsafe extern "C" {
     safe fn StandInReport(id: u32, value: u64);
     /// Returns `a + b`; shows that arguments and results cross the import correctly.
     safe fn StandInAdd(a: u64, b: u64) -> u64;
-    /// What the test wants this run to do: 0 to run to the exit, [`MODE_FAULT`] to fault.
+    /// What the test wants this run to do: 0 to run to the exit, [`MODE_FAULT`] to fault,
+    /// [`MODE_UNBUILT`] to call `StandInUnbuilt`.
     safe fn StandInMode() -> u32;
+    /// A function no test implements: what a title's call to an unbuilt console function
+    /// looks like. Only called in [`MODE_UNBUILT`].
+    safe fn StandInUnbuilt() -> u64;
+}
+
+#[link(name = "kernel32", kind = "raw-dylib")]
+unsafe extern "system" {
+    /// A function whose console version is the host's own, to be passed straight through.
+    safe fn GetCurrentThreadId() -> u32;
 }
 
 #[link(name = "standin_ordinal", kind = "raw-dylib")]
@@ -105,7 +118,13 @@ pub extern "C" fn title_entry() -> u32 {
     StandInReport(REPORT_RELOCATED, **black_box(&POINTER));
     StandInReport(REPORT_COUNTER, COUNTER.fetch_add(1, Ordering::Relaxed) + 1);
 
-    if StandInMode() == MODE_FAULT {
+    StandInReport(REPORT_THREAD, u64::from(GetCurrentThreadId()));
+
+    let mode = StandInMode();
+    if mode == MODE_UNBUILT {
+        StandInReport(REPORT_ENTERED, StandInUnbuilt());
+    }
+    if mode == MODE_FAULT {
         let nowhere = black_box(0usize) as *mut u32;
         // SAFETY: none. This write faults on purpose, so a test can check that the loader
         // names the faulting address as module plus offset.

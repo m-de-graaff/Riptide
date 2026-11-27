@@ -11,5 +11,6 @@ workspace = true
 
 [dependencies]
 riptide-hle = { path = "../riptide-hle" }
+riptide-pe = { path = "../riptide-pe" }
 riptide-gpu = { path = "../riptide-gpu" }
 riptide-trace = { path = "../riptide-trace" }

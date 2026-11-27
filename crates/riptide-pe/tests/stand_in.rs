@@ -20,6 +20,7 @@ const REPORT_ADD: u32 = 3;
 const REPORT_ORDINAL: u32 = 4;
 const REPORT_RELOCATED: u32 = 5;
 const REPORT_COUNTER: u32 = 6;
+const REPORT_THREAD: u32 = 7;
 
 const MODE_FAULT: u32 = 1;
 
@@ -77,6 +78,16 @@ extern "C" fn stand_in_by_ordinal() -> u64 {
     0x0D1A
 }
 
+/// The title only calls this when asked to; these tests never ask.
+extern "C" fn stand_in_unbuilt() -> u64 {
+    unreachable!("no loader test runs the stand-in title in that mode")
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    safe fn GetCurrentThreadId() -> u32;
+}
+
 /// Resolves every import of the stand-in title.
 fn resolver(module: &str, symbol: &Symbol) -> Option<usize> {
     match (module, symbol) {
@@ -84,10 +95,14 @@ fn resolver(module: &str, symbol: &Symbol) -> Option<usize> {
             "StandInReport" => Some(stand_in_report as *const () as usize),
             "StandInAdd" => Some(stand_in_add as *const () as usize),
             "StandInMode" => Some(stand_in_mode as *const () as usize),
+            "StandInUnbuilt" => Some(stand_in_unbuilt as *const () as usize),
             _ => None,
         },
         ("standin_ordinal.dll", Symbol::Ordinal(7)) => {
             Some(stand_in_by_ordinal as *const () as usize)
+        }
+        ("kernel32.dll", Symbol::Name(name)) if name == "GetCurrentThreadId" => {
+            Some(GetCurrentThreadId as *const () as usize)
         }
         _ => None,
     }
@@ -106,6 +121,7 @@ fn expected_reports() -> Vec<(u32, u64)> {
         (REPORT_ORDINAL, 0x0D1A),
         (REPORT_RELOCATED, 0x5EED_0000_CAFE),
         (REPORT_COUNTER, 101),
+        (REPORT_THREAD, u64::from(GetCurrentThreadId())),
     ]
 }
 
@@ -127,9 +143,11 @@ fn the_image_parses_with_its_imports_sections_and_tls() {
     assert_eq!(
         imports,
         [
+            "kernel32.dll!GetCurrentThreadId",
             "standin_console.dll!StandInAdd",
             "standin_console.dll!StandInMode",
             "standin_console.dll!StandInReport",
+            "standin_console.dll!StandInUnbuilt",
             "standin_ordinal.dll!#7",
         ]
     );
