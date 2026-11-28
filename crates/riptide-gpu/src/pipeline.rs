@@ -112,6 +112,66 @@ pub(crate) struct Pipeline {
     programs: Vec<(Stage, Vec<u8>)>,
     /// The root signature object named in the stream, or zero.
     root: usize,
+    /// The vertex layout named in the stream, copied: its names are the title's strings,
+    /// which may not outlive the call.
+    layout: Vec<Element>,
+}
+
+/// One element of a vertex layout: `D3D12_INPUT_ELEMENT_DESC` with its name copied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Element {
+    pub(crate) name: std::ffi::CString,
+    pub(crate) index: u32,
+    pub(crate) format: u32,
+    pub(crate) slot: u32,
+    pub(crate) offset: u32,
+    /// 0 for each vertex, 1 for each instance.
+    pub(crate) class: u32,
+    pub(crate) step: u32,
+}
+
+/// The layout a stream's layout subobject points at: a pointer and a count, 8 bytes in.
+///
+/// # Safety
+/// The pointer is null or `count` elements, each with a name that is null or a string.
+unsafe fn layout(stream: &[u8], subobject: &Subobject) -> Vec<Element> {
+    #[repr(C)]
+    struct Raw {
+        name: *const std::ffi::c_char,
+        index: u32,
+        format: u32,
+        slot: u32,
+        offset: u32,
+        class: u32,
+        step: u32,
+    }
+    let elements = pointer(stream, subobject) as *const Raw;
+    let at = subobject.offset + 16;
+    let count = u32::from_le_bytes(stream[at..at + 4].try_into().expect("4 bytes"));
+    if elements.is_null() || count > 64 {
+        return Vec::new();
+    }
+    (0..count as usize)
+        .map(|index| {
+            // SAFETY: as this function's contract says.
+            let raw = unsafe { elements.add(index).read_unaligned() };
+            let name = if raw.name.is_null() {
+                std::ffi::CString::default()
+            } else {
+                // SAFETY: a string, as the contract says.
+                unsafe { std::ffi::CStr::from_ptr(raw.name) }.to_owned()
+            };
+            Element {
+                name,
+                index: raw.index,
+                format: raw.format,
+                slot: raw.slot,
+                offset: raw.offset,
+                class: raw.class,
+                step: raw.step,
+            }
+        })
+        .collect()
 }
 
 const _: () = assert!(std::mem::offset_of!(Pipeline, packet) == 0x10);
@@ -127,8 +187,45 @@ unsafe impl Child for Pipeline {
 }
 
 impl Pipeline {
-    /// Each stage's program.
+    /// The vertex layout.
     #[allow(dead_code)] // the first user is making the host pipeline
+    pub(crate) fn layout(&self) -> &[Element] {
+        &self.layout
+    }
+
+    /// What the pipeline is, in a few words, for the session log.
+    pub(crate) fn shown(&self) -> String {
+        let kinds: Vec<u32> = self.subobjects.iter().map(|one| one.kind).collect();
+        let word = |kind: u32, at: usize| {
+            self.subobject(kind)
+                .and_then(|bytes| bytes.get(at..at + 4))
+                .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+        };
+        // Render target formats: eight formats, then how many of them count.
+        let targets: Vec<u32> = (0..word(15, 36).unwrap_or(0).min(8) as usize)
+            .filter_map(|index| word(15, 4 + 4 * index))
+            .collect();
+        let layout: Vec<String> = self
+            .layout
+            .iter()
+            .map(|element| {
+                format!(
+                    "{}{} format {} slot {} at {}",
+                    element.name.to_string_lossy(),
+                    element.index,
+                    element.format,
+                    element.slot,
+                    element.offset
+                )
+            })
+            .collect();
+        let depth = word(16, 4);
+        format!(
+            "subobjects {kinds:?}, target formats {targets:?}, depth format {depth:?}, layout {layout:?}"
+        )
+    }
+
+    /// Each stage's program.
     pub(crate) fn programs(&self) -> &[(Stage, Vec<u8>)] {
         &self.programs
     }
@@ -237,8 +334,11 @@ pub(crate) unsafe extern "system" fn create(
     }
     let mut programs = Vec::new();
     let mut root = 0;
+    let mut elements = Vec::new();
     for one in &subobjects {
         match subobject(one.kind) {
+            // SAFETY: the title's layout, as its stream describes it.
+            _ if one.kind == 12 => elements = unsafe { layout(&stream, one) },
             Some((_, Some(stage))) => {
                 // SAFETY: a program subobject is its type, then a pointer and a size.
                 let code = unsafe {
@@ -274,6 +374,7 @@ pub(crate) unsafe extern "system" fn create(
         subobjects,
         programs,
         root,
+        layout: elements,
     });
     show(&pipeline);
     // SAFETY: `accepts` checked the out-pointer.
@@ -326,6 +427,7 @@ pub(crate) unsafe extern "system" fn create_compute(
         subobjects: Vec::new(),
         programs: vec![(Stage::Compute, program)],
         root: description.root,
+        layout: Vec::new(),
     });
     show(&pipeline);
     // SAFETY: `accepts` checked the out-pointer.

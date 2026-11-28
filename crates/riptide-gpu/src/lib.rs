@@ -9,6 +9,7 @@ mod bindless;
 mod census;
 mod descriptor;
 mod device;
+mod draw;
 mod dxgi;
 mod fence;
 mod frame;

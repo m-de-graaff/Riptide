@@ -102,6 +102,12 @@ impl Drop for Heap {
 }
 
 impl Heap {
+    /// The heap's type (0 views, 1 samplers, 2 and 3 targets) and the address of its first
+    /// descriptor.
+    pub(crate) fn span(&self) -> (u32, u64) {
+        (self.description.kind, self.start)
+    }
+
     /// Which descriptor of this heap `handle` is, if it is one.
     #[allow(dead_code)] // the first user is view creation
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {

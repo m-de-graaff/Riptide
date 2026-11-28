@@ -139,6 +139,8 @@ pub(crate) struct List {
     /// the list last put it in.
     textures:
         std::sync::Mutex<std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>>,
+    /// What the list has been told to draw with.
+    drawing: crate::draw::Kept,
 }
 
 /// A wait on a value in memory: the GPU goes on when the value at `address` compares as
@@ -390,6 +392,7 @@ fn list_table(newer: bool) -> &'static [usize] {
             (137, reset_x as *const () as usize),
         ]);
         methods.extend(crate::record::methods());
+        methods.extend(crate::draw::methods());
         let names: Vec<(usize, &str)> = LIST_NAMES
             .iter()
             .map(|&(slot, name)| (placed(slot, newer), name))
@@ -508,6 +511,7 @@ unsafe fn make_list(
         run: std::sync::Mutex::new(std::sync::Arc::new(Run::default())),
         allocator: std::cell::UnsafeCell::new(Some(allocator.host.clone())),
         textures: std::sync::Mutex::new(std::collections::HashMap::new()),
+        drawing: crate::draw::Kept::default(),
     });
     trace!("command list {:p} made: type {kind}", &raw const *list);
     // SAFETY: `accepts` checked the out-pointer.
@@ -668,6 +672,11 @@ impl List {
         unsafe { &*self.host.get() }
     }
 
+    /// What the list has been told to draw with.
+    pub(crate) fn drawing(&self) -> &crate::draw::Kept {
+        &self.drawing
+    }
+
     /// The host list this one records onto, for a command that is recorded now.
     pub(crate) fn host(&self) -> &ID3D12GraphicsCommandList {
         self.recorded
@@ -807,8 +816,9 @@ unsafe extern "system" fn reset(
     let Some(allocator) = (unsafe { allocator.as_ref() }) else {
         return E_INVALIDARG;
     };
-    // The first pipeline means nothing until host pipelines exist.
-    let _ = pipeline;
+    // Nothing set before the reset is kept, but the pipeline given with it.
+    this.drawing.clear();
+    this.drawing.state().pipeline = pipeline;
     // What the list recorded before is gone, or has run: the host textures it held for
     // those commands are let go.
     this.settle_textures(true);

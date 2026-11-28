@@ -60,11 +60,16 @@ fn keep(hash: u64, code: &[u8]) {
     }
 }
 
-/// Counts one program, if it has not been counted before.
-pub(crate) fn count(code: &[u8]) {
+/// The number a program is known by in the session log and in a folder of kept programs.
+pub(crate) fn hash(code: &[u8]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     code.hash(&mut hasher);
-    let hash = hasher.finish();
+    hasher.finish()
+}
+
+/// Counts one program, if it has not been counted before.
+pub(crate) fn count(code: &[u8]) {
+    let hash = hash(code);
     let mut census = CENSUS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

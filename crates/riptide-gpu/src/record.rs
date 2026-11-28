@@ -4,13 +4,9 @@
 //! the same notion: viewports, scissors, topology, blend factor, stencil reference.
 //!
 //! What a draw needs beyond that (the pipeline, the root signature and its arguments, the
-//! descriptor heaps, vertex and index buffers) only means something to a host pipeline, and
-//! none can be made until shader programs are translated. Those calls are accepted and
-//! nothing is kept of them, and draws and dispatches are counted and not made. That is the
-//! whole of what is missing between this and a picture, and it is said in the session log
-//! the first time a draw is skipped.
+//! descriptor heaps, vertex and index buffers) and the draws themselves are in `draw.rs`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
@@ -66,6 +62,7 @@ unsafe extern "system" fn scissors(this: &List, count: u32, rectangles: *const R
 
 /// `IASetPrimitiveTopology`.
 extern "system" fn topology(this: &List, topology: u32) {
+    crate::draw::note_topology(this, topology);
     // SAFETY: a plain call on the host list.
     unsafe {
         this.host()
@@ -397,31 +394,8 @@ extern "system" fn depth_bounds(this: &List, least: f32, greatest: f32) {
 /// of which is read.
 extern "system" fn changes_nothing(_this: &List) {}
 
-/// State that only a host pipeline can use: accepted, and nothing is kept. The methods
-/// bound to this take different arguments, none of which is read.
-extern "system" fn waits_for_pipelines(_this: &List) {}
-
-/// Draws and dispatches not made so far, for want of host pipelines.
-static SKIPPED: AtomicU64 = AtomicU64::new(0);
-
-/// A draw or a dispatch: counted and not made. The methods bound to this take different
-/// arguments, none of which is read.
-extern "system" fn skipped_draw(_this: &List) {
-    let skipped = SKIPPED.fetch_add(1, Ordering::Relaxed) + 1;
-    if skipped == 1 {
-        trace!(
-            "the title's first draw or dispatch is skipped, as every one will be: no host \
-             pipeline exists, because shader programs cannot be translated yet"
-        );
-    } else if skipped.is_power_of_two() && skipped >= 1024 {
-        trace!("{skipped} draws and dispatches skipped so far");
-    }
-}
-
 /// The recording methods by their position in the older list layout.
 pub(crate) fn methods() -> Vec<(usize, usize)> {
-    let state = waits_for_pipelines as *const () as usize;
-    let draw = skipped_draw as *const () as usize;
     let mut methods = vec![
         (20, topology as *const () as usize),
         (21, viewports as *const () as usize),
@@ -439,13 +413,7 @@ pub(crate) fn methods() -> Vec<(usize, usize)> {
         (71, wait_on_value_32 as *const () as usize),
         (72, wait_on_value_64 as *const () as usize),
     ];
-    // Draws and dispatches: instanced, indexed, dispatch, indirect, and the console's own
-    // dispatch and mesh dispatches.
-    methods.extend([12, 13, 14, 59, 78, 98, 127].map(|slot| (slot, draw)));
     methods.extend([56, 57, 58, 73, 99].map(|slot| (slot, changes_nothing as *const () as usize)));
-    // The pipeline, descriptor heaps, root signatures and root arguments, index and vertex
-    // buffers.
-    methods.extend((32..=48).chain([25]).map(|slot| (slot, state)));
     methods
 }
 
