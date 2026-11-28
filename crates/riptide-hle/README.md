@@ -59,7 +59,6 @@ Also built for the title's graphics set-up:
 - `kernel32.dll!VirtualFree` on title memory. A title frees what `XMemVirtualAlloc` gave it with this, and cuts a reservation into parts with it, so those calls go to `riptide-mem`. Any other address goes to Windows.
 - `XMemAllocDefault` hands out title memory, below 2^40, for the kinds of memory the GPU uses. The title's own allocator asks it for the memory of committed graphics resources.
 - `xg_xs.dll`, the console's texture-layout library, on `riptide-formats`: the suggested mode, and a texture computer's layout, element offsets and copies into and out of a layout. Its other methods name themselves when called.
-- `XboxBvhBuilder.dll`, the module a title builds ray-tracing structures with, as a stand-in: a builder can be made, dropped and given its options, and builds nothing. Its other methods name themselves when called. The real module ships in the title's package and needs its shader programs translated before it can be loaded.
 
 Built for the title's first frames and what it does next:
 
@@ -68,4 +67,6 @@ Built for the title's first frames and what it does next:
 - **More runtime areas.** Asynchronous calls (`XAsync`) in the task queue area, with task queue ports and queues made of them. One local, offline user with a made-up id and the name "Player", who is an adult and holds no service privileges. The game area (the title id), the system area (the sandbox name), accessibility (a speech synthesizer that speaks nothing, high contrast off), and saves (see the module's own notes for what of it is built).
 - **The texture computer's 64 KiB tiling**, which a title maps streaming pages by.
 
-`riptide run` loads three modules from the title's own package beside it, as the title is loaded, and binds the title's imports to their functions: the video player (`Bink2Scarlett.dll`) and the two HTTP libraries (`libHttpClient.GDK.dll`, `XCurl.dll`). They need nothing of the console but what is answered here.
+`riptide run` loads four modules from the title's own package beside it, as the title is loaded, and binds the title's imports to their functions: the video player (`Bink2Scarlett.dll`), the two HTTP libraries (`libHttpClient.GDK.dll`, `XCurl.dll`) and the builder of ray-tracing structures (`XboxBvhBuilder.dll`), which works through the title's own graphics device. They need nothing of the console but what is answered here.
+
+The save area is whole: containers of named blobs, kept so that a crash leaves the whole old save or the whole new one. `T:`, the title's scratch drive, is a folder of this machine.
