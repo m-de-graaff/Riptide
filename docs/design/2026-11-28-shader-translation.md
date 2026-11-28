@@ -41,7 +41,7 @@ What every translated shader is given, and where. The emitter in `riptide-shader
 
 | What | Where | Holds |
 | --- | --- | --- |
-| Stage inputs | constant buffer `b0`, in space 0 for a vertex or mesh program, space 1 for a pixel program, space 2 for a compute program | 64 words: the console's user-data registers for that stage, in their order (a root constant's value; a root view's address, low word then high; a table's or a heap's 32-bit address). Then 16 words of what the stage is told besides: for compute, the thread-group counts. |
+| Stage inputs | constant buffer `b0`, in space 0 for a vertex or mesh program, space 1 for a pixel program, space 2 for a compute program | 80 words. Word n below 64 is what scalar register n holds when the program starts: the console's user data (a root constant's value; a root view's address, low word then high; a table's or a heap's 32-bit address), in the registers the program's own root parameters name. Then what the stage is told besides: words 64 to 66 the group counts of a dispatch; words 67 to 77 the places in the sampler heap of the samplers the program's root signature fixes, in the order the translation numbers them; word 78 the draw's first instance and word 79 its first vertex (or what is added to each index), which the console counts from and the host does not. |
 | Page table | raw buffer `t0`, space 0, as a root view | One word per 64 KiB of title addresses below 2^37: the frame mapped there plus one, or zero. A frame is its bank times 32,768 plus its place in the bank. |
 | Banks, to read | the resource heap, places 0 to 15 | A raw buffer over each bank of title memory. |
 | Banks, to write | the resource heap, places 16 to 31 | The same buffers for unordered access. |

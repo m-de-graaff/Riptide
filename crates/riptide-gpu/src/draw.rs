@@ -456,8 +456,9 @@ fn show_first_use(state: &State, what: &str) {
 /// Gets the host list ready to draw or dispatch with the pipeline that is set: the heaps,
 /// root signature and page table if this host list has not been given them, the host
 /// pipeline, each stage's inputs, and for a draw the vertex and index buffers. `more` is
-/// what the stage is told besides its user data. An error says why nothing can be drawn.
-fn prepare(list: &List, compute: bool, indexed: bool, more: &[u32]) -> Result<(), String> {
+/// what the draw itself tells each stage, as words of the stage's inputs and their values.
+/// An error says why nothing can be drawn.
+fn prepare(list: &List, compute: bool, indexed: bool, more: &[(usize, u32)]) -> Result<(), String> {
     let state = list.drawing().state();
     // SAFETY: the pipeline a list was given is live while the list draws with it.
     let pipeline =
@@ -488,18 +489,24 @@ fn prepare(list: &List, compute: bool, indexed: bool, more: &[u32]) -> Result<()
         } else {
             &state.graphics
         };
-        for (parameter, parameters) in &host.stages {
+        for stage in &host.stages {
             let mut words = [0u32; crate::stage::WORDS];
-            words[..USER_WORDS].copy_from_slice(&user_data(parameters, roots, state.heaps));
-            for (word, &value) in words[USER_WORDS..].iter_mut().zip(more) {
-                *word = value;
+            words[..USER_WORDS].copy_from_slice(&user_data(&stage.parameters, roots, state.heaps));
+            for (word, &place) in words[crate::translate::SAMPLERS..]
+                .iter_mut()
+                .zip(&stage.samplers)
+            {
+                *word = place;
+            }
+            for &(word, value) in more {
+                words[word] = value;
             }
             let block = crate::stage::block(list.allocator_key(), &words)
                 .ok_or("the host gave no memory for a stage's inputs")?;
             if compute {
-                host_list.SetComputeRootConstantBufferView(*parameter, block);
+                host_list.SetComputeRootConstantBufferView(stage.parameter, block);
             } else {
-                host_list.SetGraphicsRootConstantBufferView(*parameter, block);
+                host_list.SetGraphicsRootConstantBufferView(stage.parameter, block);
             }
         }
         if !compute {
@@ -561,7 +568,13 @@ extern "system" fn draw_instanced(
     first_instance: u32,
 ) {
     show_first_use(this.drawing().state(), "a draw");
-    match prepare(this, false, false, &[]) {
+    // The console counts a vertex from the first of the draw and an instance from the
+    // first of the draw; the host's shaders count both from zero, so they are told.
+    let more = [
+        (crate::translate::FIRST_VERTEX, first_vertex),
+        (crate::translate::FIRST_INSTANCE, first_instance),
+    ];
+    match prepare(this, false, false, &more) {
         // SAFETY: a plain call on the host list, which has all the draw needs.
         Ok(()) => unsafe {
             this.host()
@@ -582,7 +595,11 @@ extern "system" fn draw_indexed(
     first_instance: u32,
 ) {
     show_first_use(this.drawing().state(), "an indexed draw");
-    match prepare(this, false, true, &[]) {
+    let more = [
+        (crate::translate::FIRST_VERTEX, base_vertex as u32),
+        (crate::translate::FIRST_INSTANCE, first_instance),
+    ];
+    match prepare(this, false, true, &more) {
         // SAFETY: a plain call on the host list, which has all the draw needs.
         Ok(()) => unsafe {
             this.host().DrawIndexedInstanced(
@@ -601,7 +618,12 @@ extern "system" fn draw_indexed(
 /// after its user data.
 extern "system" fn dispatch(this: &List, x: u32, y: u32, z: u32) {
     show_first_use(this.drawing().state(), "a dispatch");
-    match prepare(this, true, false, &[x, y, z]) {
+    let more = [
+        (crate::translate::GROUP_COUNTS, x),
+        (crate::translate::GROUP_COUNTS + 1, y),
+        (crate::translate::GROUP_COUNTS + 2, z),
+    ];
+    match prepare(this, true, false, &more) {
         // SAFETY: a plain call on the host list, which has all the dispatch needs.
         Ok(()) => unsafe { this.host().Dispatch(x, y, z) },
         Err(why) => skipped(&why),

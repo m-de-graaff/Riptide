@@ -412,11 +412,17 @@ pub(crate) fn sampler(sampler: &[u32; 13]) -> u32 {
 /// whether a sample compares is the instruction's to say, and every sampler has a
 /// comparison; on the host it is the sampler's, so each sampler is made both ways.
 fn forms(sampler: &[u32; 13]) -> ([u32; 13], [u32; 13]) {
-    /// The bit of a host filter that makes it compare.
-    const COMPARE: u32 = 0x80;
+    /// Where a host filter says how samples are combined: 0 plain, 1 compared, 2 and 3
+    /// the least and the greatest.
+    const COMBINE: u32 = 3 << 7;
+    const COMPARED: u32 = 1 << 7;
     let (mut plain, mut comparing) = (*sampler, *sampler);
-    plain[0] &= !COMPARE;
-    comparing[0] |= COMPARE;
+    match sampler[0] & COMBINE {
+        0 => comparing[0] |= COMPARED,
+        COMPARED => plain[0] &= !COMBINE,
+        // The least or greatest of the samples has no comparing form: both are it.
+        _ => {}
+    }
     // A comparison of zero is none at all, which the host refuses in a comparing sampler:
     // "less or equal" is what the console has when the title set none.
     if comparing[6] == 0 {
@@ -439,6 +445,13 @@ mod tests {
         assert_eq!(comparing[0], 0x95);
         assert_eq!(comparing[6], 4);
         assert_eq!(plain[1..], sampler[1..]);
+        // A sampler that takes the greatest of its samples stays one, both ways.
+        sampler[0] = 0x180 | 0x15;
+        let (plain, comparing) = forms(&sampler);
+        assert_eq!((plain[0], comparing[0]), (0x195, 0x195));
+        // A plain one gets a comparing form.
+        sampler[0] = 0x15;
+        assert_eq!(forms(&sampler).1[0], 0x95);
     }
 
     #[test]

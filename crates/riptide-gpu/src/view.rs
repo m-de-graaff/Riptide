@@ -244,7 +244,7 @@ fn channels(mapping: u32) -> u32 {
 }
 
 /// Bit 0 if `format` holds whole numbers, and bit 1 as well if they are signed.
-fn whole_numbers(format: u32) -> u32 {
+pub(crate) fn whole_numbers(format: u32) -> u32 {
     match format {
         3 | 7 | 12 | 17 | 22 | 25 | 30 | 36 | 42 | 47 | 50 | 57 | 62 => 1,
         4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => 3,
@@ -947,6 +947,82 @@ pub(crate) unsafe extern "system" fn create_sampler_x(
     unsafe { create_sampler(device, &sampler, handle) };
 }
 
+/// The host sampler for a sampler as the console GPU itself holds it: four words, which a
+/// program has as constants in its code when its root signature fixes the sampler.
+///
+/// | Word | Bits | Hold |
+/// | --- | --- | --- |
+/// | 0 | 0 to 8 | how each of three coordinates is addressed, three bits each |
+/// | 0 | 9 to 11 | the anisotropy, as a power of two |
+/// | 0 | 12 to 14 | the comparison: 0 never to 7 always, in the host's order |
+/// | 0 | 29 and 30 | how samples are combined: 0 plain, 1 minimum, 2 maximum |
+/// | 1 | 0 to 11, 12 to 23 | the least and the greatest level, in 256ths |
+/// | 2 | 0 to 13 | the level bias, signed, in 256ths |
+/// | 2 | 20 and 21, 22 and 23 | the magnification and minification filters: 0 point, 1 linear, 2 and 3 the same with anisotropy |
+/// | 2 | 26 and 27 | the filter between levels: 0 none, 1 point, 2 linear |
+/// | 3 | 30 and 31 | the border: 0 clear black, 1 black, 2 white, 3 a colour held elsewhere |
+///
+/// The layout is the public one of this GPU family's sampler registers. A border colour
+/// held elsewhere cannot be followed from the four words, and is black here.
+pub(crate) fn from_hardware(words: &[u32; 4]) -> Sampler {
+    let field = |word: usize, first: u32, bits: u32| (words[word] >> first) & ((1 << bits) - 1);
+    // Wrap, mirror, clamp, mirror once, then the same two with half a border texel (which
+    // the host has not, and are the plain ones here), then border and mirror once.
+    let address = |code: u32| match code {
+        0 => 1,
+        1 => 2,
+        3 | 5 | 7 => 5,
+        6 => 4,
+        _ => 3,
+    };
+    let (magnify, minify, between) = (field(2, 20, 2), field(2, 22, 2), field(2, 26, 2));
+    let anisotropic = magnify >= 2 || minify >= 2;
+    let filter = if anisotropic {
+        0x55
+    } else {
+        ((minify & 1) << 4) | ((magnify & 1) << 2) | u32::from(between == 2)
+    };
+    let reduction = match field(0, 29, 2) {
+        1 => 2,
+        2 => 3,
+        _ => 0,
+    };
+    let least = field(1, 0, 12) as f32 / 256.0;
+    // With no filter between levels the console samples the least level only.
+    let greatest = if between == 0 {
+        least
+    } else {
+        (field(1, 12, 12) as f32 / 256.0).max(least)
+    };
+    // Fourteen bits, signed.
+    let bias = ((field(2, 0, 14) << 18) as i32 >> 18) as f32 / 256.0;
+    let border: [f32; 4] = match field(3, 30, 2) {
+        1 => [0.0, 0.0, 0.0, 1.0],
+        2 => [1.0; 4],
+        _ => [0.0; 4],
+    };
+    [
+        (reduction << 7) | filter,
+        address(field(0, 0, 3)),
+        address(field(0, 3, 3)),
+        address(field(0, 6, 3)),
+        bias.to_bits(),
+        if anisotropic {
+            1 << field(0, 9, 3).min(4)
+        } else {
+            1
+        },
+        // The host counts comparisons from one.
+        field(0, 12, 3) + 1,
+        border[0].to_bits(),
+        border[1].to_bits(),
+        border[2].to_bits(),
+        border[3].to_bits(),
+        least.to_bits(),
+        greatest.to_bits(),
+    ]
+}
+
 /// `ID3D12Device::CopyDescriptorsSimple`: `(count, to, from, heap type)`. Records are
 /// whole in their bytes, so a copy of the bytes is a copy of the views.
 ///
@@ -1348,6 +1424,37 @@ mod tests {
             let record = (at as *const SamplerRecord).read();
             assert_eq!(record, sampler_record(&sampler));
         }
+    }
+
+    #[test]
+    fn a_sampler_as_the_gpu_holds_it_becomes_the_host_sampler_that_samples_the_same() {
+        // Clamp, wrap, mirror; less-or-equal; linear both ways and between levels; levels
+        // 0 to 12.5; a bias of minus a half.
+        let words = [
+            2 | (1 << 6) | (3 << 12),
+            (0xc80) << 12,
+            ((-128i32 as u32) & 0x3fff) | (1 << 20) | (1 << 22) | (2 << 26),
+            2 << 30,
+        ];
+        let sampler = from_hardware(&words);
+        assert_eq!(sampler[0], 0x15);
+        assert_eq!(sampler[1..4], [3, 1, 2]);
+        assert_eq!(f32::from_bits(sampler[4]), -0.5);
+        assert_eq!((sampler[5], sampler[6]), (1, 4));
+        assert_eq!(sampler[7..11], [1.0f32.to_bits(); 4]);
+        assert_eq!(
+            (f32::from_bits(sampler[11]), f32::from_bits(sampler[12])),
+            (0.0, 12.5)
+        );
+        // Anisotropy of 2^3 on the minification filter, and the least of the samples.
+        let sharp = from_hardware(&[(3 << 9) | (1 << 29), 0, 3 << 22, 0]);
+        assert_eq!((sharp[0], sharp[5]), (0x100 | 0x55, 8));
+        // No filter between levels: the least level only.
+        let flat = from_hardware(&[0, 0x200 | (0xfff << 12), 0, 0]);
+        assert_eq!(
+            (f32::from_bits(flat[11]), f32::from_bits(flat[12])),
+            (2.0, 2.0)
+        );
     }
 
     #[test]

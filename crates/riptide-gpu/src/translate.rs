@@ -15,10 +15,40 @@ use crate::pipeline::{Pipeline, Stage};
 /// A pipeline as the host draws with it.
 pub(crate) struct HostPipeline {
     pub(crate) state: ID3D12PipelineState,
-    /// Each stage that has inputs: the host root parameter they go to, and the root
-    /// parameters its program was compiled against, which say what goes in which word.
-    pub(crate) stages: Vec<(u32, Vec<RootParameter>)>,
+    /// Each stage that has inputs.
+    pub(crate) stages: Vec<StageInputs>,
 }
+
+/// What a draw writes into one stage's block of inputs besides what the draw itself says.
+pub(crate) struct StageInputs {
+    /// The host root parameter the block is bound to.
+    pub(crate) parameter: u32,
+    /// The root parameters the stage's program was compiled against, which say what goes
+    /// in which word of user data.
+    pub(crate) parameters: Vec<RootParameter>,
+    /// The places in the shaders' sampler heap of the samplers the program's root
+    /// signature fixes, in the order the translated shader numbers them. They go in the
+    /// words from [`SAMPLERS`] on.
+    pub(crate) samplers: Vec<u32>,
+}
+
+/// The words of a stage's inputs after its user data: what a translated shader is told
+/// besides (the design's "The host shader's bindings").
+pub(crate) const GROUP_COUNTS: usize = 64;
+/// The first of the words that hold the places of root-fixed samplers.
+pub(crate) const SAMPLERS: usize = 67;
+/// How many root-fixed samplers a shader can have.
+pub(crate) const MOST_SAMPLERS: usize = 11;
+/// The draw's first instance, and its first vertex or what is added to each index.
+pub(crate) const FIRST_INSTANCE: usize = 78;
+pub(crate) const FIRST_VERTEX: usize = 79;
+
+// The extras do not run into each other, and end where a stage's inputs end.
+const _: () = assert!(
+    GROUP_COUNTS + 3 <= SAMPLERS
+        && SAMPLERS + MOST_SAMPLERS <= FIRST_INSTANCE
+        && FIRST_VERTEX + 1 == crate::stage::WORDS
+);
 
 // SAFETY: a host pipeline state is free-threaded, and the rest is plain data.
 unsafe impl Send for HostPipeline {}
@@ -29,6 +59,32 @@ unsafe impl Sync for HostPipeline {}
 struct Translated {
     shader: Vec<u8>,
     parameters: Vec<RootParameter>,
+    /// The samplers its root signature fixes, as the console GPU holds them.
+    samplers: Vec<[u32; 4]>,
+    /// How many rows a vertex shader passes on, and which of them must not be
+    /// interpolated, a bit each.
+    rows: u32,
+    flat_rows: u32,
+}
+
+/// A host shader's source and what the pipeline has to know about it.
+struct Source {
+    text: String,
+    /// The shader model to compile for, as `vs_6_6`.
+    profile: &'static str,
+    samplers: Vec<[u32; 4]>,
+    rows: u32,
+    flat_rows: u32,
+}
+
+/// What kind of numbers a render target of console format `format` holds, which a pixel
+/// shader's output has to be declared as: 0 fractions, 1 unsigned whole numbers, 2 signed.
+fn target_kind(format: u32) -> u8 {
+    match crate::view::whole_numbers(format) {
+        0 => 0,
+        1 => 1,
+        _ => 2,
+    }
 }
 
 /// The hardware stage a program of a pipeline stage runs as when nothing follows it but
@@ -61,36 +117,53 @@ fn parameters(code: &[u8], stage: HardwareStage) -> Result<Vec<RootParameter>, S
         .ok_or_else(|| format!("the program has no {} stage", stage.short_name()))
 }
 
-/// Translates and compiles the program `code` of pipeline stage `stage`.
-fn translate(code: &[u8], stage: Stage) -> Result<(u32, Translated), String> {
+/// Translates and compiles the program `code` of pipeline stage `stage`, for render
+/// targets of `targets` kinds (see [`target_kind`]).
+fn translate(code: &[u8], stage: Stage, targets: [u8; 8]) -> Result<(u32, Translated), String> {
     let (hardware, parameter) =
         place(stage).ok_or_else(|| format!("{stage:?} programs are not translated yet"))?;
     let parameters = parameters(code, hardware)?;
-    let shader = emit(code, hardware)?;
-    Ok((parameter, Translated { shader, parameters }))
-}
-
-/// The compiled host shader for the program in `code` that runs as `stage`: from the
-/// cache if this program was compiled before by this translator and compiler, and
-/// otherwise translated, compiled and kept.
-fn emit(code: &[u8], stage: HardwareStage) -> Result<Vec<u8>, String> {
-    let key = crate::cache::key(&[
-        code,
-        stage.short_name().as_bytes(),
-        TRANSLATION.as_bytes(),
-        crate::compile::identity().as_bytes(),
-    ]);
-    if let Some(shader) = key.as_deref().and_then(crate::cache::get) {
-        return Ok(shader);
-    }
-    let (source, profile) = source(code, stage)?;
-    let shader = crate::compile::compile(&source, "main", profile, &[]).map_err(|said| {
+    let source = source(code, hardware, targets)?;
+    let shader = compiled(
+        &[
+            code,
+            hardware.short_name().as_bytes(),
+            &targets,
+            TRANSLATION.as_bytes(),
+        ],
+        &source.text,
+        source.profile,
+    )
+    .map_err(|said| {
         format!(
             "the translation of {} program {:016x} does not compile: {said}",
-            stage.short_name(),
+            hardware.short_name(),
             crate::census::hash(code)
         )
     })?;
+    Ok((
+        parameter,
+        Translated {
+            shader,
+            parameters,
+            samplers: source.samplers,
+            rows: source.rows,
+            flat_rows: source.flat_rows,
+        },
+    ))
+}
+
+/// The compiled form of the host shader `text`: from the cache if what it was made from
+/// (`from`, and the compiler) was compiled before, and otherwise compiled and kept.
+fn compiled(from: &[&[u8]], text: &str, profile: &str) -> Result<Vec<u8>, String> {
+    let compiler = crate::compile::identity();
+    let mut parts = from.to_vec();
+    parts.push(compiler.as_bytes());
+    let key = crate::cache::key(&parts);
+    if let Some(shader) = key.as_deref().and_then(crate::cache::get) {
+        return Ok(shader);
+    }
+    let shader = crate::compile::compile(text, "main", profile, &["-HV", "2021"])?;
     if let Some(key) = &key {
         crate::cache::put(key, &shader);
     }
@@ -102,13 +175,22 @@ fn emit(code: &[u8], stage: HardwareStage) -> Result<Vec<u8>, String> {
 /// different: bump it with any change to what `source` or `riptide-shader` writes.
 const TRANSLATION: &str = "0";
 
-/// The host shader's source for the program in `code` that runs as `stage`, and the
-/// shader model to compile it for.
-fn source(code: &[u8], stage: HardwareStage) -> Result<(String, &'static str), String> {
+/// The host shader for the program in `code` that runs as `stage`.
+fn source(code: &[u8], stage: HardwareStage, targets: [u8; 8]) -> Result<Source, String> {
+    let _ = targets;
     Err(format!(
         "the translator does not write host shaders yet ({} program {:016x})",
         stage.short_name(),
         crate::census::hash(code)
+    ))
+}
+
+/// The geometry shader that completes rectangles behind a vertex shader that passes on
+/// `rows` rows, of which those in `flat` must not be interpolated.
+fn rectangles(rows: u32, flat: u32) -> Result<Vec<u8>, String> {
+    Err(format!(
+        "the pipeline draws rectangles, which are not completed yet ({rows} rows, flat \
+         {flat:#x})"
     ))
 }
 
@@ -172,24 +254,54 @@ pub(crate) fn make_later(pipeline: usize) {
 
 /// Makes the host pipeline for a title's pipeline.
 pub(crate) fn host_pipeline(pipeline: &Pipeline) -> Result<HostPipeline, String> {
+    let (stream, subobjects) = pipeline.stream();
+    // The kinds of the render targets, from their formats in the stream: eight formats,
+    // four bytes into the subobject of type 15.
+    let mut targets = [0u8; 8];
+    if let Some(formats) = pipeline.subobject(15) {
+        for (index, kind) in targets.iter_mut().enumerate() {
+            let at = 4 + 4 * index;
+            if let Some(bytes) = formats.get(at..at + 4) {
+                *kind = target_kind(u32::from_le_bytes(bytes.try_into().expect("4 bytes")));
+            }
+        }
+    }
     let mut shaders = Shaders::default();
     let mut stages = Vec::new();
     let mut compute = None;
+    let mut rows = (0, 0);
     for (stage, code) in pipeline.programs() {
-        let (parameter, translated) = translate(code, *stage)?;
+        let (parameter, translated) = translate(code, *stage, targets)?;
+        if translated.samplers.len() > MOST_SAMPLERS {
+            return Err(format!(
+                "a program has {} samplers fixed by its root signature, more than the {MOST_SAMPLERS} \
+                 a stage's inputs have room for",
+                translated.samplers.len()
+            ));
+        }
         match stage {
-            Stage::Vertex => shaders.vertex = Some(translated.shader),
+            Stage::Vertex => {
+                rows = (translated.rows, translated.flat_rows);
+                shaders.vertex = Some(translated.shader);
+            }
             Stage::Pixel => shaders.pixel = Some(translated.shader),
             _ => compute = Some(translated.shader),
         }
-        stages.push((parameter, translated.parameters));
+        stages.push(StageInputs {
+            parameter,
+            parameters: translated.parameters,
+            samplers: translated
+                .samplers
+                .iter()
+                .map(|words| crate::bindless::sampler(&crate::view::from_hardware(words)))
+                .collect(),
+        });
     }
-    let (stream, subobjects) = pipeline.stream();
     let state = match compute {
         Some(shader) => crate::hostpipe::compute(&shader)?,
         None => {
             if crate::hostpipe::completes_shapes(stream, subobjects) {
-                return Err("the pipeline draws rectangles, which are not completed yet".to_owned());
+                shaders.geometry = Some(rectangles(rows.0, rows.1)?);
             }
             crate::hostpipe::drawing(stream, subobjects, pipeline.layout(), &shaders)?
         }
@@ -207,6 +319,14 @@ mod tests {
         assert_eq!(place(Stage::Pixel), Some((HardwareStage::Pixel, 1)));
         assert_eq!(place(Stage::Compute), Some((HardwareStage::Compute, 2)));
         assert_eq!(place(Stage::Hull), None);
+    }
+
+    #[test]
+    fn a_target_is_fractions_or_whole_numbers_by_its_format() {
+        assert_eq!(
+            (target_kind(28), target_kind(42), target_kind(43)),
+            (0, 1, 2)
+        );
     }
 
     #[test]
