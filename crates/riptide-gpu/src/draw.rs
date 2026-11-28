@@ -6,9 +6,9 @@
 //! title's arguments are kept here and turned into what a translated shader reads when a
 //! draw is made.
 //!
-//! A draw is made if the pipeline has a host pipeline, which is made the first time
-//! something is drawn with it (`translate.rs`). Until then, and for a pipeline whose
-//! programs cannot be translated, the draw is counted and not made.
+//! A draw is made if the pipeline has a host pipeline. The first draw with a pipeline asks
+//! for one to be made, on another thread (`translate.rs`). Until it is there, and for a
+//! pipeline whose programs cannot be translated, the draw is counted and not made.
 //!
 //! What a shader program is given is the console's *user data*: a row of 32-bit words,
 //! one per scalar register the program starts with. Each program says which root
@@ -462,7 +462,9 @@ fn prepare(list: &List, compute: bool, indexed: bool, more: &[u32]) -> Result<()
     // SAFETY: the pipeline a list was given is live while the list draws with it.
     let pipeline =
         unsafe { (state.pipeline as *const Pipeline).as_ref() }.ok_or("no pipeline is set")?;
-    let host = pipeline.host()?;
+    let host = pipeline
+        .host()?
+        .ok_or("the pipeline's host pipeline is still being made")?;
     let host_list = list.host();
     // SAFETY: plain calls on the host list, with host objects that live for the run or as
     // long as the title's pipeline, and buffers found in title memory.

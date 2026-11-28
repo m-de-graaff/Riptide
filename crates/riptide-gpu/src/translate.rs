@@ -80,6 +80,64 @@ fn emit(code: &[u8], stage: HardwareStage) -> Result<Vec<u8>, String> {
     ))
 }
 
+/// Pipelines waiting to have their host pipeline made, and the threads that make them.
+struct Makers {
+    waiting: std::sync::Mutex<std::collections::VecDeque<usize>>,
+    arrived: std::sync::Condvar,
+}
+
+/// Has the host pipeline of the pipeline at `pipeline` made on one of the threads kept
+/// for that. The threads are started the first time: a quarter of the machine's, at
+/// least two, so that a burst of new pipelines neither waits on one thread nor takes the
+/// machine from the title.
+pub(crate) fn make_later(pipeline: usize) {
+    use std::sync::OnceLock;
+    static MAKERS: OnceLock<&'static Makers> = OnceLock::new();
+    let makers = MAKERS.get_or_init(|| {
+        let makers: &'static Makers = Box::leak(Box::new(Makers {
+            waiting: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            arrived: std::sync::Condvar::new(),
+        }));
+        let threads =
+            std::thread::available_parallelism().map_or(2, |count| (count.get() / 4).max(2));
+        for _ in 0..threads {
+            let spawned = std::thread::Builder::new()
+                .name("riptide shaders".to_owned())
+                .spawn(move || {
+                    loop {
+                        let pipeline = {
+                            let mut waiting = makers
+                                .waiting
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            loop {
+                                if let Some(pipeline) = waiting.pop_front() {
+                                    break pipeline;
+                                }
+                                waiting = makers
+                                    .arrived
+                                    .wait(waiting)
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            }
+                        };
+                        // SAFETY: the address `Pipeline::host` gave, held until now.
+                        unsafe { Pipeline::make_host(pipeline) };
+                    }
+                });
+            if let Err(error) = spawned {
+                crate::trace!("a thread for making pipelines could not be started: {error}");
+            }
+        }
+        makers
+    });
+    makers
+        .waiting
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push_back(pipeline);
+    makers.arrived.notify_one();
+}
+
 /// Makes the host pipeline for a title's pipeline.
 pub(crate) fn host_pipeline(pipeline: &Pipeline) -> Result<HostPipeline, String> {
     let mut shaders = Shaders::default();

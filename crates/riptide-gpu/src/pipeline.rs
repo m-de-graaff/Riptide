@@ -115,9 +115,10 @@ pub(crate) struct Pipeline {
     /// The vertex layout named in the stream, copied: its names are the title's strings,
     /// which may not outlive the call.
     layout: Vec<Element>,
-    /// The host pipeline, made the first time something is drawn with this one, or why
-    /// there is none.
+    /// The host pipeline, or why there is none. Empty until it has been made.
     host: OnceLock<Result<crate::translate::HostPipeline, String>>,
+    /// Whether the making of the host pipeline has been asked for.
+    asked: std::sync::atomic::AtomicBool,
 }
 
 /// One element of a vertex layout: `D3D12_INPUT_ELEMENT_DESC` with its name copied.
@@ -190,19 +191,45 @@ unsafe impl Child for Pipeline {
 }
 
 impl Pipeline {
-    /// The host pipeline, made now if this is the first time it is asked for. Making it
-    /// translates and compiles the programs, which takes a while.
-    pub(crate) fn host(&self) -> Result<&crate::translate::HostPipeline, &str> {
-        self.host
-            .get_or_init(|| {
-                let made = crate::translate::host_pipeline(self);
-                if let Err(why) = &made {
-                    show_unmade(why);
-                }
-                made
-            })
-            .as_ref()
-            .map_err(String::as_str)
+    /// The host pipeline if it has been made, `None` while it is being made, or why there
+    /// is none. The first call asks for it to be made, on a thread kept for that
+    /// (`translate.rs`): translating and compiling the programs takes a while, and the
+    /// thread that draws is not held for it. What is drawn meanwhile is not drawn
+    /// (decision D7).
+    pub(crate) fn host(&self) -> Result<Option<&crate::translate::HostPipeline>, &str> {
+        use std::sync::atomic::Ordering;
+        if let Some(made) = self.host.get() {
+            return made.as_ref().map(Some).map_err(String::as_str);
+        }
+        if !self.asked.swap(true, Ordering::AcqRel) {
+            // The pipeline is held until it has been made, so that a title that lets go
+            // of it meanwhile does not take it from under the thread that makes it.
+            self.object.add_ref();
+            crate::translate::make_later(std::ptr::from_ref(self) as usize);
+        }
+        Ok(None)
+    }
+
+    /// Makes the host pipeline, on the calling thread, and lets go of the hold [`host`]
+    /// took.
+    ///
+    /// # Safety
+    /// `pipeline` is the address [`host`] gave to `make_later`.
+    ///
+    /// [`host`]: Pipeline::host
+    pub(crate) unsafe fn make_host(pipeline: usize) {
+        let pipeline = pipeline as *mut Pipeline;
+        {
+            // SAFETY: held since `host` asked, as this function's contract says.
+            let this = unsafe { &*pipeline };
+            let made = crate::translate::host_pipeline(this);
+            if let Err(why) = &made {
+                show_unmade(why);
+            }
+            let _ = this.host.set(made);
+        }
+        // SAFETY: the hold taken in `host`, given up; the pipeline goes if it was the last.
+        unsafe { object::release(pipeline) };
     }
 
     /// The stream as the title gave it, and where its subobjects are.
@@ -407,6 +434,7 @@ pub(crate) unsafe extern "system" fn create(
         root,
         layout: elements,
         host: OnceLock::new(),
+        asked: std::sync::atomic::AtomicBool::new(false),
     });
     show(&pipeline);
     // SAFETY: `accepts` checked the out-pointer.
@@ -461,6 +489,7 @@ pub(crate) unsafe extern "system" fn create_compute(
         root: description.root,
         layout: Vec::new(),
         host: OnceLock::new(),
+        asked: std::sync::atomic::AtomicBool::new(false),
     });
     show(&pipeline);
     // SAFETY: `accepts` checked the out-pointer.
