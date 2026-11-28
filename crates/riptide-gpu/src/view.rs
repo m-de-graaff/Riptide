@@ -293,8 +293,9 @@ fn undescribed(resource: &crate::resource::Description, unordered: bool) -> [u32
             };
         }
     } else {
-        // Format, dimension, mapping, then: first level, levels; and for an array the
-        // first slice and the slices.
+        // Format, dimension, mapping and a word of padding, then from word 4: first level,
+        // levels; and for an array the first slice and the slices. A multisampled array
+        // has only its first slice and its slices.
         words[1] = match (resource.dimension, layered, resource.sample_count > 1) {
             (2, false, _) => 2,
             (2, true, _) => 3,
@@ -307,11 +308,11 @@ fn undescribed(resource: &crate::resource::Description, unordered: bool) -> [u32
         words[2] = 0x1688;
         match words[1] {
             6 => {}
-            7 => words[4] = array,
+            7 => words[5] = array,
             _ => {
-                words[4] = u32::MAX;
+                words[5] = u32::MAX;
                 if layered && resource.dimension != 4 {
-                    words[6] = array;
+                    words[7] = array;
                 }
             }
         }
@@ -1187,7 +1188,7 @@ mod tests {
         };
         assert_eq!(
             undescribed(&depth, false)[..6],
-            [41, 4, 0x1688, 0, u32::MAX, 0]
+            [41, 4, 0x1688, 0, 0, u32::MAX]
         );
         let layered = crate::resource::Description {
             depth_or_array_size: 6,
@@ -1195,8 +1196,8 @@ mod tests {
             ..depth
         };
         assert_eq!(
-            undescribed(&layered, false)[..7],
-            [28, 5, 0x1688, 0, u32::MAX, 0, 6]
+            undescribed(&layered, false)[..8],
+            [28, 5, 0x1688, 0, 0, u32::MAX, 0, 6]
         );
         assert_eq!(undescribed(&layered, true)[..5], [28, 5, 0, 0, 6]);
     }

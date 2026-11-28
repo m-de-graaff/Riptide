@@ -1,12 +1,13 @@
-//! A test of what a translated shader is bound to, on a real GPU: the page table, the
-//! banks of title memory in the shaders' heap, a block of stage inputs and the one root
-//! signature, with shaders written by hand to the same rules a translation follows.
+//! Tests of what a translated shader is bound to, on a real GPU: the page table, the banks
+//! of title memory and the textures in the shaders' heap, the sampler heap, a block of
+//! stage inputs and the one root signature, with shaders written by hand to the same rules
+//! a translation follows.
 //!
-//! It needs a graphics card and the shader compiler, so it is run by name:
+//! They need a graphics card and the shader compiler, so they are run by name:
 //! `cargo test -p riptide-gpu -- --ignored bindings`.
 
 use std::mem::ManuallyDrop;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use riptide_mem::{Access, FRAME, Limits, TitleMemory};
 use windows::Win32::Foundation::RECT;
@@ -16,10 +17,10 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+use windows::core::Interface;
 
 use crate::hostpipe::Shaders;
 use crate::pipeline::Subobject;
-use windows::core::Interface;
 
 /// What every shader here starts with: the stage inputs, the page table, and reading a
 /// word of title memory by its address. `SPACE` is the space of the stage's inputs.
@@ -47,15 +48,48 @@ float4 main(uint id : SV_VertexID) : SV_Position {
 }
 ";
 
-const PIXEL: &str = r"
+/// Every pixel is the word of title memory whose address the inputs give, a byte to a
+/// channel.
+const WORD: &str = r"
 float4 main() : SV_Target {
     uint word = read_word(user(0), user(1));
     return float4(word & 0xff, (word >> 8) & 0xff, (word >> 16) & 0xff, word >> 24) / 255.0;
 }
 ";
 
-fn unbuilt(name: String) -> usize {
-    panic!("{name} is not built");
+/// The inputs give the address of a texture's record, with a sampler's record after it.
+/// The texture is read at each pixel's own texel through the places the records name.
+const SAMPLE: &str = r"
+float4 main(float4 position : SV_Position) : SV_Target {
+    uint record = user(0);
+    uint place = read_word(record + 20, 0);
+    uint size = read_word(record + 8, 0);
+    uint width = (((size & 0x3fff) << 2) | (read_word(record + 4, 0) >> 30)) + 1;
+    uint height = ((size >> 14) & 0xffff) + 1;
+    Texture2D<float4> image = ResourceDescriptorHeap[place];
+    SamplerState sampler = SamplerDescriptorHeap[read_word(record + 32 + 12, 0) & 0xfff];
+    return image.SampleLevel(sampler, position.xy / float2(width, height), 0);
+}
+";
+
+/// A method that is not built has nothing to call here: no test calls one.
+fn unbuilt(_name: String) -> usize {
+    0
+}
+
+/// Title memory and the runtime's services, set up once for every test here.
+fn memory() -> &'static TitleMemory {
+    static MEMORY: OnceLock<&'static TitleMemory> = OnceLock::new();
+    MEMORY.get_or_init(|| {
+        let memory: &'static TitleMemory = Box::leak(Box::new(TitleMemory::new(4 << 30)));
+        crate::init(crate::Services {
+            memory,
+            log: Arc::new(|line| eprintln!("{line}")),
+            stub: unbuilt,
+            allocator: || None,
+        });
+        memory
+    })
 }
 
 /// A stream of a root signature, a vertex and a pixel program, depth and stencil turned
@@ -108,34 +142,19 @@ fn transition(
     }
 }
 
-#[test]
-#[ignore = "needs a graphics card and the shader compiler"]
-fn a_shaders_bindings_reach_title_memory_through_the_page_table() {
-    let memory: &'static TitleMemory = Box::leak(Box::new(TitleMemory::new(4 << 30)));
-    crate::init(crate::Services {
-        memory,
-        log: Arc::new(|line| eprintln!("{line}")),
-        stub: unbuilt,
-        allocator: || None,
-    });
+/// Draws one triangle over a square target of `size` pixels a side with the pixel shader
+/// `pixel` and the stage inputs `inputs`, and returns the target's pixels, four bytes
+/// each, row after row. `before` runs with the queue just before the draw is submitted.
+fn picture(
+    pixel: &str,
+    inputs: &[u32],
+    size: u32,
+    before: impl FnOnce(&ID3D12CommandQueue),
+) -> Vec<u8> {
     let host = crate::host::host().expect("a host device");
     assert!(crate::compile::found_in().is_some(), "no shader compiler");
-
-    // A word of title memory, above 4 GiB so that both halves of its address count.
-    let limits = Limits {
-        lowest: 4 << 30,
-        highest: (1 << 37) - 1,
-        alignment: 0,
-    };
-    let at = memory
-        .commit(None, FRAME, limits, Access::ReadWrite)
-        .unwrap()
-        + 0x1230;
-    // SAFETY: committed just now, and inside the frame.
-    unsafe { (at as *mut u32).write(0x80ff_4020) };
     crate::pagetable::sync();
     crate::bindless::sync();
-
     let vertex = crate::compile::compile(
         &format!("{}{VERTEX}", START.replace("SPACE", "space0")),
         "main",
@@ -144,7 +163,7 @@ fn a_shaders_bindings_reach_title_memory_through_the_page_table() {
     )
     .unwrap();
     let pixel = crate::compile::compile(
-        &format!("{}{PIXEL}", START.replace("SPACE", "space1")),
+        &format!("{}{pixel}", START.replace("SPACE", "space1")),
         "main",
         "ps_6_6",
         &[],
@@ -162,10 +181,9 @@ fn a_shaders_bindings_reach_title_memory_through_the_page_table() {
         },
     )
     .unwrap();
-
-    let mut inputs = [0u32; crate::stage::WORDS];
-    (inputs[0], inputs[1]) = (at as u32, (at >> 32) as u32);
-    let block = crate::stage::block(1, &inputs).expect("a block of stage inputs");
+    let mut words = [0u32; crate::stage::WORDS];
+    words[..inputs.len()].copy_from_slice(inputs);
+    let block = crate::stage::block(1, &words).expect("a block of stage inputs");
 
     // SAFETY: plain calls on the host device and objects made here, in the order the host
     // wants them; the read-back buffer is read inside its size after the GPU is done.
@@ -174,8 +192,8 @@ fn a_shaders_bindings_reach_title_memory_through_the_page_table() {
         let target_description = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             Alignment: 0,
-            Width: 4,
-            Height: 4,
+            Width: u64::from(size),
+            Height: size,
             DepthOrArraySize: 1,
             MipLevels: 1,
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -272,16 +290,16 @@ fn a_shaders_bindings_reach_title_memory_through_the_page_table() {
         list.SetPipelineState(&pipeline);
         list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list.RSSetViewports(&[D3D12_VIEWPORT {
-            Width: 4.0,
-            Height: 4.0,
+            Width: size as f32,
+            Height: size as f32,
             MaxDepth: 1.0,
             ..Default::default()
         }]);
         list.RSSetScissorRects(&[RECT {
             left: 0,
             top: 0,
-            right: 4,
-            bottom: 4,
+            right: size as i32,
+            bottom: size as i32,
         }]);
         list.OMSetRenderTargets(1, Some(&view), false, None);
         list.ClearRenderTargetView(view, &[0.0; 4], None);
@@ -312,6 +330,7 @@ fn a_shaders_bindings_reach_title_memory_through_the_page_table() {
             None,
         );
         list.Close().unwrap();
+        before(&queue);
         queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
         queue.Signal(&fence, 1).unwrap();
@@ -323,11 +342,112 @@ fn a_shaders_bindings_reach_title_memory_through_the_page_table() {
 
         let mut mapped = std::ptr::null_mut();
         read_back.Map(0, None, Some(&mut mapped)).unwrap();
-        let pixels = std::slice::from_raw_parts(mapped.cast::<u8>(), bytes as usize);
-        // Every pixel is the word of title memory, a byte to a channel.
-        let last = 3 * footprint.Footprint.RowPitch as usize + 12;
-        assert_eq!(pixels[..4], [0x20, 0x40, 0xff, 0x80]);
-        assert_eq!(pixels[last..last + 4], [0x20, 0x40, 0xff, 0x80]);
+        let rows = std::slice::from_raw_parts(mapped.cast::<u8>(), bytes as usize);
+        let pitch = footprint.Footprint.RowPitch as usize;
+        let pixels = (0..size as usize)
+            .flat_map(|row| {
+                rows[row * pitch..row * pitch + size as usize * 4]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        crate::stage::give_back(1);
+        pixels
     }
-    crate::stage::give_back(1);
+}
+
+#[test]
+#[ignore = "needs a graphics card and the shader compiler"]
+fn bindings_reach_title_memory_through_the_page_table() {
+    let memory = memory();
+    // A word of title memory, above 4 GiB so that both halves of its address count.
+    let limits = Limits {
+        lowest: 4 << 30,
+        highest: (1 << 37) - 1,
+        alignment: 0,
+    };
+    let at = memory
+        .commit(None, FRAME, limits, Access::ReadWrite)
+        .unwrap()
+        + 0x1230;
+    // SAFETY: committed just now, and inside the frame.
+    unsafe { (at as *mut u32).write(0x80ff_4020) };
+    let pixels = picture(WORD, &[at as u32, (at >> 32) as u32], 4, |_| {});
+    // Every pixel is the word of title memory, a byte to a channel.
+    assert_eq!(pixels.len(), 64);
+    for pixel in pixels.chunks(4) {
+        assert_eq!(pixel, [0x20, 0x40, 0xff, 0x80]);
+    }
+}
+
+#[test]
+#[ignore = "needs a graphics card and the shader compiler"]
+fn bindings_reach_a_texture_through_its_record() {
+    use riptide_formats::texture::LinearPitch;
+    const SIZE: u32 = 32;
+    let memory = memory();
+    let low = Limits {
+        lowest: 0x1_0000,
+        highest: 0xffff_ffff,
+        alignment: 0,
+    };
+    // A texture in title memory, in the layout the console would choose for it, with a
+    // colour for every texel that says where the texel is.
+    let description = crate::resource::Description {
+        dimension: 3,
+        alignment: 0,
+        width: u64::from(SIZE),
+        height: SIZE,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 28,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 0,
+    };
+    let layout = crate::resource::console_texture(&description).unwrap();
+    let bytes = layout.bytes().next_multiple_of(FRAME);
+    let texture = memory.commit(None, bytes, low, Access::ReadWrite).unwrap();
+    let texels: Vec<u8> = (0..SIZE * SIZE)
+        .flat_map(|texel| {
+            [
+                (texel % SIZE * 8) as u8,
+                (texel / SIZE * 8) as u8,
+                0x55,
+                0xff,
+            ]
+        })
+        .collect();
+    // SAFETY: committed just now, that many bytes.
+    let tiled = unsafe { std::slice::from_raw_parts_mut(texture as *mut u8, bytes as usize) };
+    layout
+        .tile(
+            tiled,
+            0,
+            0,
+            0,
+            &texels,
+            LinearPitch::packed(SIZE as usize * 4, SIZE as usize),
+        )
+        .unwrap();
+
+    // A view of it and a sampler that takes the nearest texel, as records in title memory.
+    let records = memory.commit(None, FRAME, low, Access::ReadWrite).unwrap();
+    let resource = crate::resource::placed(texture, &description);
+    let nearest: crate::view::Sampler = [0, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0, f32::MAX.to_bits()];
+    // SAFETY: a live resource, a valid description, and room for the records.
+    unsafe {
+        crate::view::create_shader_resource(
+            crate::device::device(),
+            resource,
+            std::ptr::null(),
+            records,
+        );
+        crate::view::create_sampler(crate::device::device(), &nearest, records + 32);
+    }
+    let pixels = picture(SAMPLE, &[records as u32], SIZE, |queue| {
+        crate::upload::flush(queue, 1, 0);
+    });
+    assert_eq!(pixels, texels);
 }
