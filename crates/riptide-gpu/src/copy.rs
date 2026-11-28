@@ -10,9 +10,13 @@
 //! the same bank. Such a copy goes by way of a scratch buffer of the list's allocator:
 //! out of the bank, and back in.
 //!
-//! Built: `CopyBufferRegion`, and the console's `CopyMemoryX`, which names two addresses
-//! and no resource. Not built: copies of textures, which name themselves when
-//! called, and a range that is not one stretch of one bank, which is said in the session
+//! A copy from one texture to another is the same copy between their host textures.
+//!
+//! Built: `CopyBufferRegion`, the console's `CopyMemoryX`, which names two addresses and
+//! no resource, `CopyResource`, and `CopyTextureRegion` between two textures. Not built:
+//! a copy between a texture and rows in a buffer, the other copy and resolve methods,
+//! which name themselves when called, and a range of memory that is not one stretch of
+//! one bank. What is not made is said in the session
 //! log and not copied.
 
 use std::collections::HashMap;
@@ -20,9 +24,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_DESC,
-    D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_STATE_COPY_DEST,
-    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ID3D12Resource,
+    D3D12_BOX, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
+    D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_STATE_COPY_DEST,
+    D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+    D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
 use windows::core::Interface;
@@ -230,10 +235,110 @@ fn copy_range(this: &List, to_address: u64, from_address: u64, bytes: u64) {
     );
 }
 
+/// `CopyResource`: `(to, from)`. All of one resource to another like it: two textures by
+/// their host textures, two buffers as their memory.
+///
+/// # Safety
+/// `to` and `from` are null or live resources.
+unsafe extern "system" fn copy_resource(this: &List, to: *const Resource, from: *const Resource) {
+    // SAFETY: the title's resources, null or live.
+    let (Some(to), Some(from)) = (unsafe { to.as_ref() }, unsafe { from.as_ref() }) else {
+        unmade("a copy of a resource names no resource");
+        return;
+    };
+    match (to.host(), from.host()) {
+        (Some(target), Some(source)) => {
+            this.use_texture(source, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            this.use_texture(target, D3D12_RESOURCE_STATE_COPY_DEST);
+            // SAFETY: a plain call on the host list with two live host textures.
+            unsafe { this.host().CopyResource(target, source) };
+        }
+        (None, None) if to.description().dimension == 1 && from.description().dimension == 1 => {
+            let bytes = to.description().width.min(from.description().width);
+            copy_range(this, to.address(), from.address(), bytes);
+        }
+        _ => unmade("a copy between a texture and a buffer, or of a texture the host has not"),
+    }
+}
+
+/// One end of a texture copy as a title describes it: the resource, then whether what
+/// follows is a subresource's number (0) or a footprint in a buffer (1), then that, which
+/// starts on the next eight bytes: the number is its first word.
+#[repr(C)]
+struct Location {
+    resource: *const Resource,
+    kind: u32,
+    unused: u32,
+    rest: [u32; 8],
+}
+
+const _: () = assert!(size_of::<Location>() == 48);
+
+/// `CopyTextureRegion`: `(to, x, y, z in it, from, box in it or null)`. Part of one
+/// subresource of a texture to a place in a subresource of another. A copy to or from a
+/// footprint in a buffer is not built.
+///
+/// # Safety
+/// `to` and `from` are null or locations whose resources are null or live, and `region`
+/// is null or six words.
+unsafe extern "system" fn copy_texture_region(
+    this: &List,
+    to: *const Location,
+    x: u32,
+    y: u32,
+    z: u32,
+    from: *const Location,
+    region: *const D3D12_BOX,
+) {
+    // SAFETY: the title's locations and their resources, null or live.
+    let ends = unsafe {
+        to.as_ref()
+            .zip(from.as_ref())
+            .and_then(|(to, from)| Some((to, to.resource.as_ref()?, from, from.resource.as_ref()?)))
+    };
+    let Some((to, target, from, source)) = ends else {
+        unmade("a copy of a texture's part names no resource");
+        return;
+    };
+    if to.kind != 0 || from.kind != 0 {
+        unmade("a copy between a texture and rows in a buffer");
+        return;
+    }
+    let (Some(target_texture), Some(source_texture)) = (target.host(), source.host()) else {
+        unmade("a copy of part of a texture the host has not");
+        return;
+    };
+    let end = |texture: &ID3D12Resource, subresource: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a copy of the pointer without a reference of its own, used for one
+        // call during which the texture is alive, and never dropped.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: subresource,
+        },
+    };
+    this.use_texture(source_texture, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    this.use_texture(target_texture, D3D12_RESOURCE_STATE_COPY_DEST);
+    // SAFETY: a plain call on the host list; the locations name live host textures and
+    // the box, if there is one, is the title's six words.
+    unsafe {
+        this.host().CopyTextureRegion(
+            &end(target_texture, to.rest[0]),
+            x,
+            y,
+            z,
+            &end(source_texture, from.rest[0]),
+            region.as_ref().map(std::ptr::from_ref),
+        );
+    }
+}
+
 /// The copy methods by their position in the older list layout.
 pub(crate) fn methods() -> Vec<(usize, usize)> {
     vec![
         (15, copy_buffer_region as *const () as usize),
+        (16, copy_texture_region as *const () as usize),
+        (17, copy_resource as *const () as usize),
         (60, copy_memory as *const () as usize),
     ]
 }
