@@ -19,4 +19,4 @@ Working, used by `riptide-launcher`. The runtime will call it too (decision D11)
 Two checks are limited by what is known:
 
 - **Graphics driver.** `MEASURED_DRIVER` is `None` until `docs/measurements.md` has its first entry, so nothing is compared yet. Set it with each measurement.
-- **Antivirus.** Windows shows a product's exclusions only to administrators. The check warns whenever a real-time scanner is active and names the folder to exclude; it cannot see that the exclusion is already made.
+- **Antivirus.** Windows shows a product's exclusions only to administrators, so the check cannot tell whether the cache folder is excluded. An active real-time scanner is therefore a note at the OK level that names the folder to exclude, never a warning: a warning that cannot clear would be there on nearly every machine.

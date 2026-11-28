@@ -275,13 +275,16 @@ pub fn judge_with(m: &Machine, s: &Settings, measured: Option<Driver>) -> Vec<Ch
             ANTIVIRUS,
             "No real-time scanner is active.".into(),
         ),
+        // A note, not a warning. Windows shows a product's exclusions only to
+        // administrators, so this could never be seen to be dealt with, and a warning that
+        // never clears teaches its reader to pass over warnings.
         Some(scanners) => add(
             "antivirus",
-            Level::Warning,
+            Level::Ok,
             ANTIVIRUS,
             format!(
-                "{} scans files as they are written. Exclude {} in it, or Riptide's caches \
-                 load slowly. Riptide cannot see whether that is done already.",
+                "{} scans files as they are written. If Riptide's caches load slowly, \
+                 exclude {} in it. Riptide cannot see whether that is done already.",
                 scanners.join(" and "),
                 m.cache_folder
             ),
@@ -621,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn an_active_real_time_scanner_warns_and_names_the_cache_folder() {
+    fn an_active_real_time_scanner_is_noted_with_the_cache_folder_and_is_no_warning() {
         let with_scanners = |scanners: Option<Vec<&str>>| {
             let m = Machine {
                 scanners: scanners.map(|s| s.into_iter().map(String::from).collect()),
@@ -633,7 +636,7 @@ mod tests {
         assert_eq!(with_scanners(None).level, Level::Ok);
 
         let one = with_scanners(Some(vec!["Windows Defender"]));
-        assert_eq!(one.level, Level::Warning);
+        assert_eq!(one.level, Level::Ok);
         assert!(one.detail.starts_with("Windows Defender scans files"));
         assert!(
             one.detail
@@ -659,7 +662,7 @@ mod tests {
             ..good()
         };
         let checks = judge_with(&m, &Settings::default(), Some(amd([2, 0, 0, 0])));
-        assert_eq!(summary(&checks), "7 OK, 3 warnings");
+        assert_eq!(summary(&checks), "8 OK, 2 warnings");
         assert!(can_play(&checks));
     }
 

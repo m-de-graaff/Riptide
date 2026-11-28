@@ -178,4 +178,6 @@ Riptide is written from scratch. The published findings and measurements of VIct
 
 ## License
 
-To be decided.
+GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+Riptide takes no code from the projects it learned from, only facts about the console's interfaces. Those projects are GPL-3.0, and Riptide uses the same licence so that the question of where that line runs never decides whether Riptide may be shared.
