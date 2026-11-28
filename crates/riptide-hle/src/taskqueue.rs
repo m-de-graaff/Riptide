@@ -31,7 +31,7 @@ const E_ABORT: i32 = 0x8000_4004_u32 as i32;
 const INFINITE: u32 = u32::MAX;
 
 /// A callback the title submits: its context, and whether the queue was ended before it ran.
-type Callback = unsafe extern "system" fn(*mut c_void, bool);
+pub(crate) type Callback = unsafe extern "system" fn(*mut c_void, bool);
 /// Told that a callback was submitted to a port, so the title can wake what dispatches it.
 type Monitor = unsafe extern "system" fn(*mut c_void, *const Queue, u32);
 type Terminated = unsafe extern "system" fn(*mut c_void);
@@ -257,6 +257,32 @@ unsafe fn queue(handle: *const Queue) -> Arc<Queue> {
     unsafe {
         Arc::increment_strong_count(handle);
         Arc::from_raw(handle)
+    }
+}
+
+/// Submits a callback of Riptide's own to a port of a title's queue, after `delay`
+/// milliseconds: what `XTaskQueueSubmitDelayedCallback` does, for the runtime's own use.
+///
+/// # Safety
+/// `handle` is null or a live handle; `callback` may be called with `context` once, on any
+/// thread.
+pub(crate) unsafe fn submit_callback(
+    handle: *const Queue,
+    port: u32,
+    delay: u32,
+    context: *mut c_void,
+    callback: Callback,
+) -> i32 {
+    // SAFETY: as received.
+    unsafe {
+        submit_delayed(
+            std::ptr::null_mut(),
+            handle,
+            port,
+            delay,
+            context,
+            Some(callback),
+        )
     }
 }
 
@@ -541,7 +567,8 @@ extern "system" fn check_thread(_this: *mut c_void) {}
 
 /// The methods that are built, by position.
 pub(crate) fn methods() -> Vec<(usize, usize)> {
-    vec![
+    let mut methods = crate::xasync::methods();
+    methods.extend([
         (12, create as *const () as usize),
         (13, create_composite as *const () as usize),
         (14, get_port as *const () as usize),
@@ -556,7 +583,8 @@ pub(crate) fn methods() -> Vec<(usize, usize)> {
         (25, get_process_queue as *const () as usize),
         (26, set_process_queue as *const () as usize),
         (29, check_thread as *const () as usize),
-    ]
+    ]);
+    methods
 }
 
 #[cfg(test)]

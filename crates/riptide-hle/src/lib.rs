@@ -31,6 +31,7 @@ pub mod timers;
 mod trace;
 mod user;
 mod xapu;
+mod xasync;
 mod xdsp;
 mod xg;
 pub mod xmem;
