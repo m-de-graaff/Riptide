@@ -7,6 +7,7 @@
 
 mod bindless;
 mod census;
+mod compile;
 mod descriptor;
 mod device;
 mod draw;
@@ -14,6 +15,9 @@ mod dxgi;
 mod fence;
 mod frame;
 mod host;
+mod hostpipe;
+#[cfg(test)]
+mod hosttest;
 mod inplace;
 mod list;
 mod object;
@@ -28,6 +32,7 @@ mod record;
 mod resource;
 mod root;
 mod signature;
+mod stage;
 mod target;
 mod view;
 
