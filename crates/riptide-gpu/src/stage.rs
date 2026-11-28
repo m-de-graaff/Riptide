@@ -262,4 +262,4 @@ pub(crate) fn give_back(allocator: usize) {
 }
 
 // A block holds a stage's inputs, and starts where the host wants constants to start.
-const _: () = assert!(WORDS * 4 <= BLOCK && BLOCK % 256 == 0);
+const _: () = assert!(WORDS * 4 <= BLOCK && BLOCK.is_multiple_of(256));
