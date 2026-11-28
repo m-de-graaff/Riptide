@@ -616,6 +616,72 @@ impl TitleMemory {
         }
     }
 
+    /// As [`TitleMemory::guard`], for a range that need not be mapped whole: the pages of
+    /// it that are mapped are guarded, and the rest left alone. A title maps a texture it
+    /// streams a piece at a time. Returns how many bytes of the range are mapped, which is
+    /// an error if none are.
+    pub fn guard_mapped(&self, address: u64, bytes: u64, resource: u64) -> Result<u64, MemError> {
+        if bytes == 0 {
+            return Err(MemError::InvalidParameter);
+        }
+        let state = self.state();
+        let mut pages = Vec::new();
+        let mut mapped = 0;
+        for (from, to) in Self::mapped_stretches(&state, address, bytes) {
+            if let Some(more) = Self::pages_everywhere(&state, from, to - from) {
+                pages.extend(more);
+                mapped += to - from;
+            }
+        }
+        if mapped == 0 {
+            return Err(MemError::InvalidAddress);
+        }
+        // Holding the state keeps the mappings in place until the guard stands.
+        if guard::guard(self.id, resource, pages) {
+            Ok(mapped)
+        } else {
+            Err(MemError::InvalidParameter)
+        }
+    }
+
+    /// The stretches of `bytes` at `address` that are mapped, each as its first address
+    /// and the address after its last.
+    fn mapped_stretches(state: &State, address: u64, bytes: u64) -> Vec<(u64, u64)> {
+        let end = address.saturating_add(bytes);
+        state
+            .space
+            .mapped_in(address..end)
+            .into_iter()
+            .map(|(first, _, frames)| {
+                (
+                    first.max(address),
+                    (first + u64::from(frames) * FRAME).min(end),
+                )
+            })
+            .filter(|(from, to)| from < to)
+            .collect()
+    }
+
+    /// Copies what is mapped of the title memory at `address` into `into`, which stands
+    /// for the bytes from that address on, and leaves the rest of `into` as it is. Returns
+    /// how many bytes were copied. The title may be writing them meanwhile: what is read
+    /// then is some mix of old and new.
+    pub fn read_mapped(&self, address: u64, into: &mut [u8]) -> u64 {
+        let state = self.state();
+        let mut copied = 0;
+        for (from, to) in Self::mapped_stretches(&state, address, into.len() as u64) {
+            let count = (to - from) as usize;
+            let at = (from - address) as usize;
+            // SAFETY: the stretch is mapped, and stays so while the state is held; the
+            // destination is that many bytes of `into`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(from as *const u8, into[at..].as_mut_ptr(), count);
+            }
+            copied += count as u64;
+        }
+        copied
+    }
+
     /// Ends the guard for `resource` without reporting it as written. Returns whether it
     /// was guarded: false if a write, or an unmapping, ended the guard first.
     pub fn unguard(&self, resource: u64) -> bool {

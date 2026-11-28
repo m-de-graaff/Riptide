@@ -201,6 +201,9 @@ pub(crate) struct Run {
     pub(crate) queued: std::sync::atomic::AtomicU32,
     /// The number, on its queue, of the last submission that ran it. Zero: never.
     pub(crate) ran_at: std::sync::atomic::AtomicU64,
+    /// The ranges of title memory its copies write, as addresses and lengths: a texture
+    /// that lies there has to be filled again once the list has run (`upload.rs`).
+    pub(crate) written: std::sync::Mutex<Vec<(u64, u64)>>,
 }
 
 /// One part of a title's list as it is submitted: a host list, and the waits the GPU makes
@@ -668,6 +671,18 @@ impl List {
             self.transition(buffer, entry.state, wanted);
             entry.state = wanted;
         }
+    }
+
+    /// Notes that a command recorded now has the GPU write `bytes` of title memory at
+    /// `address`.
+    pub(crate) fn note_written(&self, address: u64, bytes: u64) {
+        self.run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .written
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((address, bytes));
     }
 
     /// Records a change of state of all of a host texture or buffer.

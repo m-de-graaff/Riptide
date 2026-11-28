@@ -108,11 +108,22 @@ pub(crate) fn make(description: &Description) -> Option<ID3D12Resource> {
     if description.dimension < 2 {
         return None;
     }
-    let Some(host_description) = host_description(description) else {
+    let Some(mut host_description) = host_description(description) else {
         trace!("no host texture for a format the host does not have: {description:?}");
         return None;
     };
     let host = crate::host::host().ok()?;
+    // The console lets a title make a view for writing of any texture, whatever it was
+    // made with; the host wants to be told when the texture is made. So every texture
+    // that can be written from shaders at all is made so.
+    const DEPTH: i32 = 0x2;
+    const UNORDERED_ACCESS: i32 = 0x4;
+    if host_description.Flags.0 & DEPTH == 0
+        && description.sample_count <= 1
+        && host_format(description.format).is_some_and(writable)
+    {
+        host_description.Flags.0 |= UNORDERED_ACCESS;
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -142,6 +153,43 @@ pub(crate) fn make(description: &Description) -> Option<ID3D12Resource> {
             None
         }
     }
+}
+
+/// Whether the host can make a view of a texture of `format` that shaders write through.
+/// Asked of the host once for each format.
+fn writable(format: DXGI_FORMAT) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+        D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+    };
+    static KNOWN: Mutex<Option<HashMap<i32, bool>>> = Mutex::new(None);
+    let mut known = KNOWN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *known
+        .get_or_insert_with(HashMap::new)
+        .entry(format.0)
+        .or_insert_with(|| {
+            let Ok(host) = crate::host::host() else {
+                return false;
+            };
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: format,
+                ..Default::default()
+            };
+            // SAFETY: a plain call that fills the structure it is given, of that size.
+            let asked = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+                )
+            };
+            asked.is_ok()
+                && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+        })
 }
 
 /// Says what was made, for the first few.

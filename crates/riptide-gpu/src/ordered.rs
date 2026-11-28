@@ -204,6 +204,16 @@ impl Ordered {
                     let _ = unsafe { self.host.Signal(fence, number) };
                 }
                 for piece in pieces {
+                    // Textures the piece's copies write are filled again once it has run.
+                    let written = piece
+                        .run
+                        .written
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if !written.is_empty() {
+                        crate::upload::written_by_gpu(&self.host, number, &written);
+                    }
+                    drop(written);
                     piece.run.ran_at.store(number, Ordering::Release);
                     piece.run.queued.fetch_sub(1, Ordering::AcqRel);
                     // A host list its title list has let go of can record again.

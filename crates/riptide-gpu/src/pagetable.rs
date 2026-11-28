@@ -168,6 +168,8 @@ pub(crate) fn sync() {
         return;
     };
     for range in services.memory.take_remapped() {
+        // A texture that lies there shows what is mapped there now.
+        crate::upload::remapped(&range);
         if range.start >= LIMIT {
             show_beyond(range.start);
             continue;

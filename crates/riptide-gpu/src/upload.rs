@@ -45,14 +45,27 @@ const MADE_ON_THE_GPU: u32 = 0x7;
 
 #[derive(Default)]
 struct Kept {
-    /// Every texture kept filled, by the address of its resource object, with whether it
-    /// has to be filled again.
-    textures: HashMap<usize, bool>,
+    /// Every texture kept filled, by the address of its resource object.
+    textures: HashMap<usize, Watched>,
     /// What an upload used, to let go when the GPU has run it: the number of the
     /// submission that follows it on its queue, by the queue.
     used: Vec<(usize, u64, Used)>,
+    /// Textures whose memory a submission's copies write: the queue, the submission's
+    /// number on it, and the resource object. They are filled again when it has run.
+    pending: Vec<(usize, u64, usize)>,
+    /// How many times a copy wrote a texture's memory.
+    copied_into: u64,
     filled: u64,
     bytes: u64,
+}
+
+/// A texture kept filled.
+struct Watched {
+    /// Whether it has to be filled again.
+    dirty: bool,
+    /// Where its memory lies: its first address and how many bytes. No bytes if its
+    /// layout in memory is not known.
+    lies: (u64, u64),
 }
 
 /// The host objects one upload used.
@@ -83,15 +96,76 @@ pub(crate) fn watch(resource: &Resource) {
         return;
     }
     kept(|kept| {
+        let before = kept.textures.len();
         kept.textures
             .entry(std::ptr::from_ref(resource) as usize)
-            .or_insert(true);
+            .or_insert_with(|| Watched {
+                dirty: true,
+                lies: (
+                    resource.address(),
+                    crate::resource::console_texture(description)
+                        .map_or(0, |layout| layout.bytes()),
+                ),
+            });
+        let watched = kept.textures.len();
+        if watched != before && watched.is_power_of_two() && watched >= 32 {
+            trace!("{watched} textures are kept filled from title memory");
+        }
+    });
+}
+
+/// Whether two ranges, each a first address and a length, share a byte.
+fn overlap(one: (u64, u64), other: (u64, u64)) -> bool {
+    one.0 < other.0.saturating_add(other.1) && other.0 < one.0.saturating_add(one.1)
+}
+
+/// Notes that submission `number` on `queue` has the GPU write the ranges `written` of
+/// title memory. A texture kept filled that lies in one of them is filled again once the
+/// submission has run: the title streams a texture in elsewhere and has the GPU copy it
+/// to where the texture lies, which no guard on the CPU's writes hears.
+pub(crate) fn written_by_gpu(queue: &ID3D12CommandQueue, number: u64, written: &[(u64, u64)]) {
+    let key = queue.as_raw() as usize;
+    kept(|kept| {
+        let Kept {
+            textures,
+            pending,
+            copied_into,
+            ..
+        } = kept;
+        for (&address, watched) in textures.iter() {
+            if written.iter().any(|&range| overlap(range, watched.lies)) {
+                pending.push((key, number, address));
+                *copied_into += 1;
+                if *copied_into == 1 || copied_into.is_power_of_two() {
+                    trace!(
+                        "{copied_into} times so far a copy on a list wrote a texture's memory;                          the texture is filled again when the copy has run"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Notes that what is mapped at the title addresses of `range` has changed. A texture
+/// that lies there is filled again: a title maps a texture it streams a piece at a time,
+/// and each piece shows once it is there.
+pub(crate) fn remapped(range: &std::ops::Range<u64>) {
+    let range = (range.start, range.end - range.start);
+    kept(|kept| {
+        for watched in kept.textures.values_mut() {
+            if overlap(range, watched.lies) {
+                watched.dirty = true;
+            }
+        }
     });
 }
 
 /// Forgets the texture of the resource object at `resource`, which is going.
 pub(crate) fn forget(resource: usize) {
-    let watched = kept(|kept| kept.textures.remove(&resource).is_some());
+    let watched = kept(|kept| {
+        kept.pending.retain(|&(_, _, pending)| pending != resource);
+        kept.textures.remove(&resource).is_some()
+    });
     if watched && let Some(services) = crate::services() {
         services.memory.unguard(resource as u64);
     }
@@ -135,12 +209,16 @@ fn bring_out(resource: &Resource, rows: &mut Vec<u8>) -> Option<Filled> {
     let texture = resource.host()?.clone();
     let layout: Texture = crate::resource::console_texture(resource.description())?;
     let bytes = layout.bytes();
-    services.memory.locate(resource.address(), bytes)?;
-    // SAFETY: that many bytes are mapped at the address, as just checked. The title may
-    // be writing them: what is read then is some mix of old and new, and the guard that
-    // was set before this says they were written, so they are read again.
-    let memory =
-        unsafe { std::slice::from_raw_parts(resource.address() as *const u8, bytes as usize) };
+    // What is mapped of the texture's memory, with zeros where nothing is: a texture the
+    // title streams has its smaller levels first, and the others show black until they
+    // come. The title may be writing the memory: what is read then is some mix of old and
+    // new, and the guard that was set before this says it was written, so it is read
+    // again.
+    let mut memory = vec![0u8; usize::try_from(bytes).ok()?];
+    if services.memory.read_mapped(resource.address(), &mut memory) == 0 {
+        return None;
+    }
+    let memory = memory.as_slice();
     // SAFETY: a plain call on the host texture.
     let description = unsafe { texture.GetDesc() };
     let three = resource.description().dimension == 4;
@@ -216,13 +294,23 @@ pub(crate) fn flush(queue: &ID3D12CommandQueue, number: u64, done: u64) {
         kept.used
             .retain(|(queue, used_at, _)| *queue != key || *used_at > done);
         for resource in written {
-            if let Some(dirty) = kept.textures.get_mut(&(resource as usize)) {
-                *dirty = true;
+            if let Some(watched) = kept.textures.get_mut(&(resource as usize)) {
+                watched.dirty = true;
             }
         }
+        // What the GPU was to write, it has written when its submission is done.
+        let mut pending = std::mem::take(&mut kept.pending);
+        pending.retain(|&(queue, after, resource)| {
+            let ran = queue == key && after <= done;
+            if ran && let Some(watched) = kept.textures.get_mut(&resource) {
+                watched.dirty = true;
+            }
+            !ran
+        });
+        kept.pending = pending;
         kept.textures
             .iter()
-            .filter(|&(_, &dirty)| dirty)
+            .filter(|(_, watched)| watched.dirty)
             .map(|(&resource, _)| resource)
             .collect()
     });
@@ -239,12 +327,22 @@ pub(crate) fn flush(queue: &ID3D12CommandQueue, number: u64, done: u64) {
         // The guard goes up before the memory is read, so that a write during the read
         // is heard. Memory that is not mapped yet cannot be guarded, and the texture
         // stays to be filled.
-        if bytes == 0
-            || services
-                .memory
-                .guard(resource.address(), bytes, address as u64)
-                .is_err()
+        if bytes == 0 {
+            show_unreadable(resource, "its layout in memory is not known");
+            continue;
+        }
+        // What of it is mapped is watched; none of it mapped yet is nothing to fill, and
+        // it is filled when some of it is (see `remapped`).
+        if services
+            .memory
+            .guard_mapped(resource.address(), bytes, address as u64)
+            .is_err()
         {
+            kept(|kept| {
+                if let Some(watched) = kept.textures.get_mut(&address) {
+                    watched.dirty = false;
+                }
+            });
             continue;
         }
         if let Some(one) = bring_out(resource, &mut rows) {
@@ -257,14 +355,16 @@ pub(crate) fn flush(queue: &ID3D12CommandQueue, number: u64, done: u64) {
     match copy(queue, &rows, &filled) {
         Ok(used) => kept(|kept| {
             for (address, _) in &filled {
-                if let Some(dirty) = kept.textures.get_mut(address) {
-                    *dirty = false;
+                if let Some(watched) = kept.textures.get_mut(address) {
+                    watched.dirty = false;
                 }
             }
             kept.used.push((key, number, used));
+            let before = kept.filled;
             kept.filled += filled.len() as u64;
             kept.bytes += rows.len() as u64;
-            if kept.filled.is_power_of_two() || kept.filled == filled.len() as u64 {
+            // Said the first time, and each time the count passes a power of two.
+            if before == 0 || kept.filled.ilog2() != before.ilog2() {
                 trace!(
                     "{} textures filled from title memory so far, {} MiB",
                     kept.filled,
@@ -359,5 +459,21 @@ fn copy(
             _list: list,
             _buffer: buffer,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranges_share_a_byte_or_do_not() {
+        assert!(overlap((100, 10), (109, 1)));
+        assert!(overlap((100, 10), (90, 11)));
+        assert!(overlap((100, 10), (0, u64::MAX)));
+        // One ends where the other begins: no byte is shared.
+        assert!(!overlap((100, 10), (110, 5)));
+        assert!(!overlap((100, 10), (90, 10)));
+        assert!(!overlap((100, 0), (100, 10)));
     }
 }

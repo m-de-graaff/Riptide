@@ -184,6 +184,8 @@ fn copy_range(this: &List, to_address: u64, from_address: u64, bytes: u64) {
         return;
     };
     let host = this.host();
+    // A texture that lies where the copy writes is the title's way of filling it.
+    this.note_written(to_address, bytes);
     if target.buffer.as_raw() != source.buffer.as_raw() {
         this.use_buffer(&source.buffer, READ);
         this.use_buffer(&target.buffer, D3D12_RESOURCE_STATE_COPY_DEST);
