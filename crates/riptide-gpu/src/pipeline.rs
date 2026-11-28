@@ -411,6 +411,48 @@ pub(crate) unsafe extern "system" fn create_unknown_67(
     unsafe { refuse_unknown(67, description, out) }
 }
 
+/// What a program's container holds, in a line: each part's four-letter name and size, and
+/// for the `DXIL` part where its bitcode starts and how long it is. A program is a DXBC
+/// container: a 32-byte header, a list of part offsets, and parts that each start with a
+/// name and a size. `None` if the bytes are not one.
+pub(crate) fn container_parts(code: &[u8]) -> Option<String> {
+    let word = |at: usize| {
+        code.get(at..at + 4)
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
+    };
+    if code.get(..4)? != b"DXBC" {
+        return None;
+    }
+    let count = word(28)?;
+    let mut parts = Vec::new();
+    for index in 0..count.min(64) {
+        let at = word(32 + index * 4)?;
+        let name = String::from_utf8_lossy(code.get(at..at + 4)?).into_owned();
+        let bytes = word(at + 4)?;
+        let data = at + 8;
+        if name == "DXIL" || name == "STAT" {
+            // The part starts with a program version and a size in words, then "DXIL", a
+            // version, and where the bitcode starts (counted from that "DXIL") and its
+            // length. On PC the bitcode starts 16 bytes in and runs to the end.
+            let version = word(data)?;
+            let start = word(data + 16)?;
+            let length = word(data + 20)?;
+            let magic = code.get(data + 8 + start..data + 8 + start + 4);
+            parts.push(format!(
+                "{name} {bytes} (program {version:#x}, bitcode {length} bytes from {start}{})",
+                if magic == Some(&[0x42, 0x43, 0xc0, 0xde]) {
+                    ""
+                } else {
+                    ", not bitcode there"
+                }
+            ));
+        } else {
+            parts.push(format!("{name} {bytes}"));
+        }
+    }
+    Some(parts.join(", "))
+}
+
 /// Says what was made, for the first few: a title makes thousands.
 fn show(pipeline: &Pipeline) {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -428,9 +470,12 @@ fn show(pipeline: &Pipeline) {
             .iter()
             .map(|(stage, code)| {
                 format!(
-                    "{stage:?} {} bytes starting {:02x?}",
+                    "{stage:?} {} bytes: {}",
                     code.len(),
-                    &code[..code.len().min(8)]
+                    container_parts(code).unwrap_or_else(|| format!(
+                        "not a DXBC container, starting {:02x?}",
+                        &code[..code.len().min(8)]
+                    ))
                 )
             })
             .collect();
@@ -453,6 +498,23 @@ mod tests {
         stream.extend(kind.to_le_bytes());
         stream.extend([0; 4]);
         stream.extend(payload);
+    }
+
+    #[test]
+    fn a_containers_parts_are_named_with_their_sizes() {
+        // A header, one part offset, and a part "ABCD" of 4 bytes.
+        let mut code = b"DXBC".to_vec();
+        code.extend([0; 24]);
+        code.extend(1u32.to_le_bytes());
+        code.extend(36u32.to_le_bytes());
+        code.extend(b"ABCD");
+        code.extend(4u32.to_le_bytes());
+        code.extend([9; 4]);
+        assert_eq!(container_parts(&code).as_deref(), Some("ABCD 4"));
+        assert_eq!(container_parts(b"nope"), None);
+        // A part offset that points outside the bytes is not followed.
+        code[32] = 200;
+        assert_eq!(container_parts(&code), None);
     }
 
     #[test]
