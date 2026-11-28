@@ -676,7 +676,7 @@ mod tests {
 
     const ANYWHERE: Limits = Limits {
         lowest: 0x1_0000_0000,
-        highest: (1 << 40) - 1,
+        highest: (1 << 37) - 1,
         alignment: 0,
     };
 

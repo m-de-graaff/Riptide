@@ -682,12 +682,12 @@ fn attributes(size: &AllocationInfo, heap: &HeapProperties) -> u64 {
     GRAPHICS_ALLOCATOR | (pages << 14) | (alignment << 24) | (memory << 29)
 }
 
-/// Where a committed resource's memory may lie: above 4 GiB and below 2^40, as the title's
+/// Where a committed resource's memory may lie: above 4 GiB and below 2^37 (where the GPU's page table ends), as the title's
 /// other graphics memory does.
 fn limits(alignment: u64) -> Limits {
     Limits {
         lowest: 4 << 30,
-        highest: (1 << 40) - 1,
+        highest: (1 << 37) - 1,
         alignment: if alignment > KIB_64 { alignment } else { 0 },
     }
 }

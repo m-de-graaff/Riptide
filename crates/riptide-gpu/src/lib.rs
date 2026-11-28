@@ -17,6 +17,7 @@ mod list;
 mod object;
 mod ordered;
 mod pagepool;
+mod pagetable;
 mod pipeline;
 mod present;
 mod query;

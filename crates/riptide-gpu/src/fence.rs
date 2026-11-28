@@ -124,7 +124,7 @@ fn pool_slot() -> Option<*mut Fence> {
     if pool.next + SLOT > pool.end {
         let limits = Limits {
             lowest: 4 << 30,
-            highest: (1 << 40) - 1,
+            highest: (1 << 37) - 1,
             alignment: 0,
         };
         let start = services

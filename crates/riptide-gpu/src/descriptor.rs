@@ -155,11 +155,11 @@ fn table() -> &'static [usize] {
     })
 }
 
-/// Where a heap's own memory may lie: above 4 GiB and below 2^40, as the title's other
+/// Where a heap's own memory may lie: above 4 GiB and below 2^37 (where the GPU's page table ends), as the title's other
 /// graphics memory does.
 const LIMITS: Limits = Limits {
     lowest: 4 << 30,
-    highest: (1 << 40) - 1,
+    highest: (1 << 37) - 1,
     alignment: 0,
 };
 

@@ -452,6 +452,32 @@ impl Space {
         Some(parts)
     }
 
+    /// What is mapped in `range`: each stretch that has frames one after another behind
+    /// it, as its first address, its first frame and how many frames.
+    pub(crate) fn mapped_in(&self, range: Range<u64>) -> Vec<(u64, u32, u32)> {
+        let mut mapped = Vec::new();
+        for (&start, reservation) in self.reservations.range(..range.end) {
+            if start + reservation.bytes <= range.start {
+                continue;
+            }
+            for (at, piece) in Self::overlapping(reservation, &range) {
+                let Some(run) = piece.run() else {
+                    continue;
+                };
+                let from = range.start.max(at);
+                let to = range.end.min(at + piece.bytes);
+                if from < to {
+                    mapped.push((
+                        from,
+                        run.first + ((from - at) / FRAME) as u32,
+                        ((to - from).div_ceil(FRAME)) as u32,
+                    ));
+                }
+            }
+        }
+        mapped
+    }
+
     /// Every address range at which any frame of `frames` is mapped, each with the first
     /// frame mapped there.
     pub(crate) fn views_of(&self, frames: FrameRun) -> Vec<(Range<u64>, u32)> {

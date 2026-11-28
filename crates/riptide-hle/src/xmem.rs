@@ -108,7 +108,8 @@ pub unsafe extern "system" fn configure_virtual_memory(
 /// memory lies above it, so the low 4 GiB stay free for the 32-bit requests, and below a
 /// limit the three bits from bit 12 give: 46 bits for 1 down to 40 for 7, and 40 with no
 /// field. The title computes with these limits (its ray-tracing structures must lie below
-/// 2^40).
+/// 2^40). Whatever the field allows, nothing is given above 2^37: that is as far as the
+/// page table the GPU reads title memory through goes, and it is inside every limit.
 fn limits(flags: u64, alignment: u64) -> Limits {
     if flags & FLAG_32BIT != 0 {
         return Limits {
@@ -121,9 +122,11 @@ fn limits(flags: u64, alignment: u64) -> Limits {
         0 => 40,
         field => 47 - field,
     };
+    // Never above what the GPU's page table covers (2^37), whatever more the title allows:
+    // shaders read title memory through that table.
     Limits {
         lowest: 4 * GIB,
-        highest: (1u64 << bits) - 1,
+        highest: (1u64 << bits.min(37)) - 1,
         alignment,
     }
 }
@@ -335,11 +338,11 @@ fn memory_type(attributes: u64) -> u64 {
 /// The arguments are the title's own.
 pub unsafe extern "system" fn alloc_default(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ATTRIBUTE_32BIT == 0 && memory_type(attributes) != 0 {
-        // Graphics memory: pages of its own, below 2^40 as graphics addresses must be.
+        // Graphics memory: pages of its own, below 2^37, where the GPU's page table ends.
         let alignment = alignment(attributes) as u64;
         let limits = Limits {
             lowest: 4 * GIB,
-            highest: (1 << 40) - 1,
+            highest: (1 << 37) - 1,
             alignment: if alignment > FRAME { alignment } else { 0 },
         };
         let result = memory().commit(None, size.max(1) as u64, limits, Access::ReadWrite);
@@ -604,10 +607,12 @@ mod tests {
     fn flags_set_the_address_limits() {
         let low = limits(FLAG_32BIT, 0);
         assert_eq!((low.lowest, low.highest), (0x1_0000, 0xFFFF_FFFF));
-        assert_eq!(limits(0, 0).highest, (1 << 40) - 1);
+        // The flags allow up to 2^40 or more, and all of that is given below 2^37, where
+        // the GPU's page table ends.
+        assert_eq!(limits(0, 0).highest, (1 << 37) - 1);
         assert_eq!(limits(3, 0).lowest, 4 * GIB);
-        assert_eq!(limits(1 << 12, 0).highest, (1 << 46) - 1);
-        assert_eq!(limits(7 << 12, 0).highest, (1 << 40) - 1);
+        assert_eq!(limits(1 << 12, 0).highest, (1 << 37) - 1);
+        assert_eq!(limits(7 << 12, 0).highest, (1 << 37) - 1);
         assert_eq!(limits(0, 2 * MIB).alignment, 2 * MIB);
     }
 
@@ -760,11 +765,11 @@ mod tests {
                 block.cast::<u8>().add(99).write(1);
                 free_default(block, attributes);
             }
-            // Graphics memory is title memory, below 2^40, aligned as asked.
+            // Graphics memory is title memory, below 2^37, aligned as asked.
             let attributes = (1 << ATTRIBUTE_MEMORY_TYPE_SHIFT) | (21 << ATTRIBUTE_ALIGNMENT_SHIFT);
             let graphics = alloc_default(0x3_0000, attributes);
             assert!(memory().holds(graphics as u64));
-            assert!((4 * GIB..1 << 40).contains(&(graphics as u64)));
+            assert!((4 * GIB..1 << 37).contains(&(graphics as u64)));
             assert_eq!(graphics as u64 % (2 * MIB), 0);
             assert!(memory().locate(graphics as u64, 0x3_0000).is_some());
             free_default(graphics, attributes);

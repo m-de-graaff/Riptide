@@ -102,6 +102,9 @@ struct State {
     /// Frames the title has freed that are still mapped somewhere. They go back when the
     /// last mapping does.
     leaving: BTreeSet<u32>,
+    /// The ranges of title addresses whose mapping has changed since they were last asked
+    /// for, for whoever keeps a copy of the page table.
+    remapped: Vec<Range<u64>>,
 }
 
 /// All of a title's memory.
@@ -132,6 +135,25 @@ impl Drop for TitleMemory {
 }
 
 /// Groups frame numbers into runs of consecutive frames in one bank, in the order given.
+/// Adds `range` to a list of remapped ranges, joined to the last one if it follows on.
+/// A list that has grown long is made one range that covers everything in it: whoever
+/// reads it then looks at more than changed, which costs time and is never wrong.
+fn note_remapped(remapped: &mut Vec<Range<u64>>, range: Range<u64>) {
+    if range.start >= range.end {
+        return;
+    }
+    match remapped.last_mut() {
+        Some(last) if last.end == range.start => last.end = range.end,
+        _ => remapped.push(range),
+    }
+    if remapped.len() > 4096 {
+        let start = remapped.iter().map(|range| range.start).min().unwrap_or(0);
+        let end = remapped.iter().map(|range| range.end).max().unwrap_or(0);
+        remapped.clear();
+        remapped.push(start..end);
+    }
+}
+
 fn runs_of(frames: &[u32]) -> Vec<FrameRun> {
     let mut runs: Vec<FrameRun> = Vec::new();
     for &frame in frames {
@@ -166,6 +188,7 @@ impl TitleMemory {
                 used: BTreeSet::new(),
                 held: BTreeSet::new(),
                 leaving: BTreeSet::new(),
+                remapped: Vec::new(),
             }),
             discard_failures: AtomicU64::new(0),
         }
@@ -231,6 +254,7 @@ impl TitleMemory {
     /// and gives back every frame that is no longer mapped anywhere and that the title does
     /// not hold as a physical page.
     fn unmapped(&self, state: &mut State, range: Range<u64>, runs: Vec<FrameRun>) {
+        note_remapped(&mut state.remapped, range.clone());
         guard::end_overlapping(self.id, range);
         for run in runs {
             for frame in run.first..run.first + run.count {
@@ -462,6 +486,19 @@ impl TitleMemory {
             at += part.bytes;
         }
         Ok(())
+    }
+
+    /// The ranges of title addresses whose mapping has changed since this was last called:
+    /// mapped, unmapped or mapped to other frames. For keeping a copy of the page table
+    /// (the GPU's) up to date without reading all of it again.
+    pub fn take_remapped(&self) -> Vec<Range<u64>> {
+        std::mem::take(&mut self.state().remapped)
+    }
+
+    /// What is mapped in `range`: each stretch of addresses that has frames one after
+    /// another behind it, as its first address, its first frame and how many frames.
+    pub fn mapped_in(&self, range: Range<u64>) -> Vec<(u64, u32, u32)> {
+        self.state().space.mapped_in(range)
     }
 
     /// Where in the banks `bytes` at `address` lie (decision M4), or `None` if any of it is
@@ -825,6 +862,56 @@ mod tests {
         );
         memory.release(texture).unwrap();
         memory.release(pool).unwrap();
+    }
+
+    #[test]
+    fn what_changed_is_told_once_and_what_is_mapped_can_be_read_back() {
+        let memory = TitleMemory::new(BANK_BYTES);
+        let range = memory.reserve(16 * FRAME, ANYWHERE).unwrap();
+        // Reserving maps nothing.
+        assert!(memory.take_remapped().is_empty());
+        let frames = memory.allocate_frames(3).unwrap();
+        memory
+            .map_frames(range + 4 * FRAME, &frames, Access::ReadWrite)
+            .unwrap();
+        let changed = memory.take_remapped();
+        assert!(
+            changed
+                .iter()
+                .any(|part| part.start <= range + 4 * FRAME && part.end >= range + 7 * FRAME)
+        );
+        assert!(memory.take_remapped().is_empty());
+
+        let mapped = memory.mapped_in(range..range + 16 * FRAME);
+        let total: u32 = mapped.iter().map(|&(_, _, count)| count).sum();
+        assert_eq!(total, 3);
+        assert_eq!(mapped[0].0, range + 4 * FRAME);
+        assert_eq!(mapped[0].1, frames[0]);
+        // A range that cuts through what is mapped gets the part inside it.
+        let inside = memory.mapped_in(range + 5 * FRAME..range + 6 * FRAME);
+        assert_eq!(inside.len(), 1);
+        assert_eq!((inside[0].0, inside[0].2), (range + 5 * FRAME, 1));
+
+        memory.unmap(range + 4 * FRAME, 3 * FRAME).unwrap();
+        assert!(!memory.take_remapped().is_empty());
+        assert!(memory.mapped_in(range..range + 16 * FRAME).is_empty());
+        memory.release(range).unwrap();
+        memory.free_frames(&frames).unwrap();
+    }
+
+    #[test]
+    fn remapped_ranges_join_and_a_long_list_becomes_one_range() {
+        let mut list = Vec::new();
+        note_remapped(&mut list, 0..10);
+        note_remapped(&mut list, 10..20);
+        note_remapped(&mut list, 40..50);
+        note_remapped(&mut list, 60..60);
+        assert_eq!(list, [0..20, 40..50]);
+        for index in 0..5000u64 {
+            note_remapped(&mut list, index * 100 + 1000..index * 100 + 1001);
+        }
+        assert!(list.len() <= 4096);
+        assert_eq!(list.iter().map(|range| range.start).min(), Some(0));
     }
 
     #[test]
