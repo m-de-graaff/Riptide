@@ -155,11 +155,12 @@ fn table() -> &'static [usize] {
     })
 }
 
-/// Where a heap's own memory may lie: above 4 GiB and below 2^37 (where the GPU's page table ends), as the title's other
-/// graphics memory does.
+/// Where a heap's own memory may lie: below 4 GiB. A descriptor table reaches a shader
+/// program as a 32-bit address, whose high half the program's own code makes zero, so a
+/// heap anywhere else could not be read. The title places its own view heap there too.
 const LIMITS: Limits = Limits {
-    lowest: 4 << 30,
-    highest: (1 << 37) - 1,
+    lowest: 0x1_0000,
+    highest: 0xffff_ffff,
     alignment: 0,
 };
 
