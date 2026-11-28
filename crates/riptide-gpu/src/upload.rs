@@ -66,6 +66,28 @@ struct Watched {
     /// Where its memory lies: its first address and how many bytes. No bytes if its
     /// layout in memory is not known.
     lies: (u64, u64),
+    /// A sum over what its memory held when it was last filled, or zero if it never was.
+    held: u64,
+}
+
+/// A sum over `bytes` that differs, as good as always, when the bytes do. Never zero.
+///
+/// A texture is asked to be filled again whenever anything near it changes: another page
+/// of it is mapped, a write lands on one of its pages, a copy touches its range. Often
+/// nothing it holds has changed, and bringing a large texture out of the console's layout
+/// costs far more than summing its bytes.
+fn sum(bytes: &[u8]) -> u64 {
+    const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut sum = bytes.len() as u64 ^ MIX;
+    let mut words = bytes.chunks_exact(8);
+    for word in &mut words {
+        let word = u64::from_le_bytes(word.try_into().expect("8 bytes"));
+        sum = (sum ^ word).wrapping_mul(MIX).rotate_left(29);
+    }
+    for &byte in words.remainder() {
+        sum = (sum ^ u64::from(byte)).wrapping_mul(MIX).rotate_left(29);
+    }
+    sum | 1
 }
 
 /// The host objects one upload used.
@@ -106,6 +128,7 @@ pub(crate) fn watch(resource: &Resource) {
                     crate::resource::console_texture(description)
                         .map_or(0, |layout| layout.bytes()),
                 ),
+                held: 0,
             });
         let watched = kept.textures.len();
         if watched != before && watched.is_power_of_two() && watched >= 32 {
@@ -200,10 +223,35 @@ struct Filled {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
 }
 
+/// What came of bringing a texture out of its memory.
+enum Out {
+    /// Its rows are in the buffer, and this is the sum over what its memory held.
+    Filled(Filled, u64),
+    /// Its memory holds what it held when it was last filled.
+    Same,
+    /// It cannot be read now: none of its memory is mapped, or its layout is not known.
+    Unread,
+}
+
 /// Brings every level of every slice of `resource` out of its memory into plain rows,
-/// appended to `rows`. `None` if the texture cannot be read now: its memory is not all
-/// mapped, or its layout is not known.
-fn bring_out(resource: &Resource, rows: &mut Vec<u8>) -> Option<Filled> {
+/// appended to `rows`, unless its memory still sums to `held`.
+fn bring_out(resource: &Resource, rows: &mut Vec<u8>, held: u64) -> Out {
+    let mut now = 0;
+    match brought_out(resource, rows, held, &mut now) {
+        Some(filled) => Out::Filled(filled, now),
+        None if now == held && held != 0 => Out::Same,
+        None => Out::Unread,
+    }
+}
+
+/// The work of [`bring_out`]: `None` with `now` equal to `held` if nothing has changed,
+/// and `None` otherwise if the texture cannot be read.
+fn brought_out(
+    resource: &Resource,
+    rows: &mut Vec<u8>,
+    held: u64,
+    now: &mut u64,
+) -> Option<Filled> {
     let services = crate::services()?;
     let host = crate::host::host().ok()?;
     let texture = resource.host()?.clone();
@@ -219,6 +267,10 @@ fn bring_out(resource: &Resource, rows: &mut Vec<u8>) -> Option<Filled> {
         return None;
     }
     let memory = memory.as_slice();
+    *now = sum(memory);
+    if *now == held {
+        return None;
+    }
     // SAFETY: a plain call on the host texture.
     let description = unsafe { texture.GetDesc() };
     let three = resource.description().dimension == 4;
@@ -345,8 +397,27 @@ pub(crate) fn flush(queue: &ID3D12CommandQueue, number: u64, done: u64) {
             });
             continue;
         }
-        if let Some(one) = bring_out(resource, &mut rows) {
-            filled.push((address, one));
+        let held = kept(|kept| {
+            kept.textures
+                .get(&address)
+                .map_or(0, |watched| watched.held)
+        });
+        match bring_out(resource, &mut rows, held) {
+            Out::Filled(one, held) => {
+                kept(|kept| {
+                    if let Some(watched) = kept.textures.get_mut(&address) {
+                        watched.held = held;
+                    }
+                });
+                filled.push((address, one));
+            }
+            // What it holds is what the host texture already shows.
+            Out::Same => kept(|kept| {
+                if let Some(watched) = kept.textures.get_mut(&address) {
+                    watched.dirty = false;
+                }
+            }),
+            Out::Unread => {}
         }
     }
     if filled.is_empty() {
@@ -465,6 +536,22 @@ fn copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sum_tells_changed_bytes_from_unchanged() {
+        let mut bytes = vec![0u8; 100];
+        let empty = sum(&bytes);
+        assert_eq!(empty, sum(&[0u8; 100]));
+        // One more zero, one changed byte in a whole word, one in the last odd bytes.
+        assert_ne!(empty, sum(&[0u8; 101]));
+        bytes[40] = 1;
+        let one = sum(&bytes);
+        assert_ne!(empty, one);
+        bytes[99] = 1;
+        assert_ne!(one, sum(&bytes));
+        // Zero is kept for "never filled".
+        assert_ne!(sum(&[]), 0);
+    }
 
     #[test]
     fn ranges_share_a_byte_or_do_not() {
