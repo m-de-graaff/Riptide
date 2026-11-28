@@ -10,8 +10,8 @@
 //!
 //! An uncompressed read to an address goes from the file straight into the title's memory.
 //!
-//! Not built: BCPack decoding (a request that asks for it names itself and stops the
-//! title), unbuffered reads, and the staging buffer's limit on how much is in flight.
+//! Not built: BCPack decoding (a request that asks for it is answered with black blocks,
+//! and the session log says so), and the staging buffer's limit on how much is in flight.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{c_char, c_void};
@@ -290,17 +290,11 @@ impl Read {
 
     /// Does the request: reads, inflates if asked, and writes the result where it goes.
     fn run(&self) -> Result<(), i32> {
-        if self.options & OPTION_BCPACK != 0 {
-            crate::stub::stop(&format!(
-                "a DirectStorage request for BCPack data (format {}, {} bytes)",
-                (self.options & OPTION_BCPACK) >> 1,
-                self.source_size
-            ));
-        }
+        let packed = ((self.options & OPTION_BCPACK) >> 1) as u8;
         let inflate = self.options & OPTION_ZLIB != 0;
         let to_pages = self.options & OPTION_PAGE_DESTINATION != 0;
 
-        if !inflate && !to_pages {
+        if packed == 0 && !inflate && !to_pages {
             // Straight from the file into the title's memory.
             if self.source_size > self.destination_size {
                 return Err(E_INVALIDARG);
@@ -315,7 +309,9 @@ impl Read {
 
         let mut source = vec![0u8; self.source_size];
         self.read_source(&mut source)?;
-        let result = if inflate {
+        let result = if packed != 0 {
+            unpack(packed, &source, self.destination_size)
+        } else if inflate {
             let mut out = vec![0u8; self.destination_size];
             let written = miniz_oxide::inflate::decompress_slice_iter_to_slice(
                 &mut out,
@@ -364,6 +360,42 @@ impl Read {
             Ok(())
         }
     }
+}
+
+/// The blocks a BCPack stream of block-compression format `format` holds, `bytes` of them.
+///
+/// The decoder is not built yet (issue #33): the blocks come out all zero, which every
+/// block-compressed format reads as black, and the session log says so. `RIPTIDE_BCPACK_DUMP`
+/// names a folder each stream is written to as `<number>.bc<format>.<bytes>.bin`, for work
+/// on the decoder; what is written is the title's data and stays on this machine.
+fn unpack(format: u8, packed: &[u8], bytes: usize) -> Vec<u8> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ASKED: AtomicU64 = AtomicU64::new(0);
+    if format > 7 {
+        // There are seven block-compression formats; what an eighth would hold is not
+        // known, and black blocks of the wrong size would not stand in for it.
+        crate::stub::stop(&format!(
+            "a DirectStorage request for BCPack data of format {format} ({} bytes)",
+            packed.len()
+        ));
+    }
+    let asked = ASKED.fetch_add(1, Ordering::Relaxed) + 1;
+    if asked == 1 || (asked.is_power_of_two() && asked >= 1024) {
+        trace!(
+            "DirectStorage: BCPack data is not decoded yet; {asked} requests so far are answered              with black blocks (the last: format {format}, {} bytes for {bytes})",
+            packed.len()
+        );
+    }
+    if let Some(folder) = std::env::var_os("RIPTIDE_BCPACK_DUMP") {
+        /// How many streams are written: enough to work with, and not a title's whole
+        /// texture set.
+        const MOST: u64 = 4096;
+        if asked <= MOST {
+            let name = format!("{asked:05}.bc{format}.{bytes}.bin");
+            let _ = std::fs::write(std::path::Path::new(&folder).join(name), packed);
+        }
+    }
+    vec![0u8; bytes]
 }
 
 fn file_table() -> &'static [usize] {

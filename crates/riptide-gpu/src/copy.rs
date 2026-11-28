@@ -10,7 +10,8 @@
 //! the same bank. Such a copy goes by way of a scratch buffer of the list's allocator:
 //! out of the bank, and back in.
 //!
-//! Built: `CopyBufferRegion`. Not built: copies of textures, which name themselves when
+//! Built: `CopyBufferRegion`, and the console's `CopyMemoryX`, which names two addresses
+//! and no resource. Not built: copies of textures, which name themselves when
 //! called, and a range that is not one stretch of one bank, which is said in the session
 //! log and not copied.
 
@@ -148,10 +149,30 @@ unsafe extern "system" fn copy_buffer_region(
         unmade("a buffer copy names no resource");
         return;
     };
+    copy_range(
+        this,
+        to.address() + to_offset,
+        from.address() + from_offset,
+        bytes,
+    );
+}
+
+/// `CopyMemoryX`: `(to, from, bytes, flags)`. The console's copy between two addresses of
+/// title memory with no resource named, which is what a buffer copy comes to here.
+extern "system" fn copy_memory(this: &List, to: u64, from: u64, bytes: u64, _flags: u32) {
+    if to == 0 || from == 0 {
+        unmade("a memory copy names no address");
+        return;
+    }
+    copy_range(this, to, from, bytes);
+}
+
+/// Has the host GPU copy `bytes` of title memory from `from_address` to `to_address` at
+/// this point of the list.
+fn copy_range(this: &List, to_address: u64, from_address: u64, bytes: u64) {
     if bytes == 0 {
         return;
     }
-    let (to_address, from_address) = (to.address() + to_offset, from.address() + from_offset);
     let (Some(target), Some(source)) = (
         crate::inplace::find(to_address, bytes),
         crate::inplace::find(from_address, bytes),
@@ -209,7 +230,10 @@ unsafe extern "system" fn copy_buffer_region(
 
 /// The copy methods by their position in the older list layout.
 pub(crate) fn methods() -> Vec<(usize, usize)> {
-    vec![(15, copy_buffer_region as *const () as usize)]
+    vec![
+        (15, copy_buffer_region as *const () as usize),
+        (60, copy_memory as *const () as usize),
+    ]
 }
 
 #[cfg(test)]
