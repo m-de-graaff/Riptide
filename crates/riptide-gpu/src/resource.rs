@@ -191,15 +191,73 @@ fn level_count(description: &Description) -> u32 {
     64 - largest.leading_zeros()
 }
 
-/// The memory a resource takes: a buffer its width, a texture every level of every slice
-/// and sample packed one after another, each rounded up to 64 KiB.
+/// A texture's size and alignment in the console GPU's own layout, as `riptide-formats`
+/// lays it out: in the mode the description's layout field names (`0x100 | mode`), row
+/// after row for 1, and for 0 the mode the console's library would choose for what the
+/// texture is for. `None` for a description it cannot lay out.
 ///
-/// For a texture this is not the console's own layout, which pads and interleaves, so it
-/// is smaller than what the console would say. It serves textures the title only renders
-/// to, whose bytes in title memory nobody reads; the console's layouts come with texture
-/// conversion (decision D4).
+/// The console also keeps compression data beside render targets and depth buffers, which
+/// is not laid out, so those come out a little smaller than on the console.
+fn console_layout(description: &Description) -> Option<AllocationInfo> {
+    use riptide_formats::texture::{Mode, Shape, Texture, TextureDesc, Usage, suggested_mode};
+    let d = description;
+    let shape = match d.dimension {
+        2 => Shape::OneD,
+        3 => Shape::TwoD,
+        4 => Shape::ThreeD,
+        _ => return None,
+    };
+    let mode = if d.layout & 0x100 != 0 {
+        Mode::from_number(d.layout & 0xff)?
+    } else if d.layout == 1 {
+        Mode::Linear
+    } else {
+        let usage = if d.flags & 2 != 0 {
+            Usage::DepthStencil
+        } else if d.flags & 1 != 0 {
+            Usage::RenderTarget
+        } else {
+            Usage::Sampled
+        };
+        suggested_mode(shape, usage)
+    };
+    let texture = Texture::new(&TextureDesc {
+        shape,
+        width: u32::try_from(d.width).ok()?,
+        height: d.height,
+        depth_or_slices: u32::from(d.depth_or_array_size).max(1),
+        mips: u32::from(d.mip_levels),
+        format: d.format,
+        samples: d.sample_count,
+        mode,
+    })
+    .ok()?;
+    // The layout's own alignment unless the title asks for more: 4 KiB for the 4 KiB
+    // modes, where PC would say 64 KiB.
+    let alignment = d.alignment.max(texture.alignment());
+    if !alignment.is_power_of_two() {
+        return None;
+    }
+    Some(AllocationInfo {
+        bytes: texture.bytes().checked_next_multiple_of(alignment)?,
+        alignment,
+    })
+}
+
+/// The memory a resource takes: a buffer its width in whole 64 KiB, and a texture what the
+/// console's own layout of it takes ([`console_layout`]). A title keeps these sizes in its
+/// own tables and places its textures by them.
+///
+/// A texture the console's layouts are not known for (a format `riptide-formats` does not
+/// have) is sized as every level of every slice and sample packed one after another, in
+/// whole 64 KiB, which is less than the console would say.
 pub(crate) fn footprint(description: &Description) -> Option<AllocationInfo> {
     let d = description;
+    if d.dimension != DIMENSION_BUFFER
+        && let Some(laid_out) = console_layout(d)
+    {
+        return Some(laid_out);
+    }
     let bytes = if d.dimension == DIMENSION_BUFFER {
         d.width
     } else {
@@ -868,12 +926,12 @@ mod tests {
         assert_eq!(limits(KIB_64).alignment, 0);
         assert_eq!(limits(MIB_4).alignment, MIB_4);
 
-        // 32 MiB for the GPU alone, aligned to 64 KiB: graphics allocator, 2 MiB pages,
-        // write-combined.
+        // 32 MiB for the GPU alone, in a layout aligned to 4 KiB: graphics allocator,
+        // 2 MiB pages, write-combined.
         let size = footprint(&target).unwrap();
         assert_eq!(
             attributes(&size, &default),
-            (128 << 16) | (2 << 14) | (16 << 24) | (1 << 29)
+            (128 << 16) | (2 << 14) | (12 << 24) | (1 << 29)
         );
         let small = footprint(&buffer).unwrap();
         assert_eq!(
@@ -934,34 +992,55 @@ mod tests {
     }
 
     #[test]
-    fn a_texture_takes_every_level_and_slice() {
-        // 256 x 256 of 4 bytes: 262,144 bytes, and with every level a third more.
+    fn a_texture_takes_what_the_consoles_layout_of_it_takes() {
+        // The title's back buffer: 3840 by 2160 of 4 bytes, a render target with no mode
+        // named. In the 64 KiB render mode a block is 128 by 128 texels, so the texture is
+        // 30 by 17 blocks.
+        let target = Description {
+            flags: 0x30_0005,
+            ..texture(3840, 2160, 1, 28)
+        };
         assert_eq!(
-            footprint(&texture(256, 256, 1, 28)).unwrap().bytes,
-            4 * KIB_64
+            footprint(&target),
+            Some(AllocationInfo {
+                bytes: 30 * 17 * KIB_64,
+                alignment: KIB_64
+            })
         );
-        let chain: u64 = (0..9).map(|level| (256u64 >> level).pow(2) * 4).sum();
+        // A sampled texture with no mode named is laid out in 4 KiB blocks and aligned to
+        // 4 KiB: 256 by 128 of one byte is eight blocks.
         assert_eq!(
-            footprint(&texture(256, 256, 0, 28)).unwrap().bytes,
-            chain.next_multiple_of(KIB_64)
+            footprint(&texture(256, 128, 1, 61)),
+            Some(AllocationInfo {
+                bytes: 0x8000,
+                alignment: 0x1000
+            })
         );
-        // Block-compressed: 8 bytes for every 4 x 4 texels.
-        assert_eq!(
-            footprint(&texture(1024, 1024, 1, 71)).unwrap().bytes,
-            8 * KIB_64
-        );
+        // A mode named in the layout field is the one used, and a larger alignment asked
+        // for is given.
+        let named = Description {
+            layout: 0x100 | 9,
+            alignment: 2 << 20,
+            ..texture(256, 256, 1, 28)
+        };
+        let named = footprint(&named).unwrap();
+        assert_eq!(named.alignment, 2 << 20);
+        assert_eq!(named.bytes % (2 << 20), 0);
+        // More levels, slices or samples never take less.
+        let one = footprint(&texture(1024, 1024, 1, 71)).unwrap().bytes;
+        let chain = footprint(&texture(1024, 1024, 0, 71)).unwrap().bytes;
         let six = Description {
             depth_or_array_size: 6,
-            ..texture(256, 256, 1, 28)
+            ..texture(1024, 1024, 1, 71)
         };
-        assert_eq!(footprint(&six).unwrap().bytes, 24 * KIB_64);
-        // Multisampled textures are aligned to 4 MiB; unknown formats have no size.
-        let samples = Description {
-            sample_count: 4,
-            ..texture(256, 256, 1, 28)
-        };
-        assert_eq!(footprint(&samples).unwrap().alignment, MIB_4);
+        assert!(chain > one);
+        assert!(footprint(&six).unwrap().bytes >= 6 * one);
+    }
+
+    #[test]
+    fn a_texture_of_a_format_with_no_known_layout_has_no_size() {
         assert_eq!(footprint(&texture(256, 256, 1, 104)), None);
+        assert_eq!(console_layout(&texture(256, 256, 1, 104)), None);
     }
 
     #[test]
@@ -997,14 +1076,17 @@ mod tests {
             );
             assert!(std::ptr::eq(returned, &raw const total));
         }
-        assert_eq!((each[0].offset, each[0].bytes), (0, 4 * KIB_64));
-        assert_eq!((each[1].offset, each[1].bytes), (2 << 20, KIB_64));
+        let first = footprint(&both[0].description).unwrap();
+        let second = footprint(&both[1].description).unwrap();
+        assert_eq!((each[0].offset, each[0].bytes), (0, first.bytes));
+        // The second starts at the next multiple of its own alignment.
+        assert_eq!(second.alignment, 2 << 20);
+        assert_eq!(each[1].offset, first.bytes.next_multiple_of(2 << 20));
+        assert_eq!(each[1].bytes, second.bytes);
+        assert_eq!(total.alignment, 2 << 20);
         assert_eq!(
-            total,
-            AllocationInfo {
-                bytes: 4 << 20,
-                alignment: 2 << 20
-            }
+            total.bytes,
+            (each[1].offset + second.bytes).next_multiple_of(2 << 20)
         );
 
         // One that cannot be sized makes the whole answer unknown.
