@@ -81,7 +81,6 @@ fn newest_first(folder: &Path) -> Vec<PathBuf> {
 }
 
 /// The compiler library: where it was found and how to make its objects.
-#[allow(dead_code)] // the first user is the translation of a program, once it writes HLSL
 struct Library {
     create: CreateInstance,
     folder: PathBuf,
@@ -139,6 +138,25 @@ fn library() -> Option<&'static Library> {
         .as_ref()
 }
 
+/// What tells one compiler from another, for the names compiled shaders are kept under:
+/// where it is, how large its file is and when the file was last changed. Empty if there
+/// is no compiler.
+pub(crate) fn identity() -> String {
+    let Some(library) = library() else {
+        return String::new();
+    };
+    let file = library.folder.join("dxcompiler.dll");
+    let (bytes, changed) = std::fs::metadata(&file).map_or((0, 0), |file| {
+        let changed = file
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |since| since.as_secs());
+        (file.len(), changed)
+    });
+    format!("{} {bytes} {changed}", file.display())
+}
+
 /// The folder the compiler was found in, if it was. For preflight and the session log.
 #[allow(dead_code)] // the first user is the report of what a session ran with
 pub(crate) fn found_in() -> Option<&'static Path> {
@@ -164,7 +182,6 @@ thread_local! {
 /// Compiles `source`, whose entry point is `entry`, for the shader model `profile` (as
 /// `vs_6_6`). `arguments` are passed to the compiler after those. Returns the compiled
 /// program, or what the compiler said was wrong.
-#[allow(dead_code)] // the first user is the translation of a program, once it writes HLSL
 pub(crate) fn compile(
     source: &str,
     entry: &str,

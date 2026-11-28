@@ -6,6 +6,7 @@
 //! (decision D6). See README.md in this folder.
 
 mod bindless;
+mod cache;
 mod census;
 mod compile;
 mod descriptor;

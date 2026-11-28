@@ -70,9 +70,41 @@ fn translate(code: &[u8], stage: Stage) -> Result<(u32, Translated), String> {
     Ok((parameter, Translated { shader, parameters }))
 }
 
-/// The compiled host shader for the program in `code` that runs as `stage`.
+/// The compiled host shader for the program in `code` that runs as `stage`: from the
+/// cache if this program was compiled before by this translator and compiler, and
+/// otherwise translated, compiled and kept.
 fn emit(code: &[u8], stage: HardwareStage) -> Result<Vec<u8>, String> {
-    let _ = code;
+    let key = crate::cache::key(&[
+        code,
+        stage.short_name().as_bytes(),
+        TRANSLATION.as_bytes(),
+        crate::compile::identity().as_bytes(),
+    ]);
+    if let Some(shader) = key.as_deref().and_then(crate::cache::get) {
+        return Ok(shader);
+    }
+    let (source, profile) = source(code, stage)?;
+    let shader = crate::compile::compile(&source, "main", profile, &[]).map_err(|said| {
+        format!(
+            "the translation of {} program {:016x} does not compile: {said}",
+            stage.short_name(),
+            crate::census::hash(code)
+        )
+    })?;
+    if let Some(key) = &key {
+        crate::cache::put(key, &shader);
+    }
+    Ok(shader)
+}
+
+/// What marks a compiled shader as made by this way of translating. It is part of a kept
+/// shader's name, so it changes whenever a translation of the same program would come out
+/// different: bump it with any change to what `source` or `riptide-shader` writes.
+const TRANSLATION: &str = "0";
+
+/// The host shader's source for the program in `code` that runs as `stage`, and the
+/// shader model to compile it for.
+fn source(code: &[u8], stage: HardwareStage) -> Result<(String, &'static str), String> {
     Err(format!(
         "the translator does not write host shaders yet ({} program {:016x})",
         stage.short_name(),
