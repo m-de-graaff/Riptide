@@ -202,6 +202,7 @@ pub(crate) fn device() -> &'static Device {
             (12, crate::list::create_list as *const () as usize),
             (14, crate::descriptor::create as *const () as usize),
             (15, crate::descriptor::increment_size as *const () as usize),
+            (16, crate::root::create as *const () as usize),
             (17, crate::view::create_constants as *const () as usize),
             (
                 18,
@@ -218,8 +219,10 @@ pub(crate) fn device() -> &'static Device {
             (24, crate::view::copy_simple as *const () as usize),
             (36, crate::fence::create as *const () as usize),
             (39, crate::query::create as *const () as usize),
+            (41, crate::signature::create as *const () as usize),
             (73, crate::list::create_list_x as *const () as usize),
             (48, crate::queue::create_x as *const () as usize),
+            (61, crate::view::create_sampler_x as *const () as usize),
             (
                 70,
                 crate::view::create_placed_shader_resource as *const () as usize,
@@ -228,7 +231,10 @@ pub(crate) fn device() -> &'static Device {
                 71,
                 crate::view::create_placed_unordered_access as *const () as usize,
             ),
+            (74, crate::pagepool::register as *const () as usize),
+            (75, crate::pagepool::unregister as *const () as usize),
             (78, crate::frame::set_interval as *const () as usize),
+            (86, crate::pipeline::create as *const () as usize),
             (
                 133,
                 crate::resource::create_at_address as *const () as usize,

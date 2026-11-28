@@ -13,9 +13,13 @@ mod frame;
 mod host;
 mod list;
 mod object;
+mod pagepool;
+mod pipeline;
 mod query;
 mod queue;
 mod resource;
+mod root;
+mod signature;
 mod view;
 
 use std::sync::{Arc, OnceLock};
@@ -24,6 +28,7 @@ use riptide_mem::TitleMemory;
 
 pub use device::create as create_device;
 pub use object::Hresult;
+pub use root::serialize_versioned_root_signature;
 
 /// What this crate needs from the rest of the runtime. Given once, with [`init`], before a
 /// title can call anything here.

@@ -52,4 +52,10 @@ Import resolution, 1 ms timers and the core map are built. Whether the one-core 
 
 Built since, against the real title: console memory calls on `riptide-mem`, the package drive, DirectStorage's file path (no BCPack, issue #33), and the parts of the runtime services (`xgameruntime.dll`) the title calls on its way to the graphics device: task queues, networking (offline), users (change events only), packages (fully installed), persistent local storage (`%LOCALAPPDATA%\Riptide	itles\<package identity>\local-storage`) and display (no HDR). Every method of those areas that is not built names itself and stops the title when called.
 
-With this the real title runs its start-up, opens its archives and calls `D3D12XboxCreateDevice`, which is not built: the graphics device is the next piece.
+With this the real title runs its start-up, opens its archives and calls `D3D12XboxCreateDevice`, which `riptide-gpu` answers. This crate binds the graphics module's two functions to it and gives it the title's memory and allocator.
+
+Also built for the title's graphics set-up:
+
+- `kernel32.dll!VirtualFree` on title memory. A title frees what `XMemVirtualAlloc` gave it with this, and cuts a reservation into parts with it, so those calls go to `riptide-mem`. Any other address goes to Windows.
+- `XMemAllocDefault` hands out title memory, below 2^40, for the kinds of memory the GPU uses. The title's own allocator asks it for the memory of committed graphics resources.
+- `XboxBvhBuilder.dll`, the module a title builds ray-tracing structures with, as a stand-in: a builder can be made, dropped and given its options, and builds nothing. Its other methods name themselves when called. The real module ships in the title's package and needs its shader programs translated before it can be loaded.

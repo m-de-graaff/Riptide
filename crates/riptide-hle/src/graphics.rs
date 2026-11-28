@@ -24,5 +24,11 @@ pub(crate) fn register(imports: &mut Imports) {
             Symbol::Name("D3D12XboxCreateDevice".to_owned()),
             riptide_gpu::create_device as *const () as usize,
         );
+        // SAFETY: the function has the signature of the console's function of that name.
+        imports.implement(
+            "d3d12_xs.dll",
+            Symbol::Name("D3D12SerializeVersionedRootSignature".to_owned()),
+            riptide_gpu::serialize_versioned_root_signature as *const () as usize,
+        );
     }
 }

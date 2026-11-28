@@ -20,6 +20,8 @@ The design is [`docs/design/2026-11-27-title-memory.md`](../../docs/design/2026-
 - `map_frames(address, frames, access)` maps them one after another, in place of what was there. A frame can be mapped at several addresses at once; a write through one shows at the others.
 - `free_frames(frames)` takes them back. One that is still mapped stays readable there and goes back when its last mapping does.
 
+**Parts.** A title may cut a reservation into parts and then fill, empty and give back each by itself. `cut(address, bytes)` makes a range a part of its own, `uncut` joins the parts in a range again, `part(address)` gives the size of the part that starts at an address, and `release(address)` gives back a whole reservation or one part, leaving the rest as reservations of their own. Memory mapped across a cut lies on both sides of it. `holds(address)` says whether an address is in a reservation at all.
+
 **The page table.** `locate(address, bytes)` says where in the banks a range of title addresses lies: a list of parts, each a bank, an offset in it and a length. One part means the GPU can use the range where it is; several mean it has to be copied. `None` means some of it is not mapped.
 
 **The GPU.** `open_heap(bank, device, flags)` opens a bank as a D3D12 heap, from its address, with one buffer over all of it. Offset `n` of the buffer is byte `n` of the bank. The GPU reads and writes every byte of the bank, mapped or not: page protection applies to the CPU only. Every heap must be dropped before the `TitleMemory` it lies on.

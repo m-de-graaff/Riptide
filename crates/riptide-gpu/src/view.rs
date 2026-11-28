@@ -603,6 +603,101 @@ pub(crate) unsafe extern "system" fn create_sampler(
     unsafe { put(handle, record) };
 }
 
+/// The console's own sampler description, which names the GPU's sampler fields: 27 words.
+/// Word 1 is the magnification filter and word 2 the minification filter (0 point, 1
+/// linear, 2 and 3 the same with anisotropy), word 3 the filter between levels (0 none, 1
+/// point, 2 linear), word 5 the way samples are combined (0 plain, 1 minimum, 2 maximum),
+/// words 6 to 8 the address modes, words 9 to 11 the least and greatest level and the level
+/// bias, word 13 the anisotropy, word 16 the comparison and words 17 to 20 the border
+/// colour. The others tune the hardware and have nothing to map to.
+pub(crate) type ConsoleSampler = [u32; 27];
+
+/// The PC description of a console sampler.
+pub(crate) fn from_console(words: &ConsoleSampler) -> Sampler {
+    const ADDRESS_CLAMP: u32 = 3;
+    const COMPARE_NEVER: u32 = 1;
+    let linear = |filter: u32| u32::from(filter == 1 || filter == 3);
+    let (magnify, minify, between, combine) = (words[1], words[2], words[3], words[5]);
+    let anisotropic = magnify >= 2 || minify >= 2;
+    // The console compares when the shader's instruction says so. The host compares only
+    // with a comparison sampler, so a sampler with a real test (less to greater-or-equal)
+    // is made one.
+    let compares = (2..=7).contains(&words[16]);
+    let reduction = match combine {
+        1 => 2,
+        2 => 3,
+        _ => u32::from(compares),
+    };
+    let filter = if anisotropic {
+        0x55
+    } else {
+        (linear(minify) << 4) | (linear(magnify) << 2) | u32::from(between == 2)
+    };
+    let finite = |word: u32, or: f32| {
+        let value = f32::from_bits(word);
+        if value.is_nan() {
+            or
+        } else {
+            value.clamp(f32::MIN, f32::MAX)
+        }
+    };
+    let address = |word: u32| {
+        if (1..=5).contains(&word) {
+            word
+        } else {
+            ADDRESS_CLAMP
+        }
+    };
+    let least = finite(words[9], 0.0);
+    // With no filter between levels the console samples the least level only.
+    let greatest = if between == 0 {
+        least
+    } else {
+        finite(words[10], least).max(least)
+    };
+    [
+        (reduction << 7) | filter,
+        address(words[6]),
+        address(words[7]),
+        address(words[8]),
+        finite(words[11], 0.0).clamp(-16.0, 15.99).to_bits(),
+        if anisotropic {
+            words[13].clamp(1, 16)
+        } else {
+            1
+        },
+        if reduction == 1 {
+            words[16]
+        } else {
+            COMPARE_NEVER
+        },
+        words[17],
+        words[18],
+        words[19],
+        words[20],
+        least.to_bits(),
+        greatest.to_bits(),
+    ]
+}
+
+/// `ID3D12Device::CreateSamplerX`: `(console description, descriptor)`.
+///
+/// # Safety
+/// `description` is null or valid; `handle` is zero or a sampler descriptor's address.
+pub(crate) unsafe extern "system" fn create_sampler_x(
+    device: &Device,
+    description: *const ConsoleSampler,
+    handle: u64,
+) {
+    // SAFETY: the title's description; without one nothing is made.
+    let Some(description) = (unsafe { description.as_ref() }) else {
+        return;
+    };
+    let sampler = from_console(description);
+    // SAFETY: a valid description and the title's descriptor.
+    unsafe { create_sampler(device, &sampler, handle) };
+}
+
 /// `ID3D12Device::CopyDescriptorsSimple`: `(count, to, from, heap type)`. Records are
 /// whole in their bytes, so a copy of the bytes is a copy of the views.
 ///
@@ -842,6 +937,55 @@ mod tests {
 
             copy_simple(device(), 1, at + 48, at + 16, 1);
             assert_eq!(record(at + 48), record(at + 16));
+        }
+    }
+
+    #[test]
+    fn a_console_sampler_becomes_the_pc_sampler_that_samples_the_same() {
+        let mut words = [0u32; 27];
+        // Linear magnification, point minification, linear between levels, clamped.
+        (words[1], words[2], words[3]) = (1, 0, 2);
+        words[6..9].copy_from_slice(&[3, 3, 3]);
+        words[10] = 1000.0f32.to_bits();
+        let sampler = from_console(&words);
+        assert_eq!(sampler[0], 0x5);
+        assert_eq!(sampler[1..4], [3, 3, 3]);
+        assert_eq!(f32::from_bits(sampler[12]), 1000.0);
+        assert_eq!((sampler[5], sampler[6]), (1, 1));
+
+        // A less-or-equal test makes a comparison sampler; "never" does not.
+        words[16] = 4;
+        assert_eq!(
+            (from_console(&words)[0], from_console(&words)[6]),
+            (0x85, 4)
+        );
+        words[16] = 1;
+        assert_eq!(from_console(&words)[0], 0x5);
+
+        // Anisotropy on either filter is anisotropy on all, at most 16.
+        (words[2], words[13]) = (3, 64);
+        assert_eq!(
+            (from_console(&words)[0], from_console(&words)[5]),
+            (0x55, 16)
+        );
+
+        // No filter between levels: the least level only. Unknown address modes clamp.
+        let mut flat = [0u32; 27];
+        (flat[9], flat[10], flat[6]) = (3.0f32.to_bits(), 8.0f32.to_bits(), 9);
+        let sampler = from_console(&flat);
+        assert_eq!(
+            (f32::from_bits(sampler[11]), f32::from_bits(sampler[12])),
+            (3.0, 3.0)
+        );
+        assert_eq!(sampler[1], 3);
+
+        let mut slots = [0u64; 2];
+        let at = room(&mut slots);
+        // SAFETY: a valid description, and room for the record.
+        unsafe {
+            create_sampler_x(device(), &flat, at);
+            let record = (at as *const SamplerRecord).read();
+            assert_eq!(super::sampler(record.index), Some(sampler));
         }
     }
 
