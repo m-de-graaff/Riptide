@@ -186,7 +186,13 @@ pub(crate) fn encode(view: &View) -> [u32; 8] {
             described[0] = readable(described[0], u32::from(view.plane));
         }
         match crate::bindless::view((view.resource as usize, unordered, described), texture) {
-            Some(place) => words[5] = place,
+            Some(place) => {
+                words[5] = place;
+                // What a shader reads through the view is what the title's memory holds.
+                if let Some(resource) = resource {
+                    crate::upload::watch(resource);
+                }
+            }
             None => trace!("a texture view has no place in the shaders' heap: {view:x?}"),
         }
     }

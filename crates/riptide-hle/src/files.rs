@@ -280,9 +280,51 @@ unsafe extern "C" fn wfopen(name: *const u16, mode: *const u16) -> *mut c_void {
     open("_wfopen", &path, &mode)
 }
 
+/// The title's `ReadFile`.
+///
+/// A read into title memory is a write there that page protection cannot hear: Windows
+/// writes from inside a system call, which fails on a protected page instead of faulting.
+/// The graphics runtime protects the pages of textures to learn when they are written, so
+/// it is told before the read. A read that Windows would finish later (an overlapped one)
+/// is waited for here before this returns, still saying that it is pending as Windows
+/// did: otherwise a page protected in the meantime would make the read fail when it
+/// lands. The title sees the read finish as it would have, only sooner.
+///
+/// # Safety
+/// The arguments are the title's own, as `ReadFile` takes them.
+unsafe extern "system" fn read_file(
+    file: *mut c_void,
+    buffer: *mut c_void,
+    bytes: u32,
+    read: *mut u32,
+    overlapped: *mut c_void,
+) -> i32 {
+    /// `ERROR_IO_PENDING`.
+    const PENDING: u32 = 997;
+    let memory = crate::xmem::memory();
+    let ours = memory.holds(buffer as u64);
+    if ours {
+        memory.will_write(buffer as u64, u64::from(bytes));
+    }
+    // SAFETY: the title's own arguments, passed on.
+    let result = unsafe { sys::ReadFile(file, buffer, bytes, read, overlapped) };
+    // SAFETY: reading the calling thread's last error.
+    if ours && result == 0 && !overlapped.is_null() && unsafe { sys::GetLastError() } == PENDING {
+        let mut transferred = 0u32;
+        // SAFETY: the same file and overlapped structure, waited for; then the error the
+        // title expects is put back.
+        unsafe {
+            sys::GetOverlappedResult(file, overlapped, &mut transferred, 1);
+            sys::SetLastError(PENDING);
+        }
+    }
+    result
+}
+
 pub(crate) fn register(imports: &mut Imports) {
     const STDIO: &str = "api-ms-win-crt-stdio-l1-1-0.dll";
-    let functions: [(&str, &str, usize); 6] = [
+    let functions: [(&str, &str, usize); 7] = [
+        ("kernel32.dll", "ReadFile", read_file as *const () as usize),
         (
             "kernel32.dll",
             "CreateFileW",

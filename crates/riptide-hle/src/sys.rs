@@ -65,6 +65,19 @@ unsafe extern "system" {
         flags: u32,
         template: *mut c_void,
     ) -> *mut c_void;
+    pub fn ReadFile(
+        file: *mut c_void,
+        buffer: *mut c_void,
+        bytes: u32,
+        read: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    pub fn GetOverlappedResult(
+        file: *mut c_void,
+        overlapped: *mut c_void,
+        transferred: *mut u32,
+        wait: i32,
+    ) -> i32;
     pub fn GetFileAttributesW(name: *const u16) -> u32;
     pub fn GetFileAttributesExW(name: *const u16, level: u32, out: *mut c_void) -> i32;
     pub fn FindFirstFileW(name: *const u16, out: *mut c_void) -> *mut c_void;

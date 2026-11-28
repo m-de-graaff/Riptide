@@ -199,6 +199,26 @@ fn level_count(description: &Description) -> u32 {
 /// The console also keeps compression data beside render targets and depth buffers, which
 /// is not laid out, so those come out a little smaller than on the console.
 fn console_layout(description: &Description) -> Option<AllocationInfo> {
+    let d = description;
+    let texture = console_texture(d)?;
+    // The layout's own alignment unless the title asks for more: 4 KiB for the 4 KiB
+    // modes, where PC would say 64 KiB.
+    let alignment = d.alignment.max(texture.alignment());
+    if !alignment.is_power_of_two() {
+        return None;
+    }
+    Some(AllocationInfo {
+        bytes: texture.bytes().checked_next_multiple_of(alignment)?,
+        alignment,
+    })
+}
+
+/// How the console lays out the texture `description` describes, in the mode its layout
+/// field names or the one the console's library would choose. `None` for a buffer and for
+/// a texture `riptide-formats` cannot lay out.
+pub(crate) fn console_texture(
+    description: &Description,
+) -> Option<riptide_formats::texture::Texture> {
     use riptide_formats::texture::{Mode, Shape, Texture, TextureDesc, Usage, suggested_mode};
     let d = description;
     let shape = match d.dimension {
@@ -221,7 +241,7 @@ fn console_layout(description: &Description) -> Option<AllocationInfo> {
         };
         suggested_mode(shape, usage)
     };
-    let texture = Texture::new(&TextureDesc {
+    Texture::new(&TextureDesc {
         shape,
         width: u32::try_from(d.width).ok()?,
         height: d.height,
@@ -231,17 +251,7 @@ fn console_layout(description: &Description) -> Option<AllocationInfo> {
         samples: d.sample_count,
         mode,
     })
-    .ok()?;
-    // The layout's own alignment unless the title asks for more: 4 KiB for the 4 KiB
-    // modes, where PC would say 64 KiB.
-    let alignment = d.alignment.max(texture.alignment());
-    if !alignment.is_power_of_two() {
-        return None;
-    }
-    Some(AllocationInfo {
-        bytes: texture.bytes().checked_next_multiple_of(alignment)?,
-        alignment,
-    })
+    .ok()
 }
 
 /// The memory a resource takes: a buffer its width in whole 64 KiB, and a texture what the
@@ -457,9 +467,10 @@ enum Owned {
 
 impl Drop for Resource {
     fn drop(&mut self) {
-        // Its views in the shaders' heap go with it.
+        // Its views in the shaders' heap go with it, and it is no longer kept filled.
         if self.host.get().is_some_and(Option::is_some) {
             crate::bindless::forget(std::ptr::from_ref(self) as usize);
+            crate::upload::forget(std::ptr::from_ref(self) as usize);
         }
         let Some(services) = crate::services() else {
             return;

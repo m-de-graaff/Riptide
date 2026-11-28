@@ -180,6 +180,17 @@ impl Ordered {
                 // What the lists read of title memory is what is mapped now.
                 crate::pagetable::sync();
                 crate::bindless::sync();
+                // And what they read of its textures is what their memory holds now.
+                let done = self
+                    .ran
+                    .as_ref()
+                    // SAFETY: a plain call on the queue's own fence.
+                    .map_or(u64::MAX, |(fence, _)| unsafe { fence.GetCompletedValue() });
+                crate::upload::flush(
+                    &self.host,
+                    self.submissions.load(Ordering::Acquire) + 1,
+                    done,
+                );
                 let host: Vec<Option<ID3D12CommandList>> = pieces
                     .iter()
                     .filter_map(|piece| piece.host.cast::<ID3D12CommandList>().ok())
