@@ -10,8 +10,11 @@
 //!
 //! An uncompressed read to an address goes from the file straight into the title's memory.
 //!
-//! Not built: BCPack decoding (a request that asks for it is answered with black blocks,
-//! and the session log says so), and the staging buffer's limit on how much is in flight.
+//! BCPack data is unpacked by `riptide-formats`, after inflating if the request asks for
+//! both. The format's constants are read from a file the user supplies ([`tables`]);
+//! without it such a request is answered with black blocks, and the session log says so.
+//!
+//! Not built: the staging buffer's limit on how much is in flight.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{c_char, c_void};
@@ -69,7 +72,8 @@ pub struct Request {
     source: *const c_void,
     offset: u64,
     source_size: u32,
-    /// The size between two decompression stages. Not used.
+    /// The size of what the first of two stages gives the second: of the BCPack stream a
+    /// zlib stream inflates to.
     intermediate_size: u32,
     /// Matched by cancellation.
     tag: u64,
@@ -117,6 +121,8 @@ struct Read {
     destination: usize,
     page_offset: usize,
     destination_size: usize,
+    /// How large what is inflated is, when it is unpacked after.
+    intermediate_size: usize,
 }
 
 enum Command {
@@ -249,6 +255,7 @@ impl Read {
             source,
             offset: request.offset,
             source_size: request.source_size as usize,
+            intermediate_size: request.intermediate_size as usize,
             destination: request.destination as usize,
             page_offset: (request.page_offset & 0xFFFF) as usize,
             destination_size: request.destination_size as usize,
@@ -309,10 +316,15 @@ impl Read {
 
         let mut source = vec![0u8; self.source_size];
         self.read_source(&mut source)?;
-        let result = if packed != 0 {
-            unpack(packed, &source, self.destination_size)
-        } else if inflate {
-            let mut out = vec![0u8; self.destination_size];
+        // Inflating comes first, and unpacking after: an inflated BCPack stream is as
+        // large as the request says the stage between is.
+        let stream = if inflate {
+            let room = if packed != 0 {
+                self.intermediate_size
+            } else {
+                self.destination_size
+            };
+            let mut out = vec![0u8; room];
             let written = miniz_oxide::inflate::decompress_slice_iter_to_slice(
                 &mut out,
                 std::iter::once(source.as_slice()),
@@ -324,6 +336,11 @@ impl Read {
             out
         } else {
             source
+        };
+        let result = if packed != 0 {
+            unpack(packed, &stream, self.destination_size)?
+        } else {
+            stream
         };
         if result.len() > self.destination_size {
             return Err(E_INVALIDARG);
@@ -362,15 +379,56 @@ impl Read {
     }
 }
 
+/// The BCPack format's constants, read once from a file the user supplies: the one
+/// `RIPTIDE_BCPACK_TABLES` names, or `bcpack-tables.bin` in `%LOCALAPPDATA%\Riptide`. They
+/// are not Riptide's to ship (see `riptide-formats`). `None` if there is no such file or
+/// it is not the tables, which the session log says.
+fn tables() -> Option<&'static riptide_formats::bcpack::Tables> {
+    static TABLES: OnceLock<Option<riptide_formats::bcpack::Tables>> = OnceLock::new();
+    TABLES
+        .get_or_init(|| {
+            let path = std::env::var_os("RIPTIDE_BCPACK_TABLES")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    Some(
+                        std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
+                            .join("Riptide")
+                            .join("bcpack-tables.bin"),
+                    )
+                })?;
+            let read = std::fs::read(&path)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| {
+                    riptide_formats::bcpack::Tables::parse(&bytes).map_err(|error| error.to_string())
+                });
+            match read {
+                Ok(tables) => {
+                    trace!("DirectStorage: BCPack tables read from {}", path.display());
+                    Some(tables)
+                }
+                Err(why) => {
+                    trace!(
+                        "DirectStorage: no BCPack tables ({}: {why}); BCPack data will be                          answered with black blocks",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 /// The blocks a BCPack stream of block-compression format `format` holds, `bytes` of them.
 ///
-/// The decoder is not built yet (issue #33): the blocks come out all zero, which every
-/// block-compressed format reads as black, and the session log says so. `RIPTIDE_BCPACK_DUMP`
-/// names a folder each stream is written to as `<number>.bc<format>.<bytes>.bin`, for work
-/// on the decoder; what is written is the title's data and stays on this machine.
-fn unpack(format: u8, packed: &[u8], bytes: usize) -> Vec<u8> {
+/// Without the format's tables (see [`tables`]) the blocks come out all zero, which every
+/// block-compressed format reads as black. A stream that does not decode fails the
+/// request. `RIPTIDE_BCPACK_DUMP` names a folder each stream is written to as
+/// `<number>.bc<format>.<bytes>.bin`, for work on the decoder; what is written is the
+/// title's data and stays on this machine.
+fn unpack(format: u8, packed: &[u8], bytes: usize) -> Result<Vec<u8>, i32> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ASKED: AtomicU64 = AtomicU64::new(0);
+    static FAILED: AtomicU64 = AtomicU64::new(0);
     if format > 7 {
         // There are seven block-compression formats; what an eighth would hold is not
         // known, and black blocks of the wrong size would not stand in for it.
@@ -380,12 +438,6 @@ fn unpack(format: u8, packed: &[u8], bytes: usize) -> Vec<u8> {
         ));
     }
     let asked = ASKED.fetch_add(1, Ordering::Relaxed) + 1;
-    if asked == 1 || (asked.is_power_of_two() && asked >= 1024) {
-        trace!(
-            "DirectStorage: BCPack data is not decoded yet; {asked} requests so far are answered              with black blocks (the last: format {format}, {} bytes for {bytes})",
-            packed.len()
-        );
-    }
     if let Some(folder) = std::env::var_os("RIPTIDE_BCPACK_DUMP") {
         /// How many streams are written: enough to work with, and not a title's whole
         /// texture set.
@@ -395,7 +447,27 @@ fn unpack(format: u8, packed: &[u8], bytes: usize) -> Vec<u8> {
             let _ = std::fs::write(std::path::Path::new(&folder).join(name), packed);
         }
     }
-    vec![0u8; bytes]
+    let mut blocks = vec![0u8; bytes];
+    let Some(tables) = tables() else {
+        return Ok(blocks);
+    };
+    // A title may ask for the beginning of a stream only; whole blocks are decoded, and
+    // what is left of the room after the last whole block stays zero.
+    let block = if matches!(format, 1 | 4) { 8 } else { 16 };
+    let whole = bytes - bytes % block;
+    match riptide_formats::bcpack::decode(format, packed, &mut blocks[..whole], tables) {
+        Ok(()) => Ok(blocks),
+        Err(error) => {
+            let failed = FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+            if failed <= 8 || failed.is_power_of_two() {
+                trace!(
+                    "DirectStorage: BCPack data of format {format} ({} bytes for {bytes}) does                      not decode ({failed} so far): {error}",
+                    packed.len()
+                );
+            }
+            Err(INVALID_DATA)
+        }
+    }
 }
 
 fn file_table() -> &'static [usize] {
