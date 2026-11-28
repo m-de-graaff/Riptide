@@ -5,10 +5,14 @@
 //! a network.
 //!
 //! Built so far: a store context, the game's licence, a licence for one of the title's own
-//! packages, the add-on licences (none), a licence for a durable add-on (which is not
-//! owned: Riptide cannot know what the player bought, and says nothing was), and callbacks
-//! for a licence changing or being lost, which are registered and never called since
-//! neither happens. Products, purchases,
+//! packages, the add-on licences (none), a licence for a durable add-on, and callbacks for
+//! a licence changing or being lost, which are registered and never called since neither
+//! happens.
+//!
+//! A durable add-on a title asks a licence for is licensed. A title asks for the parts of
+//! itself that the store delivers apart (the real title asks for two as it opens two of
+//! its content packs): what the player has of them is in the title's folder, and a
+//! licence for content that is not there opens nothing. Products, purchases,
 //! updates and the store's own screens name themselves when called.
 
 use std::ffi::c_void;
@@ -32,12 +36,10 @@ pub(crate) const NAME: &str = "store";
 const S_OK: i32 = 0;
 const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
 
-/// What a store context's handle points at, what a licence's does, and what the handle of
-/// a licence the player does not hold does. Only the addresses matter: there is one store,
-/// and a licence is held or it is not.
+/// What a store context's handle points at, and what a licence's does. Only the addresses
+/// matter: there is one store and every licence is the same.
 static CONTEXT: u8 = 0;
 static LICENSE: u8 = 1;
-static NO_LICENSE: u8 = 2;
 
 fn context() -> usize {
     &raw const CONTEXT as usize
@@ -45,10 +47,6 @@ fn context() -> usize {
 
 fn license() -> usize {
     &raw const LICENSE as usize
-}
-
-fn no_license() -> usize {
-    &raw const NO_LICENSE as usize
 }
 
 /// The game's licence, in the layout the title reads.
@@ -210,14 +208,13 @@ unsafe extern "system" fn package_license_result(
     }
 }
 
-/// +0xb0 `XStoreIsLicenseValid`: `(licence)`. The licence of the game and its packages is;
-/// the one handed out for what is not owned is not.
+/// +0xb0 `XStoreIsLicenseValid`: `(licence)`. The one licence there is, is.
 extern "system" fn is_license_valid(_this: usize, asked: usize) -> bool {
     asked == license()
 }
 
-/// +0x238 `XStoreAcquireLicenseForDurablesAsync`: `(context, store id, block)`. The
-/// add-on is not owned: the title gets a licence that is not valid.
+/// +0x238 `XStoreAcquireLicenseForDurablesAsync`: `(context, store id, block)`. Licensed
+/// (see the module's notes for why).
 ///
 /// # Safety
 /// `id` is null or terminated text, and `block` is null or a block that stays valid until
@@ -236,8 +233,8 @@ unsafe extern "system" fn acquire_license_for_durables(
             .to_string_lossy()
             .into_owned()
     };
-    trace!("XStoreAcquireLicenseForDurablesAsync({id}): not owned");
-    let bytes = no_license().to_ne_bytes().to_vec();
+    trace!("XStoreAcquireLicenseForDurablesAsync({id}): licensed");
+    let bytes = license().to_ne_bytes().to_vec();
     // SAFETY: the title's block.
     unsafe { xasync::finish(block, durables_identity(), Ok(bytes)) }
 }
@@ -397,8 +394,8 @@ mod tests {
             assert_eq!(create_context(0, 0, std::ptr::null_mut()), E_INVALIDARG);
         }
         assert!(is_license_valid(0, license()));
-        // What is handed out for an add-on that is not owned is no valid licence.
-        assert!(!is_license_valid(0, no_license()));
+        // A handle that is no licence of this store's is not valid.
+        assert!(!is_license_valid(0, context()));
     }
 
     #[test]

@@ -166,7 +166,7 @@ unsafe extern "system" fn create_file_w(
             share,
             security,
             disposition,
-            flags,
+            host_flags(flags),
             template,
         )
     };
@@ -180,6 +180,21 @@ unsafe extern "system" fn create_file_w(
          {result}"
     );
     handle
+}
+
+/// `FILE_FLAG_NO_BUFFERING`: reads that go past Windows' file cache.
+const NO_BUFFERING: u32 = 0x2000_0000;
+
+/// The flags a title's file is opened with on this machine: the title's, without
+/// [`NO_BUFFERING`].
+///
+/// A title opens its packages unbuffered and then reads them at whatever offsets its own
+/// tables give. The console lets it; Windows refuses an unbuffered read that does not
+/// start and end on a sector of the disc, and the title is left without what it read
+/// for. Buffered, every read is served. What that costs is Windows' cache holding what
+/// the title also holds, which Windows gives up when memory is short.
+fn host_flags(flags: u32) -> u32 {
+    flags & !NO_BUFFERING
 }
 
 /// The title's `GetFileAttributesW`.
@@ -357,6 +372,14 @@ pub(crate) fn register(imports: &mut Imports) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_is_opened_buffered_whatever_the_title_asks() {
+        // Unbuffered and overlapped: overlapped stays.
+        assert_eq!(host_flags(0x6000_0000), 0x4000_0000);
+        assert_eq!(host_flags(NO_BUFFERING), 0);
+        assert_eq!(host_flags(0x0800_0080), 0x0800_0080);
+    }
 
     #[test]
     fn the_scratch_drive_leads_into_its_folder() {
