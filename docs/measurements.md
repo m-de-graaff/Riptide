@@ -85,3 +85,25 @@ Driver 32.0.32029.2010, Windows 11 build 26200. `cargo test -p riptide-mem --tes
 | 4 | 4 | 24,990 MiB | 25,004 MiB | +14 MiB |
 
 A leak of the kind measured for file-mapping heaps would have been 8 GiB. One run of the real title on the same memory (about 4.7 GiB committed by the title in banks, none opened as a heap yet) moved the figure by under 100 MiB, inside what other programs move it by.
+
+### 2026-11-28 · the real title's shader programs, and its first two minutes · commit 41f71e8
+
+Driver 32.0.32029.2010, Windows 11 build 26200. `riptide run` on the real title, debug build, in a 1280 by 720 window, stopped after a fixed time. Figures are read from the session log. One run each; they move a little from run to run with which thread gets where first.
+
+Shader programs. Every distinct program the title made a pipeline with in the first minute was read and decoded by `riptide-shader`.
+
+| Programs | Could not be read | Compute, pixel, vertex | Code words | Instructions | Not decoded | With a branch out of the code | Distinct instructions |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1,000 | 0 | 268, 505, 227 | 822,160 | 561,519 | 0 | 0 | 339 |
+
+The count is reported at 1, 10, 100 and 1,000 programs; the title had made more than 1,000 by the end of the run, and the next figure is at 10,000. A program is a DXBC container whose `DXIL` part holds 4 bytes where its bitcode would be. The most used instructions were `v_mul_legacy_f32`, `v_fmac_f32`, `s_waitcnt`, `v_mov_b32` and `v_fma_f32`.
+
+Two minutes of running, without the host's own checking.
+
+| Ran for | Stopped by | Frames presented | Draws and dispatches recorded and skipped | Host errors |
+| --- | --- | --- | --- | --- |
+| 120 s | the time limit | more than 2,048 | more than 32,768 | none |
+
+With the host checking every call (`RIPTIDE_GPU_CHECKS=1`), 60 s gave more than 1,024 frames and one message, that a render target was made without a clear value. Before commit 41f71e8 the host device was lost within the first minute: the title submits one recorded list every frame without resetting it, and the second submission ran a host list that had been reused.
+
+Not measured: frame times, and what any of this costs in CPU time. Nothing is drawn yet, so neither would say much.
