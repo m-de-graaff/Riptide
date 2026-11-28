@@ -13,6 +13,7 @@ mod frame;
 mod host;
 mod list;
 mod object;
+mod query;
 mod queue;
 mod resource;
 mod view;
@@ -34,7 +35,17 @@ pub struct Services {
     /// Makes a piece of code that, when called, names itself as unbuilt and stops the
     /// title. Every method that is not built yet gets one of its own.
     pub stub: fn(name: String) -> usize,
+    /// The title's own allocation and free routines, if it has them. The console's graphics
+    /// runtime gets the memory of committed resources from them, and the title counts on
+    /// that: it keeps its own books of what its graphics memory holds.
+    pub allocator: fn() -> Option<(Allocate, Free)>,
 }
+
+/// A title's allocation routine: `(bytes, attributes)`, returning the address or null.
+pub type Allocate = unsafe extern "system" fn(usize, u64) -> *mut std::ffi::c_void;
+/// A title's free routine: `(address, attributes)`, with the attributes it was allocated
+/// with.
+pub type Free = unsafe extern "system" fn(*mut std::ffi::c_void, u64);
 
 static SERVICES: OnceLock<Services> = OnceLock::new();
 

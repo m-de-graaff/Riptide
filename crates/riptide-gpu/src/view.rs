@@ -168,6 +168,7 @@ unsafe fn of(resource: *const Resource) -> Option<(u64, u32, u32)> {
 }
 
 /// A view of the buffer at `base`: `count` elements of `stride` bytes from element `first`.
+#[allow(clippy::too_many_arguments)]
 fn buffer_view(
     kind: u8,
     base: u64,

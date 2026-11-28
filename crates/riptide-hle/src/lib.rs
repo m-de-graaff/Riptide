@@ -4,6 +4,7 @@
 //! the title's sleeps and timed waits, and title threads on their own cores.
 //! See README.md in this folder.
 
+mod bvh;
 mod com;
 pub mod cores;
 mod display;

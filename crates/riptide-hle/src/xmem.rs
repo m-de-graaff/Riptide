@@ -40,6 +40,9 @@ const HOST_PROTECTION: u32 = 0xFF;
 const FLAG_32BIT: u64 = 1 << 2;
 /// `XMemAlloc` attributes: the alignment as a power of two, in five bits from bit 24.
 const ATTRIBUTE_ALIGNMENT_SHIFT: u64 = 24;
+const ATTRIBUTE_MEMORY_TYPE_SHIFT: u64 = 29;
+/// How many graphics allocations of the default allocator have been written to the log.
+static GRAPHICS_SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// `XMemAlloc` attribute: the memory must lie below 4 GiB.
 const ATTRIBUTE_32BIT: u64 = 1 << 33;
 
@@ -270,7 +273,7 @@ type FreeRoutine = unsafe extern "system" fn(*mut c_void, u64);
 /// The title's own allocation and free routines, which it exports as
 /// `__XMemAllocationHooks__` if it has them. `XMemAlloc` and `XMemFree` go to them, for the
 /// title's calls and its middleware's alike.
-fn hooks() -> Option<(AllocRoutine, FreeRoutine)> {
+pub(crate) fn hooks() -> Option<(AllocRoutine, FreeRoutine)> {
     let at = crate::process::title_export("__XMemAllocationHooks__")?;
     // SAFETY: the export is two routine addresses, in the title's mapped image.
     let [alloc, free] = unsafe { (at as *const [usize; 2]).read_unaligned() };
@@ -318,13 +321,41 @@ fn alignment(attributes: u64) -> usize {
     1usize << ((attributes >> ATTRIBUTE_ALIGNMENT_SHIFT) & 0x1F).max(4)
 }
 
+/// The kind of memory `attributes` ask for, from bit 29: zero is the ordinary heap, and
+/// every other kind is whole pages for the GPU or of physical memory.
+fn memory_type(attributes: u64) -> u64 {
+    (attributes >> ATTRIBUTE_MEMORY_TYPE_SHIFT) & 0xF
+}
+
 /// `xmem.dll!XMemAllocDefault`: the system's allocator behind `XMemAlloc`. Memory that must
-/// lie below 4 GiB is title memory of its own; anything else comes from the C runtime's
-/// heap, which is not memory the GPU uses in place.
+/// lie below 4 GiB, and memory of a kind the GPU uses, is title memory of its own; anything
+/// else comes from the C runtime's heap, which is not memory the GPU uses in place.
 ///
 /// # Safety
 /// The arguments are the title's own.
 pub unsafe extern "system" fn alloc_default(size: usize, attributes: u64) -> *mut c_void {
+    if attributes & ATTRIBUTE_32BIT == 0 && memory_type(attributes) != 0 {
+        // Graphics memory: pages of its own, below 2^40 as graphics addresses must be.
+        let alignment = alignment(attributes) as u64;
+        let limits = Limits {
+            lowest: 4 * GIB,
+            highest: (1 << 40) - 1,
+            alignment: if alignment > FRAME { alignment } else { 0 },
+        };
+        let result = memory().commit(None, size.max(1) as u64, limits, Access::ReadWrite);
+        let shown = GRAPHICS_SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if shown < 8 || result.is_err() {
+            trace!(
+                "XMemAllocDefault({size:#x} bytes, attributes {attributes:#x}): graphics \
+                 memory {}",
+                match result {
+                    Ok(address) => format!("at {address:#x}"),
+                    Err(error) => format!("refused: {error}"),
+                }
+            );
+        }
+        return result.unwrap_or(0) as *mut c_void;
+    }
     if attributes & ATTRIBUTE_32BIT != 0 {
         // SAFETY: a new allocation of our choosing.
         return unsafe {
@@ -349,7 +380,7 @@ pub unsafe extern "system" fn free_default(address: *mut c_void, attributes: u64
     if address.is_null() {
         return;
     }
-    if attributes & ATTRIBUTE_32BIT != 0 {
+    if attributes & ATTRIBUTE_32BIT != 0 || memory_type(attributes) != 0 {
         if let Err(error) = memory().release(address as u64) {
             trace!("XMemFreeDefault({address:p}): {error}");
         }
@@ -729,6 +760,16 @@ mod tests {
                 block.cast::<u8>().add(99).write(1);
                 free_default(block, attributes);
             }
+            // Graphics memory is title memory, below 2^40, aligned as asked.
+            let attributes = (1 << ATTRIBUTE_MEMORY_TYPE_SHIFT) | (21 << ATTRIBUTE_ALIGNMENT_SHIFT);
+            let graphics = alloc_default(0x3_0000, attributes);
+            assert!(memory().holds(graphics as u64));
+            assert!((4 * GIB..1 << 40).contains(&(graphics as u64)));
+            assert_eq!(graphics as u64 % (2 * MIB), 0);
+            assert!(memory().locate(graphics as u64, 0x3_0000).is_some());
+            free_default(graphics, attributes);
+            assert!(!memory().holds(graphics as u64));
+
             let low = alloc_default(0x1_0000, ATTRIBUTE_32BIT);
             assert!(!low.is_null() && (low as u64) < 4 * GIB);
             free_default(low, ATTRIBUTE_32BIT);

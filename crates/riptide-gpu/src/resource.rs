@@ -7,7 +7,9 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 
 use crate::device::Device;
-use crate::object::{self, Child, E_INVALIDARG, Hresult, Iid, Object, S_OK, guid};
+use riptide_mem::{Access, Limits};
+
+use crate::object::{self, Child, E_INVALIDARG, E_OUTOFMEMORY, Hresult, Iid, Object, S_OK, guid};
 use crate::trace;
 
 /// `ID3D12Resource`, `ID3D12Resource1` and `ID3D12Resource2`.
@@ -376,6 +378,46 @@ pub(crate) struct Resource {
     heap_flags: u32,
     /// The title address of its first byte.
     address: u64,
+    /// Whose its memory is, and so who gets it back when the resource goes.
+    owned: Owned,
+}
+
+/// Where a resource's memory came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owned {
+    /// The title's: it placed the resource there itself.
+    No,
+    /// Reserved or committed here, for a committed resource of a title without an
+    /// allocator of its own.
+    Here,
+    /// From the title's allocator, with these attributes.
+    Title(u64),
+}
+
+impl Drop for Resource {
+    fn drop(&mut self) {
+        let Some(services) = crate::services() else {
+            return;
+        };
+        match self.owned {
+            Owned::No => {}
+            Owned::Here => {
+                if let Err(error) = services.memory.release(self.address) {
+                    trace!(
+                        "a resource's memory at {:#x} was not given back: {error:?}",
+                        self.address
+                    );
+                }
+            }
+            Owned::Title(attributes) => {
+                if let Some((_, free)) = (services.allocator)() {
+                    // SAFETY: the address came from the title's allocation routine with
+                    // these attributes, and nothing uses it any more.
+                    unsafe { free(self.address as *mut c_void, attributes) };
+                }
+            }
+        }
+    }
 }
 
 // SAFETY: `Resource` is `#[repr(C)]` and starts with its header.
@@ -442,6 +484,7 @@ pub(crate) fn placed(address: u64, description: &Description) -> *const Resource
                 },
                 heap_flags: 0,
                 address,
+                owned: Owned::No,
             })) as usize
         });
     at as *const Resource
@@ -521,6 +564,7 @@ pub(crate) unsafe extern "system" fn create_at_address(
         },
         heap_flags: 0,
         address,
+        owned: Owned::No,
     });
     trace!(
         "resource {:p} made at address {address:#x}, first layout {layout:#x}: {description:?}",
@@ -528,6 +572,179 @@ pub(crate) unsafe extern "system" fn create_at_address(
     );
     // SAFETY: `accepts` checked the out-pointer.
     unsafe { object::hand_out(resource, out) }
+}
+
+/// Whether the CPU reaches the memory of a heap with these properties: upload and
+/// read-back heaps, and custom heaps whose pages are not marked as out of its reach.
+fn cpu_reaches(heap: &HeapProperties) -> bool {
+    match heap.kind {
+        HEAP_UPLOAD | HEAP_READBACK => true,
+        HEAP_CUSTOM => heap.cpu_pages > CPU_PAGES_NOT_AVAILABLE,
+        _ => false,
+    }
+}
+
+/// Whether a committed resource gets memory, or addresses only.
+///
+/// A buffer always gets memory: the GPU uses it where it lies. So does anything in a heap
+/// the CPU reaches. A texture in a heap the CPU does not reach is drawn to and sampled by
+/// the GPU alone, which keeps it in video memory, so nothing ever lies at its address; it
+/// still gets addresses of its own, because its address is how the title and its
+/// descriptors name it.
+fn needs_memory(description: &Description, heap: &HeapProperties) -> bool {
+    description.dimension == DIMENSION_BUFFER || cpu_reaches(heap)
+}
+
+/// The attributes a committed resource's memory is asked of the title's allocator with:
+/// the graphics allocator's number (128) from bit 16, the page size in bits 14 and 15 (2 MiB
+/// pages from 2 MiB up, else 64 KiB), the alignment as a power of two from bit 24, and the
+/// kind of memory from bit 29 (write-combined for heaps the CPU does not reach, cached
+/// for the others).
+///
+/// Which page size and kind of memory the console's own runtime asks for is not known.
+/// These are what such memory is on the console.
+fn attributes(size: &AllocationInfo, heap: &HeapProperties) -> u64 {
+    const GRAPHICS_ALLOCATOR: u64 = 128 << 16;
+    let pages: u64 = if size.bytes >= 2 << 20 { 2 } else { 1 };
+    let memory: u64 = if cpu_reaches(heap) { 3 } else { 1 };
+    let alignment = u64::from(size.alignment.max(1).trailing_zeros());
+    GRAPHICS_ALLOCATOR | (pages << 14) | (alignment << 24) | (memory << 29)
+}
+
+/// Where a committed resource's memory may lie: above 4 GiB and below 2^40, as the title's
+/// other graphics memory does.
+fn limits(alignment: u64) -> Limits {
+    Limits {
+        lowest: 4 << 30,
+        highest: (1 << 40) - 1,
+        alignment: if alignment > KIB_64 { alignment } else { 0 },
+    }
+}
+
+/// `ID3D12Device::CreateCommittedResource`: `(heap properties, heap flags, description,
+/// first state, clear value, interface id, resource out)`. The resource gets title memory
+/// of its own.
+///
+/// # Safety
+/// The title's pointers: each null or valid.
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+pub(crate) unsafe extern "system" fn create_committed(
+    _device: *const Device,
+    heap: *const HeapProperties,
+    heap_flags: u32,
+    description: *const Description,
+    state: u32,
+    _clear: *const c_void,
+    iid: *const Iid,
+    out: *mut *const Resource,
+) -> Hresult {
+    // SAFETY: the title's descriptions; null is refused.
+    let (Some(&heap), Some(&description)) = (unsafe { (heap.as_ref(), description.as_ref()) })
+    else {
+        return E_INVALIDARG;
+    };
+    let Some(size) = footprint(&description) else {
+        trace!("a committed resource that cannot be sized was asked for: {description:?}");
+        return E_INVALIDARG;
+    };
+    // SAFETY: the title's id and out-pointer.
+    if let Err(code) = unsafe { object::accepts(iid, out) } {
+        return code;
+    }
+    let Some(services) = crate::services() else {
+        return E_OUTOFMEMORY;
+    };
+    let with_memory = needs_memory(&description, &heap);
+    let (address, owned, from) = if let Some((allocate, _)) = (services.allocator)() {
+        // The title's allocator gives the memory, as on the console, and the title's own
+        // books of its graphics memory see it.
+        let attributes = attributes(&size, &heap);
+        // SAFETY: the title's own routine, called as the console's runtime calls it.
+        let address = unsafe { allocate(size.bytes as usize, attributes) } as u64;
+        if address == 0 {
+            trace!(
+                "the title's allocator gave no memory for a committed resource ({:#x} \
+                 bytes, attributes {attributes:#x}): {description:?}",
+                size.bytes
+            );
+            return E_OUTOFMEMORY;
+        }
+        if with_memory {
+            // A new resource reads as zero. One the GPU alone uses is not touched, so
+            // that its pages take no RAM.
+            // SAFETY: the allocator handed out that many bytes.
+            unsafe { (address as *mut u8).write_bytes(0, size.bytes as usize) };
+        }
+        (address, Owned::Title(attributes), "the title's allocator")
+    } else {
+        let limits = limits(size.alignment);
+        let reserved = if with_memory {
+            services
+                .memory
+                .commit(None, size.bytes, limits, Access::ReadWrite)
+        } else {
+            services.memory.reserve(size.bytes, limits)
+        };
+        match reserved {
+            Ok(address) if with_memory => (address, Owned::Here, "memory committed here"),
+            Ok(address) => (address, Owned::Here, "addresses reserved here"),
+            Err(error) => {
+                trace!("no memory for a committed resource ({description:?}): {error:?}");
+                return E_OUTOFMEMORY;
+            }
+        }
+    };
+    let resource = Box::new(Resource {
+        object: Object::new(table(), 1),
+        description,
+        heap,
+        heap_flags,
+        address,
+        owned,
+    });
+    trace!(
+        "resource {:p} committed at {address:#x}, {:#x} bytes from {from}, heap {heap:?} \
+         flags {heap_flags:#x}, first state {state:#x}: {description:?}",
+        &raw const *resource, size.bytes
+    );
+    // SAFETY: `accepts` checked the out-pointer.
+    unsafe { object::hand_out(resource, out) }
+}
+
+/// `ID3D12Device10::CreateCommittedResource3`: `(heap properties, heap flags, description,
+/// first layout, clear value, protected session, castable format count, castable formats,
+/// interface id, resource out)`. As [`create_committed`], with a layout where that has a
+/// state. The newer description starts like the older one.
+///
+/// # Safety
+/// The title's pointers: each null or valid.
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+pub(crate) unsafe extern "system" fn create_committed3(
+    device: *const Device,
+    heap: *const HeapProperties,
+    heap_flags: u32,
+    description: *const Description,
+    layout: u32,
+    clear: *const c_void,
+    _protected: *const c_void,
+    _castable_count: u32,
+    _castable: *const u32,
+    iid: *const Iid,
+    out: *mut *const Resource,
+) -> Hresult {
+    // SAFETY: as received.
+    unsafe {
+        create_committed(
+            device,
+            heap,
+            heap_flags,
+            description,
+            layout,
+            clear,
+            iid,
+            out,
+        )
+    }
 }
 
 /// `Map`: `(subresource, range read, pointer out)`. The memory is the title's and always
@@ -613,6 +830,74 @@ mod tests {
             sample_quality: 0,
             layout: 0,
             flags: 0,
+        }
+    }
+
+    #[test]
+    fn only_what_the_cpu_or_the_gpu_reads_in_place_gets_memory() {
+        let buffer = Description {
+            dimension: DIMENSION_BUFFER,
+            width: 4096,
+            ..texture(0, 1, 1, 0)
+        };
+        let target = texture(3840, 2160, 1, 28);
+        let default = as_custom(HEAP_DEFAULT, 1);
+        let upload = as_custom(HEAP_UPLOAD, 1);
+        assert!(needs_memory(&buffer, &default));
+        assert!(needs_memory(&target, &upload));
+        assert!(!needs_memory(&target, &default));
+        let plain_default = HeapProperties {
+            kind: HEAP_DEFAULT,
+            ..default
+        };
+        assert!(!needs_memory(&target, &plain_default));
+        assert_eq!(limits(KIB_64).alignment, 0);
+        assert_eq!(limits(MIB_4).alignment, MIB_4);
+
+        // 32 MiB for the GPU alone, aligned to 64 KiB: graphics allocator, 2 MiB pages,
+        // write-combined.
+        let size = footprint(&target).unwrap();
+        assert_eq!(
+            attributes(&size, &default),
+            (128 << 16) | (2 << 14) | (16 << 24) | (1 << 29)
+        );
+        let small = footprint(&buffer).unwrap();
+        assert_eq!(
+            attributes(&small, &upload),
+            (128 << 16) | (1 << 14) | (16 << 24) | (3 << 29)
+        );
+    }
+
+    #[test]
+    fn a_committed_resource_needs_its_descriptions_and_a_size() {
+        let heap = as_custom(HEAP_DEFAULT, 1);
+        let unknown = texture(16, 16, 1, 104);
+        let mut out: *const Resource = std::ptr::null();
+        let (device, clear) = (std::ptr::null(), std::ptr::null());
+        // SAFETY: valid pointers, and the null ones under test.
+        unsafe {
+            assert_eq!(
+                create_committed(device, &heap, 0, &unknown, 0, clear, &IIDS[0], &mut out),
+                E_INVALIDARG
+            );
+            assert_eq!(
+                create_committed(
+                    device,
+                    std::ptr::null(),
+                    0,
+                    &unknown,
+                    0,
+                    clear,
+                    &IIDS[0],
+                    &mut out
+                ),
+                E_INVALIDARG
+            );
+            let target = texture(64, 64, 1, 28);
+            assert_eq!(
+                create_committed(device, &heap, 0, &target, 0, clear, &[9; 16], &mut out),
+                E_NOINTERFACE
+            );
         }
     }
 

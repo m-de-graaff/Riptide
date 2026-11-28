@@ -217,6 +217,7 @@ pub(crate) fn device() -> &'static Device {
             (23, crate::view::copy as *const () as usize),
             (24, crate::view::copy_simple as *const () as usize),
             (36, crate::fence::create as *const () as usize),
+            (39, crate::query::create as *const () as usize),
             (73, crate::list::create_list_x as *const () as usize),
             (48, crate::queue::create_x as *const () as usize),
             (
@@ -239,6 +240,11 @@ pub(crate) fn device() -> &'static Device {
                 crate::resource::custom_heap_properties as *const () as usize,
             ),
             (25, crate::resource::allocation_info as *const () as usize),
+            (27, crate::resource::create_committed as *const () as usize),
+            (
+                127,
+                crate::resource::create_committed3 as *const () as usize,
+            ),
             (108, crate::resource::allocation_info2 as *const () as usize),
         ];
         let mut out_of_line = [0u32; 16];
