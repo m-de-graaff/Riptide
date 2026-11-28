@@ -780,8 +780,10 @@ impl List {
         }
         *gate = Some(wait);
         self.recorded.store(0, Ordering::Relaxed);
-        // The new host list has nothing bound yet.
+        // The new host list has nothing bound yet, and none of what was set before.
         self.drawing.state().on_new_host_list();
+        crate::record::carry_over(self);
+        self.recorded.store(0, Ordering::Relaxed);
         true
     }
 

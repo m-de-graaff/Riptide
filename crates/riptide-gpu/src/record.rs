@@ -41,6 +41,7 @@ unsafe fn items<'a, T>(items: *const T, count: u32) -> &'a [T] {
 unsafe extern "system" fn viewports(this: &List, count: u32, viewports: *const D3D12_VIEWPORT) {
     // SAFETY: the title's viewports.
     let viewports = unsafe { items(viewports, count) };
+    this.drawing().state().carried.viewports = viewports.to_vec();
     if !viewports.is_empty() {
         // SAFETY: a plain call on the host list.
         unsafe { this.host().RSSetViewports(viewports) };
@@ -54,6 +55,7 @@ unsafe extern "system" fn viewports(this: &List, count: u32, viewports: *const D
 unsafe extern "system" fn scissors(this: &List, count: u32, rectangles: *const RECT) {
     // SAFETY: the title's rectangles.
     let rectangles = unsafe { items(rectangles, count) };
+    this.drawing().state().carried.scissors = rectangles.to_vec();
     if !rectangles.is_empty() {
         // SAFETY: a plain call on the host list.
         unsafe { this.host().RSSetScissorRects(rectangles) };
@@ -78,6 +80,7 @@ extern "system" fn topology(this: &List, topology: u32) {
         }
         other => other,
     };
+    this.drawing().state().carried.topology = Some(host);
     // SAFETY: a plain call on the host list.
     unsafe {
         this.host()
@@ -92,12 +95,16 @@ static TOPOLOGY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// # Safety
 /// `factor` is null or four numbers.
 unsafe extern "system" fn blend_factor(this: &List, factor: *const [f32; 4]) {
-    // SAFETY: the title's factors; a plain call on the host list.
-    unsafe { this.host().OMSetBlendFactor(factor.as_ref()) };
+    // SAFETY: the title's factors; null is all ones.
+    let factor = unsafe { factor.as_ref() }.copied().unwrap_or([1.0; 4]);
+    this.drawing().state().carried.blend_factor = Some(factor);
+    // SAFETY: a plain call on the host list.
+    unsafe { this.host().OMSetBlendFactor(Some(&factor)) };
 }
 
 /// `OMSetStencilRef`.
 extern "system" fn stencil_reference(this: &List, reference: u32) {
+    this.drawing().state().carried.stencil = Some(reference);
     // SAFETY: a plain call on the host list.
     unsafe { this.host().OMSetStencilRef(reference) };
 }
@@ -262,18 +269,35 @@ unsafe extern "system" fn set_render_targets(
     depth: *const u64,
 ) {
     let step = u64::from(crate::descriptor::increment(2).unwrap_or(0));
+    let handles: Vec<u64> = (0..count.min(8))
+        .map(|index| {
+            // SAFETY: the title's handles, as the contract says.
+            unsafe {
+                match (targets.is_null(), one_range != 0) {
+                    (true, _) => 0,
+                    (false, true) => targets.read_unaligned() + u64::from(index) * step,
+                    (false, false) => targets.add(index as usize).read_unaligned(),
+                }
+            }
+        })
+        .collect();
+    // SAFETY: the title's handle; null is no depth target.
+    let depth = unsafe { depth.as_ref() }.copied();
+    // SAFETY: the title's descriptors, which name live resources.
+    unsafe { bind_targets(this, &handles, depth) };
+    this.drawing().state().carried.targets = Some((handles, depth));
+}
+
+/// Binds the render targets at the descriptors `handles` and the depth target at `depth`
+/// on the host list.
+///
+/// # Safety
+/// Every descriptor names a live resource.
+unsafe fn bind_targets(this: &List, handles: &[u64], depth: Option<u64>) {
     let mut views = Vec::new();
     // The host textures bound as targets, which a draw leaves as they are.
     let mut bound = Vec::new();
-    for index in 0..count.min(8) {
-        // SAFETY: the title's handles, as the contract says.
-        let handle = unsafe {
-            match (targets.is_null(), one_range != 0) {
-                (true, _) => 0,
-                (false, true) => targets.read_unaligned() + u64::from(index) * step,
-                (false, false) => targets.add(index as usize).read_unaligned(),
-            }
-        };
+    for &handle in handles {
         // SAFETY: the title's descriptor.
         let Some(target) = (unsafe { crate::target::render_target(handle) }) else {
             show_once(&NO_TARGET, || {
@@ -286,8 +310,7 @@ unsafe extern "system" fn set_render_targets(
         bound.push(target.texture.as_raw() as usize);
         views.push(target.view);
     }
-    // SAFETY: the title's handle; null is no depth target.
-    let depth_view = unsafe { depth.as_ref() }.and_then(|&handle| {
+    let depth_view = depth.and_then(|handle| {
         // SAFETY: the title's descriptor.
         let target = unsafe { crate::target::depth_target(handle) }?;
         this.use_texture(&target.texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -304,6 +327,51 @@ unsafe extern "system" fn set_render_targets(
             depth_view.as_ref().map(std::ptr::from_ref),
         )
     };
+}
+
+/// What a list set that the host keeps in the host list, and so loses when the list goes
+/// on in another host list after a GPU wait.
+#[derive(Debug, Default)]
+pub(crate) struct Carried {
+    viewports: Vec<D3D12_VIEWPORT>,
+    scissors: Vec<RECT>,
+    /// The topology as the host was given it.
+    topology: Option<u32>,
+    blend_factor: Option<[f32; 4]>,
+    stencil: Option<u32>,
+    /// The render target descriptors and the depth target descriptor.
+    targets: Option<(Vec<u64>, Option<u64>)>,
+}
+
+/// Gives the host list the list is now recording onto everything that was set before it
+/// started: after a GPU wait cut the list in two, the part after the wait draws with what
+/// the part before it set.
+pub(crate) fn carry_over(this: &List) {
+    let carried = std::mem::take(&mut this.drawing().state().carried);
+    // SAFETY: plain calls on the host list with what the title set before; the target
+    // descriptors named live resources then and the title has not been back since.
+    unsafe {
+        let host = this.host();
+        if !carried.viewports.is_empty() {
+            host.RSSetViewports(&carried.viewports);
+        }
+        if !carried.scissors.is_empty() {
+            host.RSSetScissorRects(&carried.scissors);
+        }
+        if let Some(topology) = carried.topology {
+            host.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(topology as i32));
+        }
+        if let Some(factor) = &carried.blend_factor {
+            host.OMSetBlendFactor(Some(factor));
+        }
+        if let Some(reference) = carried.stencil {
+            host.OMSetStencilRef(reference);
+        }
+        if let Some((handles, depth)) = &carried.targets {
+            bind_targets(this, handles, *depth);
+        }
+    }
+    this.drawing().state().carried = carried;
 }
 
 static NO_TARGET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

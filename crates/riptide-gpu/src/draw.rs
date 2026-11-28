@@ -116,6 +116,8 @@ pub(crate) struct State {
     pub(crate) topology: u32,
     /// The host textures bound as render and depth targets, by their addresses.
     pub(crate) targets: Vec<usize>,
+    /// What was set that has to be set again on another host list (see `record.rs`).
+    pub(crate) carried: crate::record::Carried,
     /// Whether the host list being recorded has been given what every draw with
     /// translated shaders needs: the heaps, the root signature and the page table.
     bound: bool,

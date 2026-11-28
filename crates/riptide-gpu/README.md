@@ -45,7 +45,7 @@ Built, and run under the real title:
 Known to be wrong or missing:
 
 - **Nothing is drawn yet.** Everything a draw needs is in place but the translated shader: `riptide-shader` does not write host shaders yet, so no pipeline has a host pipeline and every draw is counted and not made. Rectangle lists (a console topology the title's first screens use) need a geometry shader that is not written. Indirect draws, mesh draws and the console's own dispatch are not built. A host pipeline is made on the thread that draws, which stops it for as long as the compiler takes.
-- State set on a list before a GPU wait is not carried over to the part of the list after it.
+- Depth bounds and the shading rate set on a list before a GPU wait are not carried over to the part of the list after it; the rest is.
 - Texture conversion runs on the CPU, on the thread that submits. Copies and queries on a list are not built. A vertex or index buffer that does not lie in one stretch of one bank cannot be bound.
 - A GPU timestamp write is given the time of recording, not of running. An unordered access view's counter is not kept. Frame events follow a clock, not the screen. No high dynamic range, one plane only, and the window does not follow the launcher's display settings.
 
