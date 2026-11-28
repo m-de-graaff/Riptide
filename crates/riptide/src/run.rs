@@ -18,6 +18,60 @@ pub const EXIT_SETTINGS: i32 = 3;
 pub const EXIT_BLOCKED: i32 = 4;
 /// The game folder holds no title image, or more than one candidate.
 pub const EXIT_NO_TITLE: i32 = 5;
+/// Modules that ship in a title's own package, beside its executable, and need nothing of
+/// the console but what Riptide already answers: they are loaded as the title is, and the
+/// title's imports from them are bound to their own functions.
+///
+/// Only modules named here are loaded. The others in a package call the console's
+/// graphics or network interfaces, which they would reach parts of that are not built.
+const PACKAGE_MODULES: &[&str] = &["Bink2Scarlett.dll"];
+
+/// Loads the package modules found in `folder`, starts each as a library, and binds the
+/// title's imports from it to its exports. One that cannot be loaded is said in the log
+/// and left out, and the title's imports from it stay stubs.
+fn load_package_modules(
+    folder: &Path,
+    imports: &mut Imports,
+    log: &Log,
+) -> Vec<riptide_pe::LoadedImage> {
+    let mut loaded = Vec::new();
+    for &name in PACKAGE_MODULES {
+        let Ok(bytes) = std::fs::read(folder.join(name)) else {
+            continue;
+        };
+        let image = match riptide_pe::load(name, &bytes, &*imports) {
+            Ok(image) => image,
+            Err(error) => {
+                log.error(format!(
+                    "The package module {name} could not be loaded: {error}."
+                ));
+                continue;
+            }
+        };
+        // SAFETY: the module is part of the title the user asked to run, and its imports
+        // are bound as the title's are.
+        if !unsafe { image.attach_as_library() } {
+            log.error(format!("The package module {name} refused to start."));
+            continue;
+        }
+        let exports = image.exports();
+        for (export, address) in &exports {
+            // SAFETY: the address is the module's own function of that name, which is
+            // what the title imports.
+            unsafe {
+                imports.implement(name, riptide_pe::Symbol::Name(export.clone()), *address);
+            }
+        }
+        log.info(format!(
+            "Package module {name} loaded at {:#x}: {} functions.",
+            image.base(),
+            exports.len()
+        ));
+        loaded.push(image);
+    }
+    loaded
+}
+
 /// The title image could not be loaded.
 pub const EXIT_LOAD: i32 = 6;
 
@@ -220,7 +274,9 @@ fn run_with(args: &RunArgs, gather: impl FnOnce(&Settings, &Path) -> Machine) ->
     );
 
     let stub_log = log.clone();
-    let imports = Imports::with_log(Arc::new(move |line: &str| stub_log.error(line)));
+    let mut imports = Imports::with_log(Arc::new(move |line: &str| stub_log.error(line)));
+    // Kept until the title has ended: the title calls into them.
+    let _package_modules = load_package_modules(&folder, &mut imports, &log);
     let loaded = std::fs::read(&image_path)
         .map_err(|error| format!("{name} cannot be read: {error}."))
         .and_then(|bytes| {

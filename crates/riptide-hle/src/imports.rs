@@ -85,6 +85,8 @@ const HOST_MODULES: &[&str] = &[
     "mfreadwrite.dll",
     // The input library is the same on the console and on Windows.
     "gameinput.dll",
+    // So is the audio library, by the same name.
+    "xaudio2_9.dll",
 ];
 
 /// The table of what every import is bound to. It is the [`Resolver`] `riptide-pe` binds a

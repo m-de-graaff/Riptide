@@ -458,6 +458,35 @@ impl LoadedImage {
     }
 }
 
+impl LoadedImage {
+    /// Starts the image as a library: runs its start-up as Windows does when a library is
+    /// loaded into a process, and returns whether the library accepted. Its exports can be
+    /// called afterwards. Threads made later are not announced to it.
+    ///
+    /// # Safety
+    ///
+    /// As for [`LoadedImage::run`]. The image is a library, whose entry point takes the
+    /// three arguments of a library's.
+    pub unsafe fn attach_as_library(&self) -> bool {
+        type TlsCallback = unsafe extern "system" fn(*mut c_void, u32, *mut c_void);
+        type LibraryEntry = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
+
+        let base = self.mapping.base.as_ptr().cast::<c_void>();
+        for &address in &self.tls_callbacks {
+            // SAFETY: the address was read from the image's callback list and lies in the
+            // image; the caller vouches for the image's code.
+            let callback = unsafe { std::mem::transmute::<usize, TlsCallback>(address) };
+            // SAFETY: called as Windows calls a TLS callback when a library is loaded.
+            unsafe { callback(base, DLL_PROCESS_ATTACH, std::ptr::null_mut()) };
+        }
+        // SAFETY: the parser checked the entry point lies in an executable section; the
+        // caller vouches for the image's code and says it is a library's.
+        let entry = unsafe { std::mem::transmute::<usize, LibraryEntry>(self.entry_point()) };
+        // SAFETY: as above.
+        unsafe { entry(base, DLL_PROCESS_ATTACH, std::ptr::null_mut()) != 0 }
+    }
+}
+
 /// Where a thread made by [`LoadedImage::run_on_own_thread`] starts.
 ///
 /// # Safety

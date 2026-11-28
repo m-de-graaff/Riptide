@@ -245,6 +245,7 @@ pub(crate) fn device() -> &'static Device {
             ),
             (79, crate::frame::schedule as *const () as usize),
             (80, crate::frame::wait as *const () as usize),
+            (81, crate::frame::statistics as *const () as usize),
             (
                 26,
                 crate::resource::custom_heap_properties as *const () as usize,

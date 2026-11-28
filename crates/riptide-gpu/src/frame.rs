@@ -170,6 +170,26 @@ pub(crate) unsafe extern "system" fn wait(
     result
 }
 
+/// `GetFrameStatisticsX`: `(frame token, statistics wanted, count in and out, statistics
+/// out)`. No statistics are kept of when frames reached the screen, so none are given: the
+/// count comes back as zero.
+///
+/// # Safety
+/// `count` is null or the title's count.
+pub(crate) unsafe extern "system" fn statistics(
+    _this: &Device,
+    _token: u64,
+    _wanted: u32,
+    count: *mut u32,
+    _out: *mut u8,
+) -> Hresult {
+    // SAFETY: the title's count; null is tolerated.
+    if let Some(count) = unsafe { count.as_mut() } {
+        *count = 0;
+    }
+    S_OK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
