@@ -74,8 +74,24 @@ pub(crate) fn host_description(description: &Description) -> Option<D3D12_RESOUR
             Quality: 0,
         },
         Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-        Flags: D3D12_RESOURCE_FLAGS((description.flags & HOST_FLAGS) as i32),
+        Flags: D3D12_RESOURCE_FLAGS(host_flags(description.flags) as i32),
     })
+}
+
+/// The host's flags for a texture a title made with `flags`: the ones the host has, and
+/// of those a depth target is nothing else. The console lets a title also draw colour to
+/// a depth texture or write it from a compute program; the host refuses to make such a
+/// texture at all, so it is made as the depth target it mainly is.
+fn host_flags(flags: u32) -> u32 {
+    /// A render target, unordered access, and access from several queues at once.
+    const NOT_WITH_DEPTH: u32 = 0x1 | 0x4 | 0x20;
+    const DEPTH: u32 = 0x2;
+    let flags = flags & HOST_FLAGS;
+    if flags & DEPTH != 0 {
+        flags & !NOT_WITH_DEPTH
+    } else {
+        flags
+    }
 }
 
 /// The state every host texture is in between the commands that need it in another:
@@ -314,6 +330,15 @@ pub(crate) unsafe fn depth_target(handle: u64) -> Option<HostTarget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_depth_target_is_nothing_else_on_the_host() {
+        // Depth with unordered access and console bits: depth alone.
+        assert_eq!(host_flags(0x180_0006), 0x2);
+        assert_eq!(host_flags(0x2 | 0x1 | 0x20), 0x2);
+        // What is no depth target keeps what the host has.
+        assert_eq!(host_flags(0x1 | 0x4), 0x1 | 0x4);
+    }
 
     fn described(format: u32, flags: u32) -> Description {
         Description {

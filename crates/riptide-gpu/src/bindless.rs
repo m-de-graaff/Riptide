@@ -25,7 +25,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
     D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE,
-    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_SAMPLER_DESC,
+    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_SAMPLER_DESC,
     D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0, D3D12_SRV_DIMENSION,
     D3D12_SRV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_BUFFER, D3D12_UNORDERED_ACCESS_VIEW_DESC,
     D3D12_UNORDERED_ACCESS_VIEW_DESC_0, ID3D12DescriptorHeap, ID3D12Resource,
@@ -314,6 +315,18 @@ pub(crate) fn view(key: ViewKey, texture: &ID3D12Resource) -> Option<u32> {
         };
         let (_, unordered, words) = &key;
         let described = *words != [0; 10];
+        // SAFETY: a plain call on the host texture.
+        let made_as = unsafe { texture.GetDesc() };
+        if *unordered && made_as.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+            // The host texture could not be made writable from shaders (a depth target):
+            // there is no such view of it, and the record names the view of nothing.
+            return None;
+        }
+        let (levels, slices) = (
+            u32::from(made_as.MipLevels),
+            u32::from(made_as.DepthOrArraySize),
+        );
+        let words = &within_texture(*words, *unordered, levels, slices);
         // SAFETY: plain calls on the host device. The description is 40 bytes of plain
         // numbers in the layout of the host's view descriptions, and outlives the call.
         unsafe {
@@ -337,6 +350,71 @@ pub(crate) fn view(key: ViewKey, texture: &ID3D12Resource) -> Option<u32> {
         heaps.views.insert(key, place);
         Some(place)
     })
+}
+
+/// A view's description with its levels and slices kept to those the host texture has.
+/// A title may describe more than there are (fifteen levels, 4095 slices), which the
+/// console takes as "all there are" and the host refuses, losing the device.
+///
+/// Where each kind of texture has its numbers, in words of the host's descriptions:
+///
+/// | For reading | First level, levels | First slice, slices |
+/// | --- | --- | --- |
+/// | One, two and three dimensions, cube | 4, 5 | none |
+/// | Arrays of one and two dimensions | 4, 5 | 6, 7 |
+/// | Array of cubes | 4, 5 | 6 (a face), 7 (cubes) |
+/// | Multisampled array | none | 4, 5 |
+///
+/// A description for writing names one level, in word 2, and an array's or a volume's
+/// first slice and slices in words 3 and 4.
+fn within_texture(mut words: [u32; 10], unordered: bool, levels: u32, slices: u32) -> [u32; 10] {
+    /// A first place and a count, kept inside `there`. A count of all ones is "the rest".
+    fn within(first: &mut u32, count: &mut u32, there: u32) {
+        *first = (*first).min(there - 1);
+        if *count != u32::MAX {
+            *count = (*count).clamp(1, there - *first);
+        }
+    }
+    let kind = words[1];
+    if words == [0; 10] || levels == 0 || slices == 0 || kind <= 1 {
+        return words;
+    }
+    if unordered {
+        words[2] = words[2].min(levels - 1);
+        if matches!(kind, 3 | 5 | 8) {
+            // A volume's slices halve with each level.
+            let there = if kind == 8 {
+                (slices >> words[2]).max(1)
+            } else {
+                slices
+            };
+            let (first, count) = words.split_at_mut(4);
+            within(&mut first[3], &mut count[0], there);
+        }
+        return words;
+    }
+    match kind {
+        // Multisampled: one level, and an array's slices where the others have levels.
+        6 => {}
+        7 => {
+            let (first, count) = words.split_at_mut(5);
+            within(&mut first[4], &mut count[0], slices);
+        }
+        _ => {
+            let (first, count) = words.split_at_mut(5);
+            within(&mut first[4], &mut count[0], levels);
+            if matches!(kind, 3 | 5) {
+                let (first, count) = words.split_at_mut(7);
+                within(&mut first[6], &mut count[0], slices);
+            } else if kind == 10 {
+                words[6] = words[6].min(slices.saturating_sub(6));
+                if words[7] != u32::MAX {
+                    words[7] = words[7].clamp(1, ((slices - words[6]) / 6).max(1));
+                }
+            }
+        }
+    }
+    words
 }
 
 /// Forgets every view of the resource object at `resource`, which is going. Their places
@@ -434,6 +512,47 @@ fn forms(sampler: &[u32; 13]) -> ([u32; 13], [u32; 13]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_view_names_no_level_or_slice_its_texture_has_not() {
+        // Two dimensions, fifteen levels asked of a texture with one.
+        let asked = [28, 4, 0x1688, 0, 0, 15, 0, 0, 0, 0];
+        assert_eq!(within_texture(asked, false, 1, 1)[4..6], [0, 1]);
+        // From the third level on, of a texture with five: three are left.
+        let asked = [28, 4, 0x1688, 0, 2, 9, 0, 0, 0, 0];
+        assert_eq!(within_texture(asked, false, 5, 1)[4..6], [2, 3]);
+        // "All there are" stays so, and what fits stays as it is.
+        let all = [28, 4, 0x1688, 0, 1, u32::MAX, 0, 0, 0, 0];
+        assert_eq!(within_texture(all, false, 5, 1), all);
+        let fits = [28, 9, 0x1688, 0, 1, 3, 0, 0, 0, 0];
+        assert_eq!(within_texture(fits, false, 5, 6), fits);
+        // An array of 32 asked for ten levels and 4095 slices, of ten and 32.
+        let array = [98, 5, 0x1688, 0, 0, 10, 0, 4095, 0, 0];
+        assert_eq!(within_texture(array, false, 10, 32)[4..8], [0, 10, 0, 32]);
+        // From slice 30 on there are two.
+        let late = [98, 5, 0x1688, 0, 0, 1, 30, 4095, 0, 0];
+        assert_eq!(within_texture(late, false, 10, 32)[6..8], [30, 2]);
+        // Cubes are six faces each: 12 faces from the first are two cubes.
+        let cubes = [28, 10, 0x1688, 0, 0, 1, 0, 4095, 0, 0];
+        assert_eq!(within_texture(cubes, false, 1, 12)[6..8], [0, 2]);
+        // A multisampled array has its slices where the others have levels.
+        let many = [28, 7, 0x1688, 0, 1, 4095, 0, 0, 0, 0];
+        assert_eq!(within_texture(many, false, 1, 4)[4..6], [1, 3]);
+        let plain = [28, 6, 0x1688, 0, 9, 9, 0, 0, 0, 0];
+        assert_eq!(within_texture(plain, false, 1, 1), plain);
+        // A view for writing names one level, and an array's slices after it; a volume
+        // has half the slices at each level.
+        assert_eq!(
+            within_texture([28, 4, 7, 0, 0, 0, 0, 0, 0, 0], true, 3, 1)[2],
+            2
+        );
+        let written = [28, 5, 0, 0, 4095, 0, 0, 0, 0, 0];
+        assert_eq!(within_texture(written, true, 1, 8)[2..5], [0, 0, 8]);
+        let volume = [28, 8, 1, 0, 4095, 0, 0, 0, 0, 0];
+        assert_eq!(within_texture(volume, true, 3, 16)[2..5], [1, 0, 8]);
+        // No description at all has nothing to keep in.
+        assert_eq!(within_texture([0; 10], false, 1, 1), [0; 10]);
+    }
 
     #[test]
     fn a_sampler_has_a_plain_and_a_comparing_form() {

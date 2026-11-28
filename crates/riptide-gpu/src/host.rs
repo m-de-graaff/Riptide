@@ -45,9 +45,8 @@ fn checks() -> bool {
 /// the reason if the host device has been lost. Does nothing unless checking is on or the
 /// device is lost.
 pub(crate) fn report_problems() {
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     static LOST: AtomicBool = AtomicBool::new(false);
-    static SHOWN: AtomicU32 = AtomicU32::new(0);
     let Ok(host) = host() else {
         return;
     };
@@ -61,14 +60,12 @@ pub(crate) fn report_problems() {
                 let _ = queue.GetMessage(index, None, &mut bytes);
                 let mut buffer = vec![0u64; bytes.div_ceil(8) + 1];
                 let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
-                if queue.GetMessage(index, Some(message), &mut bytes).is_ok()
-                    && SHOWN.fetch_add(1, Ordering::Relaxed) < 40
-                {
+                if queue.GetMessage(index, Some(message), &mut bytes).is_ok() {
                     let text = std::slice::from_raw_parts(
                         (*message).pDescription,
                         (*message).DescriptionByteLength.saturating_sub(1),
                     );
-                    trace!("host check: {}", String::from_utf8_lossy(text));
+                    show_check(&String::from_utf8_lossy(text));
                 }
             }
             queue.ClearStoredMessages();
@@ -79,6 +76,49 @@ pub(crate) fn report_problems() {
             trace!("the host graphics device is lost: {error}");
         }
     }
+}
+
+/// Writes one thing the host's checking found to the session log, the first time it is
+/// said and then each time the count of it doubles: a message repeated every frame does
+/// not crowd out the ones that are said once. Messages are told apart with the numbers in
+/// them left out, since the same complaint names another object or address each time.
+fn show_check(message: &str) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+    /// How many different messages are kept apart; past that, all are one.
+    const MOST: usize = 512;
+    let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let seen = seen.get_or_insert_with(HashMap::new);
+    let mut kind = without_numbers(message);
+    if seen.len() >= MOST && !seen.contains_key(&kind) {
+        kind = String::new();
+    }
+    let count = seen.entry(kind).or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        trace!("host check: {message}");
+    } else if count.is_power_of_two() {
+        trace!("host check ({count} times so far): {message}");
+    }
+}
+
+/// A message with every run of digits, and every hexadecimal number written with `0x`,
+/// left out.
+fn without_numbers(message: &str) -> String {
+    let mut kind = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(first) = rest.chars().next() {
+        if let Some(digits) = rest.strip_prefix("0x").or(rest.strip_prefix("0X")) {
+            rest = digits.trim_start_matches(|c: char| c.is_ascii_hexdigit());
+        } else if first.is_ascii_digit() {
+            rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+        } else {
+            kind.push(first);
+            rest = &rest[first.len_utf8()..];
+        }
+    }
+    kind
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -134,4 +174,26 @@ pub(crate) fn host() -> Result<&'static Host, Hresult> {
     })
     .as_ref()
     .map_err(|&code| code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_same_complaint_about_another_object_is_the_same_message() {
+        let one = "Resource 0x000001E95A42EA30 (subresource 3) is in state 0x4, not 0x80";
+        let other = "Resource 0x00000274802B1F40 (subresource 12) is in state 0x4, not 0x80";
+        assert_eq!(without_numbers(one), without_numbers(other));
+        assert_eq!(
+            without_numbers(one),
+            "Resource  (subresource ) is in state , not "
+        );
+        assert_ne!(
+            without_numbers(one),
+            without_numbers("Resource 0x1 is not a buffer")
+        );
+        // Text without numbers is itself.
+        assert_eq!(without_numbers("no clear value"), "no clear value");
+    }
 }
