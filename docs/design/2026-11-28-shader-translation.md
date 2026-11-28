@@ -35,6 +35,23 @@ From the research note, the things that are easy to get wrong and are tested for
 - Waterfall loops over a per-lane resource index, and helper lanes in pixel programs, which the host's wave operations leave out (issue #21).
 - Float behaviour that differs from the host's: minimum and maximum order the two zeroes, `v_mul_legacy` gives zero for zero times anything, conversions saturate, sine and cosine take turns.
 
+## The host shader's bindings
+
+What every translated shader is given, and where. The emitter in `riptide-shader` writes shaders against this, and `riptide-gpu` binds it. Shader model 6.6, with both descriptor heaps indexed directly.
+
+| What | Where | Holds |
+| --- | --- | --- |
+| Stage inputs | constant buffer `b0`, in space 0 for a vertex or mesh program, space 1 for a pixel program, space 2 for a compute program | 64 words: the console's user-data registers for that stage, in their order (a root constant's value; a root view's address, low word then high; a table's or a heap's 32-bit address). Then 16 words of what the stage is told besides: for compute, the thread-group counts. |
+| Page table | raw buffer `t0`, space 0, as a root view | One word per 64 KiB of title addresses below 2^37: the frame mapped there plus one, or zero. A frame is its bank times 32,768 plus its place in the bank. |
+| Banks, to read | the resource heap, places 0 to 15 | A raw buffer over each bank of title memory. |
+| Banks, to write | the resource heap, places 16 to 31 | The same buffers for unordered access. |
+| Textures | the resource heap, from place 64 | Each host view of a title's texture, at the place its descriptor record names. Place 32 is a view of nothing, for a record that names none. |
+| Samplers | the sampler heap | Each host sampler, at the place its descriptor record names. A sampler that an instruction compares with is at that place plus 1,024, as the comparing form of the same sampler. |
+
+Reading title memory at an address is: the page table's word for the address's page; nothing mapped reads as zero; else the bank and the offset in it; then a load from that bank's buffer. A write is the same through the unordered-access view, and a write where nothing is mapped is dropped.
+
+A vertex program's attributes come from the host's own input assembler: the pipeline is made with the title's input layout, and the shader declares its inputs by the names and indices in the program's input signature. Values pass from one stage to the next by the rows of the two programs' signatures. A pixel program's colours go out as four raw 32-bit words per render target, declared as floats, unsigned or signed integers by the target's format, which the pipeline knows when it is made.
+
 ## Order of work
 
 1. Container and decoder (#18). In progress.
