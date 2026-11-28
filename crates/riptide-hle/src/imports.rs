@@ -83,8 +83,6 @@ const HOST_MODULES: &[&str] = &[
     "advapi32.dll",
     "mfplat.dll",
     "mfreadwrite.dll",
-    // The input library is the same on the console and on Windows.
-    "gameinput.dll",
     // So is the audio library, by the same name.
     "xaudio2_9.dll",
     // Certificates, for the HTTP libraries a title brings in its package.
@@ -136,6 +134,7 @@ impl Imports {
         crate::xapu::register(&mut imports);
         crate::xdsp::register(&mut imports);
         crate::offline::register(&mut imports);
+        crate::input::register(&mut imports);
         imports
     }
 
