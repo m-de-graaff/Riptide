@@ -146,4 +146,4 @@ The title reaches its page of legal terms, which asks the player to agree to the
 
 The BCPack decoder against the reference decoder, on 129 streams the title asked for in such a run (7 of BC1, 100 of BC5, 22 of BC7, written out with `RIPTIDE_BCPACK_DUMP`): all 129 come out the same byte for byte. Speed on one core, release build: about 70 MB of blocks a second for BC1, 65 for BC5 and 32 for BC7.
 
-A run of the same length with the host checking every call (`RIPTIDE_GPU_CHECKS=1`) lost no device. It says three things: the known one about a clear value, and two about the state of a bank's buffer (see `riptide-gpu`'s README).
+A run of 420 s with one press, with the host checking every call (`RIPTIDE_GPU_CHECKS=1`) lost no device. It says three things: the known one about a clear value, and two about the state of a bank's buffer (see `riptide-gpu`'s README).
