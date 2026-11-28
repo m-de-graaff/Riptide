@@ -199,6 +199,7 @@ pub(crate) fn device() -> &'static Device {
             (7, node_count as *const () as usize),
             (8, crate::queue::create as *const () as usize),
             (9, crate::list::create_allocator as *const () as usize),
+            (11, crate::pipeline::create_compute as *const () as usize),
             (12, crate::list::create_list as *const () as usize),
             (14, crate::descriptor::create as *const () as usize),
             (15, crate::descriptor::increment_size as *const () as usize),
@@ -222,7 +223,10 @@ pub(crate) fn device() -> &'static Device {
             (41, crate::signature::create as *const () as usize),
             (73, crate::list::create_list_x as *const () as usize),
             (48, crate::queue::create_x as *const () as usize),
+            (57, crate::pipeline::create_unknown_57 as *const () as usize),
             (61, crate::view::create_sampler_x as *const () as usize),
+            (62, crate::pipeline::create_compute_x as *const () as usize),
+            (67, crate::pipeline::create_unknown_67 as *const () as usize),
             (
                 70,
                 crate::view::create_placed_shader_resource as *const () as usize,

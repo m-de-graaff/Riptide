@@ -175,6 +175,10 @@ impl Stubs {
 unsafe extern "system" fn unimplemented(entry: *const Entry) -> ! {
     // SAFETY: a stub passes the entry stored for it, which lives as long as the stub does.
     let entry = unsafe { &*entry };
+    // One thread at a time, and the lock is never given back: a second thread that reaches
+    // a stub while the first is still writing its lines must not end the process under it.
+    static STOPPING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _stopping = STOPPING.lock().unwrap_or_else(|poison| poison.into_inner());
     // A log that panics must not change how the process ends.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if entry.note_call() {

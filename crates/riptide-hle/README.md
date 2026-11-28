@@ -58,4 +58,5 @@ Also built for the title's graphics set-up:
 
 - `kernel32.dll!VirtualFree` on title memory. A title frees what `XMemVirtualAlloc` gave it with this, and cuts a reservation into parts with it, so those calls go to `riptide-mem`. Any other address goes to Windows.
 - `XMemAllocDefault` hands out title memory, below 2^40, for the kinds of memory the GPU uses. The title's own allocator asks it for the memory of committed graphics resources.
+- `xg_xs.dll`, the console's texture-layout library, on `riptide-formats`: the suggested mode, and a texture computer's layout, element offsets and copies into and out of a layout. Its other methods name themselves when called.
 - `XboxBvhBuilder.dll`, the module a title builds ray-tracing structures with, as a stand-in: a builder can be made, dropped and given its options, and builds nothing. Its other methods name themselves when called. The real module ships in the title's package and needs its shader programs translated before it can be loaded.

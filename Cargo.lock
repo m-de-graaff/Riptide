@@ -1616,6 +1616,7 @@ name = "riptide-hle"
 version = "0.0.0"
 dependencies = [
  "miniz_oxide 0.8.9",
+ "riptide-formats",
  "riptide-gpu",
  "riptide-mem",
  "riptide-pe",

@@ -161,6 +161,7 @@ fn allocator_table() -> &'static [usize] {
     TABLE.get_or_init(|| {
         let mut methods = object::child_methods::<Allocator>().to_vec();
         methods.push((8, allocator_reset as *const () as usize));
+        methods.push((9, allocator_callback as *const () as usize));
         object::table(
             "ID3D12CommandAllocator",
             ALLOCATOR_SLOTS,
@@ -175,7 +176,7 @@ const LIST_SLOTS: usize = 160;
 
 /// The list's methods by position in the older layout, as far as their names are known.
 /// Positions 0 to 59 are the PC list's.
-const LIST_NAMES: [(usize, &str); 76] = [
+const LIST_NAMES: [(usize, &str); 77] = [
     (0, "QueryInterface"),
     (1, "AddRef"),
     (2, "Release"),
@@ -252,6 +253,7 @@ const LIST_NAMES: [(usize, &str); 76] = [
     (127, "DispatchMesh"),
     (129, "PipelineSyncTopX"),
     (130, "PipelineSyncBottomX"),
+    (137, "ResetX"),
 ];
 
 /// Where a method of the older layout is in the layout of a device created as
@@ -271,6 +273,7 @@ fn list_table(newer: bool) -> &'static [usize] {
             (10, reset as *const () as usize),
             (129, sync as *const () as usize),
             (130, sync as *const () as usize),
+            (137, reset_x as *const () as usize),
         ]);
         let names: Vec<(usize, &str)> = LIST_NAMES
             .iter()
@@ -426,6 +429,12 @@ pub(crate) unsafe extern "system" fn create_list_x(
     unsafe { make_list(description.kind, allocator, pipeline, iid, out) }
 }
 
+/// Allocator `SetAllocationCallbackX`: the title gives a routine of its own that the
+/// console's allocator asks for the memory command packets are written into. Lists here
+/// write no packets, so the routine is never asked and nothing of it is kept. What the
+/// method's arguments are, beyond the object, is not known.
+extern "system" fn allocator_callback(_this: &Allocator) {}
+
 /// Allocator `Reset`: the memory of every list recorded into it is free again.
 extern "system" fn allocator_reset(this: &Allocator) -> Hresult {
     // SAFETY: a plain call on the host allocator.
@@ -482,6 +491,21 @@ unsafe extern "system" fn reset(
             error.code().0
         }
     }
+}
+
+/// `ResetX`: `(allocator, first pipeline, flags)`. As `Reset`; the flags tune the console's
+/// command memory, which is not used here.
+///
+/// # Safety
+/// `allocator` is null or a live allocator.
+unsafe extern "system" fn reset_x(
+    this: &List,
+    allocator: *const Allocator,
+    pipeline: usize,
+    _flags: u32,
+) -> Hresult {
+    // SAFETY: as received.
+    unsafe { reset(this, allocator, pipeline) }
 }
 
 /// `PipelineSyncTopX` and `PipelineSyncBottomX`: `(flags, control, address, size)`. On the

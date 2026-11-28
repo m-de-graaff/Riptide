@@ -279,6 +279,138 @@ pub(crate) unsafe extern "system" fn create(
     unsafe { object::hand_out(pipeline, out) }
 }
 
+/// `D3D12_COMPUTE_PIPELINE_STATE_DESC`, as on PC.
+#[repr(C)]
+pub(crate) struct ComputeDescription {
+    root: usize,
+    program: Bytecode,
+    nodes: u32,
+    cached: Bytecode,
+    flags: u32,
+}
+
+const _: () = assert!(size_of::<ComputeDescription>() == 56);
+
+/// `ID3D12Device::CreateComputePipelineState`: `(description, interface id, pipeline
+/// out)`. The program and the root signature are kept, as [`create`] keeps a stream's.
+///
+/// # Safety
+/// The title's pointers: each null or valid, and the program as long as the description
+/// says.
+pub(crate) unsafe extern "system" fn create_compute(
+    _device: *const Device,
+    description: *const ComputeDescription,
+    iid: *const Iid,
+    out: *mut *const Pipeline,
+) -> Hresult {
+    // SAFETY: the title's description; null is refused.
+    let Some(description) = (unsafe { description.as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let code = description.program;
+    if code.code.is_null() || code.bytes == 0 || code.bytes > LARGEST_PROGRAM {
+        return E_INVALIDARG;
+    }
+    // SAFETY: the title's id and out-pointer.
+    if let Err(code) = unsafe { object::accepts(iid, out) } {
+        return code;
+    }
+    // SAFETY: the title's program, of that many bytes.
+    let program = unsafe { std::slice::from_raw_parts(code.code, code.bytes) }.to_vec();
+    let pipeline = Box::new(Pipeline {
+        object: Object::new(table(), 1),
+        packet: [0; 8],
+        stream: Vec::new(),
+        subobjects: Vec::new(),
+        programs: vec![(Stage::Compute, program)],
+        root: description.root,
+    });
+    show(&pipeline);
+    // SAFETY: `accepts` checked the out-pointer.
+    unsafe { object::hand_out(pipeline, out) }
+}
+
+/// `ID3D12Device::CreateComputePipelineStateX`: `(description, extension count,
+/// extensions, interface id, pipeline out)`. The extensions are settings for the console
+/// GPU's own code and are not kept: what they mean is not known.
+///
+/// # Safety
+/// As [`create_compute`].
+pub(crate) unsafe extern "system" fn create_compute_x(
+    device: *const Device,
+    description: *const ComputeDescription,
+    extensions: u32,
+    _extended: *const u8,
+    iid: *const Iid,
+    out: *mut *const Pipeline,
+) -> Hresult {
+    if extensions != 0 {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SHOWN: AtomicU32 = AtomicU32::new(0);
+        if SHOWN.fetch_add(1, Ordering::Relaxed) == 0 {
+            trace!("a compute pipeline has {extensions} console extensions, which are not kept");
+        }
+    }
+    // SAFETY: as received.
+    unsafe { create_compute(device, description, iid, out) }
+}
+
+/// Device positions 57 and 67: two of the console's own ways to make a pipeline, `(this,
+/// description, interface id, pipeline out)`. The title asks both for a pipeline state.
+/// What their descriptions hold is not known, so no pipeline can be kept from them: the
+/// call fails with the out-pointer cleared, and the title goes on without that pipeline.
+///
+/// # Safety
+/// `out` is null or where the pipeline would go.
+unsafe fn refuse_unknown(
+    slot: usize,
+    description: *const u8,
+    out: *mut *const Pipeline,
+) -> Hresult {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+    let calls = CALLS[usize::from(slot == 67)].fetch_add(1, Ordering::Relaxed) + 1;
+    if calls == 1 {
+        trace!(
+            "device position {slot} (+{:#x}) makes a pipeline from a description that is not understood (at {description:p}); the title goes without it",
+            slot * 8
+        );
+    }
+    // SAFETY: the title's out-pointer; null is tolerated.
+    if let Some(out) = unsafe { out.as_mut() } {
+        *out = std::ptr::null();
+    }
+    object::E_NOTIMPL
+}
+
+/// Device position 57. See [`refuse_unknown`].
+///
+/// # Safety
+/// As [`refuse_unknown`].
+pub(crate) unsafe extern "system" fn create_unknown_57(
+    _device: *const Device,
+    description: *const u8,
+    _iid: *const Iid,
+    out: *mut *const Pipeline,
+) -> Hresult {
+    // SAFETY: as received.
+    unsafe { refuse_unknown(57, description, out) }
+}
+
+/// Device position 67. See [`refuse_unknown`].
+///
+/// # Safety
+/// As [`refuse_unknown`].
+pub(crate) unsafe extern "system" fn create_unknown_67(
+    _device: *const Device,
+    description: *const u8,
+    _iid: *const Iid,
+    out: *mut *const Pipeline,
+) -> Hresult {
+    // SAFETY: as received.
+    unsafe { refuse_unknown(67, description, out) }
+}
+
 /// Says what was made, for the first few: a title makes thousands.
 fn show(pipeline: &Pipeline) {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -410,6 +542,42 @@ mod tests {
                 create(device, std::ptr::null(), &IID, &mut made),
                 E_INVALIDARG
             );
+
+            // A compute pipeline keeps its one program.
+            let description = ComputeDescription {
+                root: 0x9000,
+                program: Bytecode {
+                    code: vertex.as_ptr(),
+                    bytes: vertex.len(),
+                },
+                nodes: 0,
+                cached: Bytecode {
+                    code: std::ptr::null(),
+                    bytes: 0,
+                },
+                flags: 0,
+            };
+            assert_eq!(
+                create_compute_x(device, &description, 0, std::ptr::null(), &IID, &mut made),
+                0
+            );
+            assert_eq!((*made).root(), 0x9000);
+            assert_eq!((*made).programs(), [(Stage::Compute, vertex.to_vec())]);
+            assert_eq!(release(made), 0);
+            let empty = ComputeDescription {
+                program: description.cached,
+                ..description
+            };
+            assert_eq!(
+                create_compute(device, &empty, &IID, &mut made),
+                E_INVALIDARG
+            );
+
+            // The two creation methods that are not understood fail and clear the pointer.
+            made = std::ptr::dangling();
+            assert!(create_unknown_67(device, std::ptr::null(), &IID, &mut made) < 0);
+            assert!(made.is_null());
+            assert!(create_unknown_57(device, std::ptr::null(), &IID, std::ptr::null_mut()) < 0);
         }
     }
 }

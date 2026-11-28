@@ -113,6 +113,8 @@ fn table(newer: bool) -> &'static [usize] {
         methods.extend([
             (14, signal as *const () as usize),
             (15, wait as *const () as usize),
+            (16, timestamp_frequency as *const () as usize),
+            (17, clock_calibration as *const () as usize),
         ]);
         let names: Vec<(usize, &str)> = NAMES
             .iter()
@@ -243,6 +245,46 @@ unsafe extern "system" fn wait(this: &Queue, fence: *const Fence, value: u64) ->
     };
     // SAFETY: a plain call on the host queue with a live host fence.
     match unsafe { this.host.Wait(fence.host(), value) } {
+        Ok(()) => S_OK,
+        Err(error) => error.code().0,
+    }
+}
+
+/// `GetTimestampFrequency`: `(frequency out)`. How many ticks of the GPU's timer make a
+/// second. Timestamps a title's lists take come from the host GPU, so the answer is the
+/// host queue's.
+///
+/// # Safety
+/// `out` is null or where the frequency goes.
+unsafe extern "system" fn timestamp_frequency(this: &Queue, out: *mut u64) -> Hresult {
+    // SAFETY: the title's out-pointer; null is refused.
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return E_INVALIDARG;
+    };
+    // SAFETY: a plain call on the host queue.
+    match unsafe { this.host.GetTimestampFrequency() } {
+        Ok(frequency) => {
+            *out = frequency;
+            S_OK
+        }
+        Err(error) => {
+            trace!("the host queue has no timestamp frequency: {error}");
+            error.code().0
+        }
+    }
+}
+
+/// `GetClockCalibration`: `(GPU timestamp out, CPU timestamp out)`. The two clocks read at
+/// the same moment, from the host queue.
+///
+/// # Safety
+/// Each pointer is null or where its timestamp goes.
+unsafe extern "system" fn clock_calibration(this: &Queue, gpu: *mut u64, cpu: *mut u64) -> Hresult {
+    if gpu.is_null() || cpu.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: a plain call on the host queue with checked out-pointers.
+    match unsafe { this.host.GetClockCalibration(gpu, cpu) } {
         Ok(()) => S_OK,
         Err(error) => error.code().0,
     }

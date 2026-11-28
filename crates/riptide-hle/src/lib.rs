@@ -25,6 +25,7 @@ mod taskqueue;
 pub mod timers;
 mod trace;
 mod user;
+mod xg;
 pub mod xmem;
 
 pub use imports::{Binding, Census, CensusLine, Imports};
