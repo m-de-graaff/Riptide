@@ -38,9 +38,16 @@
 //!   can map it to a host wave intrinsic or refuse it: [`Op::FirstLane`],
 //!   [`Op::ReadLane`], [`Op::CountLanes`], [`Op::FirstLaneIndex`],
 //!   [`Op::AnyLane`], [`Op::LanesBelow`], [`Op::BallotWord`],
-//!   [`Op::LaneBit`], [`Op::QuadPermute`], [`Op::QuadAny`]. Their meaning is
-//!   over "the lanes that reach the operation together", which is what a
-//!   host's wave intrinsics mean too. [`crate::interp`] defines it exactly.
+//!   [`Op::LaneBit`], [`Op::LaneIndex`], [`Op::Reduce`], [`Op::PrefixSum`],
+//!   [`Op::QuadPermute`], [`Op::QuadAny`]. Their meaning is over "the lanes
+//!   that reach the operation together", which is what a host's wave
+//!   intrinsics mean too. [`crate::interp`] defines it exactly.
+//! - What the lanes of a wave share is explicit too: atomic operations on
+//!   memory ([`Op::Atomic`]), the group-shared memory ([`Op::LoadShared`],
+//!   [`Op::StoreShared`]) and the barrier that orders it ([`Op::Barrier`]).
+//!   The console does these an instruction at a time for the whole wave, so
+//!   one lane sees what another did at an earlier instruction;
+//!   [`Op::is_ordered`] names them.
 //!
 //! # Control flow
 //!
@@ -369,6 +376,128 @@ pub enum FlagOp {
     Or,
     /// Exactly one.
     Xor,
+}
+
+/// What a reduction over the lanes of a wave folds its words with
+/// ([`Op::Reduce`]). Each has an identity: the word that leaves any other
+/// unchanged, which is what a lane that takes no part counts as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReduceOp {
+    /// Wrapping sum. Identity 0.
+    Add,
+    /// Float sum, added in the console's order: a balanced tree over the
+    /// lanes by their numbers (lanes 0 and 1, 2 and 3, then those pairs,
+    /// and so on). A lane that takes no part counts as +0.
+    FloatAdd,
+    /// Bitwise and. Identity all ones.
+    And,
+    /// Bitwise or. Identity 0.
+    Or,
+    /// Bitwise exclusive or. Identity 0.
+    Xor,
+    /// The smallest as unsigned numbers. Identity all ones.
+    MinUnsigned,
+    /// The largest as unsigned numbers. Identity 0.
+    MaxUnsigned,
+    /// The smallest as signed numbers. Identity the largest signed number.
+    MinSigned,
+    /// The largest as signed numbers. Identity the smallest signed number.
+    MaxSigned,
+    /// The smallest float by the rule of [`BinaryOp::FloatMin`]. Identity
+    /// plus infinity, so a NaN never wins.
+    FloatMin,
+    /// The largest float by the rule of [`BinaryOp::FloatMax`]. Identity
+    /// minus infinity.
+    FloatMax,
+}
+
+impl ReduceOp {
+    /// The operation on two words that the reduction repeats.
+    pub fn binary(self) -> BinaryOp {
+        match self {
+            ReduceOp::Add => BinaryOp::Add,
+            ReduceOp::FloatAdd => BinaryOp::FloatAdd,
+            ReduceOp::And => BinaryOp::And,
+            ReduceOp::Or => BinaryOp::Or,
+            ReduceOp::Xor => BinaryOp::Xor,
+            ReduceOp::MinUnsigned => BinaryOp::MinUnsigned,
+            ReduceOp::MaxUnsigned => BinaryOp::MaxUnsigned,
+            ReduceOp::MinSigned => BinaryOp::MinSigned,
+            ReduceOp::MaxSigned => BinaryOp::MaxSigned,
+            ReduceOp::FloatMin => BinaryOp::FloatMin,
+            ReduceOp::FloatMax => BinaryOp::FloatMax,
+        }
+    }
+
+    /// The word a lane that takes no part counts as.
+    pub fn identity(self) -> u32 {
+        match self {
+            ReduceOp::Add
+            | ReduceOp::FloatAdd
+            | ReduceOp::Or
+            | ReduceOp::Xor
+            | ReduceOp::MaxUnsigned => 0,
+            ReduceOp::And | ReduceOp::MinUnsigned => u32::MAX,
+            ReduceOp::MinSigned => 0x7FFF_FFFF,
+            ReduceOp::MaxSigned => 0x8000_0000,
+            ReduceOp::FloatMin => 0x7F80_0000,
+            ReduceOp::FloatMax => 0xFF80_0000,
+        }
+    }
+
+    /// Whether folding a word in twice is the same as folding it in once.
+    pub fn idempotent(self) -> bool {
+        !matches!(self, ReduceOp::Add | ReduceOp::FloatAdd | ReduceOp::Xor)
+    }
+}
+
+/// What an atomic operation does to the word it works on ([`Op::Atomic`]).
+/// [`eval::atomic`] is the reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AtomicOp {
+    /// Replaces the word.
+    Swap,
+    /// Replaces the word if it equals the comparand.
+    CompareSwap,
+    /// Wrapping sum.
+    Add,
+    /// Wrapping difference: the word less the operand.
+    Sub,
+    /// The smaller as signed numbers.
+    MinSigned,
+    /// The smaller as unsigned numbers.
+    MinUnsigned,
+    /// The larger as signed numbers.
+    MaxSigned,
+    /// The larger as unsigned numbers.
+    MaxUnsigned,
+    /// Bitwise and.
+    And,
+    /// Bitwise or.
+    Or,
+    /// Bitwise exclusive or.
+    Xor,
+    /// The word plus one; the operand is not used.
+    Increment,
+    /// The word less one; the operand is not used.
+    Decrement,
+}
+
+/// The word an atomic operation works on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AtomicPlace {
+    /// A word of title memory by address.
+    Memory(Address),
+    /// A word of title memory through a buffer descriptor, as
+    /// [`Op::LoadBuffer`] finds it.
+    Buffer {
+        /// The four words of the descriptor.
+        descriptor: [Value; 4],
+        /// Where in the buffer.
+        position: BufferPosition,
+    },
+    /// A word of the group-shared memory at a byte offset.
+    Shared(Value),
 }
 
 /// A pair of barycentric weights a pixel program is given.
@@ -824,6 +953,59 @@ pub enum Op {
     /// on running (its derivatives are still wanted). No result.
     Discard(Value),
 
+    /// An atomic operation on a 32-bit word: reads the word, writes what
+    /// `op` makes of it and `value`, and gives the word as it was. The low
+    /// two bits of the place's address are ignored (taken on trust:
+    /// compiled code only does this on whole words). Nothing happens unless
+    /// `guard` holds, and nothing happens to memory that is not mapped,
+    /// outside a buffer's bound or past the end of the shared memory; the
+    /// result is zero then. The lanes of a wave do it one after another in
+    /// the order of their numbers. One word result.
+    Atomic {
+        /// What is done.
+        op: AtomicOp,
+        /// The word worked on.
+        place: AtomicPlace,
+        /// The operand.
+        value: Value,
+        /// For [`AtomicOp::CompareSwap`]: what the word must equal. A
+        /// constant zero otherwise.
+        compare: Value,
+        /// Whether the lane does it at all.
+        guard: Value,
+    },
+    /// Reads the group-shared memory of a compute program: `words` units of
+    /// `width` bits, the first at byte `offset` and each next one
+    /// `width / 8` bytes on. Narrow units are zero-extended. A unit that
+    /// does not lie wholly inside [`Interface::shared_bytes`] reads as
+    /// zero. `words` word results.
+    LoadShared {
+        /// The byte offset of the first unit.
+        offset: Value,
+        /// 8, 16 or 32.
+        width: u8,
+        /// How many units.
+        words: u8,
+    },
+    /// Writes the group-shared memory: each of `values` as a unit of
+    /// `width` bits, the first at byte `offset`. Nothing is written unless
+    /// `guard` holds, and a unit that does not lie wholly inside the memory
+    /// is dropped. No result.
+    StoreShared {
+        /// The byte offset of the first unit.
+        offset: Value,
+        /// 8, 16 or 32.
+        width: u8,
+        /// The units, low bits used.
+        values: Vec<Value>,
+        /// Whether the lane writes at all.
+        guard: Value,
+    },
+    /// The console's `s_barrier`: every wave of the thread group gets here
+    /// before any goes on, so that what was written to the shared memory
+    /// before it is read after it. No result.
+    Barrier,
+
     /// Cross-lane: `value` of the first lane (lowest lane number) whose
     /// `active` flag holds, among the lanes that reach this operation
     /// together; if none does, of the first of those lanes. One word result.
@@ -877,6 +1059,34 @@ pub enum Op {
         /// Bits 32 to 63.
         high: Value,
     },
+    /// The lane's number in the console's wave. Needs the console's lane
+    /// numbers, like [`Op::LaneBit`], unless it only meets numbers of the
+    /// same kind (a first lane's number, the bits of a ballot). One word
+    /// result.
+    LaneIndex,
+    /// Cross-lane: the words of the lanes that hold `active`, folded with
+    /// `op`; every lane gets the same result. A lane that does not hold the
+    /// flag, or does not reach the operation, counts as the identity of
+    /// `op`, so with no lane the result is that identity. This is a wave
+    /// reduction, which the console's compiler writes out as a section
+    /// that runs in every lane. One word result.
+    Reduce {
+        /// What the words are folded with.
+        op: ReduceOp,
+        /// The word of the lane.
+        value: Value,
+        /// Whether the lane takes part.
+        active: Value,
+    },
+    /// Cross-lane: the wrapping sum of `value` over the lanes with a lower
+    /// console lane number that hold `active`. The lane's own word is not
+    /// in it. One word result.
+    PrefixSum {
+        /// The word of the lane.
+        value: Value,
+        /// Whether the lane takes part.
+        active: Value,
+    },
     /// Cross-lane, within the lane's quad of four: the lane in place p of
     /// its quad reads `value` of the lane in place `lanes[p]`. In a pixel
     /// program a quad is a 2 by 2 block of pixels: place 0 top left, 1 top
@@ -904,6 +1114,8 @@ impl Op {
             | Op::StoreMemory { .. }
             | Op::StoreBuffer { .. }
             | Op::StoreFormat { .. }
+            | Op::StoreShared { .. }
+            | Op::Barrier
             | Op::Export { .. }
             | Op::Discard(_) => return None,
             Op::Image(image) => match image.kind {
@@ -933,11 +1145,14 @@ impl Op {
             | Op::StoreMemory { .. }
             | Op::StoreBuffer { .. }
             | Op::StoreFormat { .. }
+            | Op::StoreShared { .. }
+            | Op::Barrier
             | Op::Export { .. }
             | Op::Discard(_) => 0,
             Op::LoadFormat { .. } => 4,
             Op::LoadMemory { words, .. }
             | Op::LoadBuffer { words, .. }
+            | Op::LoadShared { words, .. }
             | Op::LoadCode { words, .. } => *words,
             Op::Image(image) => match image.kind {
                 ImageKind::Store { .. } => 0,
@@ -958,15 +1173,70 @@ impl Op {
                 | Op::AnyLane(_)
                 | Op::LanesBelow { .. }
                 | Op::BallotWord { .. }
+                | Op::Reduce { .. }
+                | Op::PrefixSum { .. }
                 | Op::QuadPermute { .. }
                 | Op::QuadAny(_)
+        )
+    }
+
+    /// Whether the console does the operation for a whole wave at one
+    /// instruction, so that what a lane does here another lane may see at a
+    /// later one: the atomic operations, the group-shared memory and the
+    /// barrier. The reference interpreter makes the lanes take these in
+    /// the program's order.
+    pub fn is_ordered(&self) -> bool {
+        matches!(
+            self,
+            Op::Atomic { .. } | Op::LoadShared { .. } | Op::StoreShared { .. } | Op::Barrier
         )
     }
 
     /// Calls `visit` on every value the operation reads.
     pub fn for_each_operand(&self, mut visit: impl FnMut(Value)) {
         match self {
-            Op::Get(_) | Op::Input(_) => {}
+            Op::Get(_) | Op::Input(_) | Op::LaneIndex | Op::Barrier => {}
+            Op::Atomic {
+                place,
+                value,
+                compare,
+                guard,
+                ..
+            } => {
+                match place {
+                    AtomicPlace::Memory(address) => {
+                        visit(address.low);
+                        visit(address.high);
+                    }
+                    AtomicPlace::Buffer {
+                        descriptor,
+                        position,
+                    } => {
+                        descriptor.iter().copied().for_each(&mut visit);
+                        visit(position.index);
+                        visit(position.offset);
+                    }
+                    AtomicPlace::Shared(offset) => visit(*offset),
+                }
+                visit(*value);
+                visit(*compare);
+                visit(*guard);
+            }
+            Op::LoadShared { offset, .. } => visit(*offset),
+            Op::StoreShared {
+                offset,
+                values,
+                guard,
+                ..
+            } => {
+                visit(*offset);
+                values.iter().copied().for_each(&mut visit);
+                visit(*guard);
+            }
+            Op::Reduce { value, active, .. } | Op::PrefixSum { value, active } => {
+                visit(*value);
+                visit(*active);
+            }
             Op::Set(_, a)
             | Op::Unary(_, a)
             | Op::FlagNot(a)
@@ -1243,6 +1513,8 @@ pub struct Interface {
     pub outputs: Vec<ParameterRow>,
     /// Compute: the thread group's size.
     pub group_size: [u32; 3],
+    /// Compute: the size of the group-shared memory in bytes.
+    pub shared_bytes: u32,
     /// Pixel: `DB_SHADER_CONTROL` as stored. Bit 0 says depth is exported.
     pub depth_control: u32,
 }
@@ -1403,7 +1675,19 @@ impl Function {
 fn expected_operand_types(op: &Op, actual: &[Ty]) -> Option<Vec<Ty>> {
     use Ty::{Flag, Word};
     Some(match op {
-        Op::Get(_) | Op::Input(_) => vec![],
+        Op::Get(_) | Op::Input(_) | Op::LaneIndex | Op::Barrier => vec![],
+        Op::Atomic { .. } => {
+            let mut types = vec![Word; actual.len()];
+            *types.last_mut()? = Flag;
+            types
+        }
+        Op::LoadShared { .. } => vec![Word],
+        Op::StoreShared { values, .. } => {
+            let mut types = vec![Word; 1 + values.len()];
+            types.push(Flag);
+            types
+        }
+        Op::Reduce { .. } | Op::PrefixSum { .. } => vec![Word, Flag],
         Op::Set(var, _) => vec![var.ty()],
         Op::Unary(..) => vec![Word],
         Op::Binary(..) | Op::Compare(..) | Op::FloatClass { .. } => vec![Word, Word],

@@ -90,6 +90,11 @@ impl WaveSize {
             WaveSize::Wave64 => 2,
         }
     }
+
+    /// How many lanes a wave has.
+    pub fn lanes(self) -> usize {
+        32 * usize::from(self.mask_words())
+    }
 }
 
 /// The encoding format of an instruction.

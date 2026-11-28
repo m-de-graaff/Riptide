@@ -6,7 +6,7 @@
 //! instruction set; the float rules that differ from a host's are in
 //! [`crate::ir::eval`].
 
-use super::{HIGH, Lift, Lifter, MASK, Rounding, name_of};
+use super::{HIGH, Lift, Lifter, MASK, Rounding, VCC, name_of};
 use crate::gfx10::{
     Detail, Format, Half, Instruction, LanePermutation, Operand, Role, VectorModifiers,
 };
@@ -113,6 +113,27 @@ impl Lifter<'_> {
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" if plain => {
                 return self.lanes_below(instruction, &sources);
             }
+            "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" if plain => {
+                // A 64-bit value in a pair of registers, shifted by the low
+                // six bits of the first operand.
+                let (register, count) = self.vector_register(target)?;
+                let (amount, value) = (source(self, 0)?, source(self, 1)?);
+                if count != 2 || wide(amount) {
+                    return self.fail("the instruction is not decoded");
+                }
+                let amount = self.word(amount)?;
+                let low = self.word_at(value, 0)?;
+                let high = self.word_at(value, 1)?;
+                let kind = match name {
+                    "v_lshlrev_b64" => BinaryOp::ShiftLeft,
+                    "v_lshrrev_b64" => BinaryOp::ShiftRight,
+                    _ => BinaryOp::ShiftRightSigned,
+                };
+                let (low, high) = self.shift64(kind, low, high, amount);
+                self.set_vector(register, low);
+                self.set_vector(register.wrapping_add(1), high);
+                return Ok(());
+            }
             _ => {}
         }
         if name.starts_with("v_cmp") {
@@ -193,7 +214,7 @@ impl Lifter<'_> {
         // The two-source forms that add to their result read it as the
         // third source.
         if matches!(name, "v_mac_f32" | "v_fmac_f32") && values.len() == 2 {
-            values.push(self.emit(Op::Get(Var::Vector(register))));
+            values.push(self.vector_word(register)?);
         }
 
         let Some(mut value) = self.vector_value(name, &values)? else {
@@ -247,7 +268,7 @@ impl Lifter<'_> {
                         self.binary(BinaryOp::ShiftRightSigned, up, Value::Word(top))
                     }
                     2 => {
-                        let old = self.emit(Op::Get(Var::Vector(register)));
+                        let old = self.vector_word(register)?;
                         let kept = self.binary(BinaryOp::And, old, Value::Word(!(field << shift)));
                         self.binary(BinaryOp::Or, kept, placed)
                     }
@@ -255,7 +276,7 @@ impl Lifter<'_> {
                 };
             }
         } else if let Some(high) = half {
-            let old = self.emit(Op::Get(Var::Vector(register)));
+            let old = self.vector_word(register)?;
             let (keep, shift) = if high { (0xFFFF, 16) } else { (0xFFFF_0000, 0) };
             let kept = self.binary(BinaryOp::And, old, Value::Word(keep));
             let placed = self.binary(BinaryOp::ShiftLeft, value, Value::Word(shift));
@@ -306,10 +327,10 @@ impl Lifter<'_> {
             row_mask,
         } = permutation
         else {
-            return self.fail("a permutation within eight lanes");
+            return self.fail("a permutation within eight lanes outside a wave reduction");
         };
         if control > 0xFF {
-            return self.fail("a lane permutation across quads");
+            return self.fail("a permutation within a row of lanes outside a wave reduction");
         }
         if bank_mask != 0xF || row_mask != 0xF {
             return self.fail("a lane permutation that leaves out lanes");
@@ -404,30 +425,71 @@ impl Lifter<'_> {
             return self.fail("the instruction is not decoded");
         };
         let wide = self.mask_words() == 2;
+        if high && !wide {
+            return self.fail("the high half of a 32-lane mask");
+        }
         let wanted = if high { Half::High } else { Half::Low };
+        // The operand as a lane mask, or as a number whose bits are counted.
+        let mut number = None;
         let mask = match operand {
-            Operand::Exec(half) if half == wanted => self.live(),
-            Operand::Vcc(half) if half == wanted => self.emit(Op::Get(Var::Vcc)),
+            Operand::Exec(half) if half == wanted => Some(self.live()),
+            Operand::Vcc(half) if half == wanted && self.state.forms[VCC] & MASK != 0 => {
+                Some(self.emit(Op::Get(Var::Vcc)))
+            }
+            Operand::Vcc(_) => {
+                number = Some(self.word(operand)?);
+                None
+            }
             Operand::Scalar { first, count: 1 } => {
                 let index = self.check_scalar(first)?;
                 let forms = self.state.forms[index];
                 if !high && forms & MASK != 0 {
-                    self.mask_of_register(first)
+                    Some(self.mask_of_register(first))
                 } else if high && wide && forms & HIGH != 0 {
-                    self.mask_of_register(first - 1)
+                    Some(self.mask_of_register(first - 1))
                 } else {
-                    return self.fail("a count of the lanes below in a number");
+                    number = Some(self.number(first)?);
+                    None
                 }
             }
-            _ => return self.fail("a count of the lanes below in a number"),
+            Operand::Integer(value) => {
+                number = Some(Value::Word(value as i32 as u32));
+                None
+            }
+            Operand::Literal(word) => {
+                number = Some(Value::Word(word));
+                None
+            }
+            _ => return self.fail("a count of the lanes below in an operand without a rule"),
         };
-        if high && !wide {
-            return self.fail("the high half of a 32-lane mask");
-        }
-        let below = self.emit(Op::LanesBelow {
-            mask,
-            half: wide.then_some(high),
-        });
+        let below = match (mask, number) {
+            (Some(mask), _) => self.emit(Op::LanesBelow {
+                mask,
+                half: wide.then_some(high),
+            }),
+            (None, Some(number)) => {
+                // The bits of a number below the lane's own: of bits 0 to 31
+                // for the low instruction, 32 to 63 for the high one. With
+                // all bits set and 32 lanes this is the lane's number.
+                let lane = self.emit(Op::LaneIndex);
+                if number == Value::Word(u32::MAX) && !wide {
+                    lane
+                } else {
+                    let bit = self.binary(BinaryOp::ShiftLeft, Value::Word(1), lane);
+                    let under = self.binary(BinaryOp::Sub, bit, Value::Word(1));
+                    let upper =
+                        self.compare(CompareOp::UnsignedGreaterEqual, lane, Value::Word(32));
+                    let under = if high {
+                        self.select(upper, under, Value::Word(0))
+                    } else {
+                        self.select(upper, Value::Word(u32::MAX), under)
+                    };
+                    let counted = self.binary(BinaryOp::And, number, under);
+                    self.unary(UnaryOp::CountBits, counted)
+                }
+            }
+            (None, None) => return self.fail("the instruction is not decoded"),
+        };
         let addend = self.word(addend)?;
         let value = self.binary(BinaryOp::Add, below, addend);
         self.set_vector(register, value);
@@ -680,6 +742,24 @@ impl Lifter<'_> {
                 let high = self.binary(BinaryOp::ShiftLeft, high, Value::Word(16));
                 Ok(Some(self.binary(BinaryOp::Or, low, high)))
             }
+            "v_cvt_pk_u8_f32" => {
+                need(self, 3)?;
+                // The float rounded to the nearest whole number (ties to
+                // even) and held to 0..255, into the byte of the third
+                // operand that the low two bits of the second name. Taken
+                // on trust: the rounding and the holding, which AMD's
+                // description leaves to a function it does not spell out.
+                let rounded = self.unary(UnaryOp::RoundEven, s[0]);
+                let whole = self.unary(UnaryOp::UnsignedFromFloat, rounded);
+                let byte = self.binary(BinaryOp::MinUnsigned, whole, Value::Word(255));
+                let place = self.binary(BinaryOp::And, s[1], Value::Word(3));
+                let shift = self.binary(BinaryOp::ShiftLeft, place, Value::Word(3));
+                let hole = self.binary(BinaryOp::ShiftLeft, Value::Word(0xFF), shift);
+                let hole = self.unary(UnaryOp::Not, hole);
+                let kept = self.binary(BinaryOp::And, s[2], hole);
+                let placed = self.binary(BinaryOp::ShiftLeft, byte, shift);
+                Ok(Some(self.binary(BinaryOp::Or, kept, placed)))
+            }
             "v_pack_b32_f16" => {
                 need(self, 2)?;
                 let low = self.binary(BinaryOp::And, s[0], Value::Word(0xFFFF));
@@ -885,7 +965,7 @@ impl Lifter<'_> {
                 None => {
                     let weight = self.word(source)?;
                     let slope = term(self, VertexTerm::P20);
-                    let old = self.emit(Op::Get(Var::Vector(register)));
+                    let old = self.vector_word(register)?;
                     self.emit(Op::Ternary(TernaryOp::FloatFused, slope, weight, old))
                 }
             },

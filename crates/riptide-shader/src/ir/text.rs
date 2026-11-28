@@ -86,6 +86,20 @@ fn head(op: &Op) -> String {
         Op::LanesBelow { half, .. } => format!("LanesBelow {half:?}"),
         Op::BallotWord { high, .. } => format!("BallotWord high={high}"),
         Op::LaneBit { .. } => "LaneBit".into(),
+        Op::LaneIndex => "LaneIndex".into(),
+        Op::Reduce { op, .. } => format!("Reduce {op:?}"),
+        Op::PrefixSum { .. } => "PrefixSum".into(),
+        Op::Atomic { op, place, .. } => {
+            let place = match place {
+                super::AtomicPlace::Memory(_) => "memory",
+                super::AtomicPlace::Buffer { .. } => "buffer",
+                super::AtomicPlace::Shared(_) => "shared",
+            };
+            format!("Atomic{op:?} {place}")
+        }
+        Op::LoadShared { width, .. } => format!("LoadShared{width}"),
+        Op::StoreShared { width, .. } => format!("StoreShared{width}"),
+        Op::Barrier => "Barrier".into(),
         Op::QuadPermute { lanes, .. } => format!("QuadPermute {lanes:?}"),
         Op::QuadAny(_) => "QuadAny".into(),
     }

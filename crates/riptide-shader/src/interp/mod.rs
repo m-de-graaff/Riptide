@@ -25,8 +25,12 @@
 //! Effects (stores, exports) happen lane by lane in that order, not
 //! instruction by instruction across the wave. A program in which one lane
 //! reads what another stored can therefore behave differently here than on
-//! the console; compiled shaders do that only through atomics, which are
-//! not lifted.
+//! the console. Compiled shaders do that only through atomic operations and
+//! the group-shared memory, so those ([`Op::is_ordered`]) are done the
+//! console's way: the lanes wait at them as at a cross-lane operation and
+//! do them together, in the order of their numbers, the earliest place in
+//! the program first. The shared memory starts as zeroes and lasts for the
+//! run: one wave is one thread group here.
 //!
 //! # The second interpreter
 //!
@@ -46,7 +50,8 @@ use std::collections::HashMap;
 use crate::ir::cfg::{ControlFlow, map_operands};
 use crate::ir::eval::{self, BufferFormat, BufferView};
 use crate::ir::{
-    Address, BlockId, ExportTarget, Function, ImageKind, ImageOp, Input, Op, Terminator, Value, Var,
+    Address, AtomicPlace, BlockId, ExportTarget, Function, ImageKind, ImageOp, Input, Op,
+    Terminator, Value, Var,
 };
 
 /// What a program touches outside itself.
@@ -165,6 +170,7 @@ pub fn run_wave(function: &Function, lanes: usize, host: &mut dyn Host) -> Resul
         })
         .collect();
     let mut steps = 0u64;
+    let mut shared = vec![0u8; function.interface.shared_bytes as usize];
     // The lanes that wait at a cross-lane operation.
     let mut waiting = vec![false; lanes];
     loop {
@@ -195,7 +201,7 @@ pub fn run_wave(function: &Function, lanes: usize, host: &mut dyn Host) -> Resul
         let group: Vec<usize> = (0..lanes)
             .filter(|&lane| waiting[lane] && key(&state[lane]) == first)
             .collect();
-        resolve(function, &group, &mut state)?;
+        resolve(function, &group, &mut state, host, &mut shared)?;
         for lane in group {
             waiting[lane] = false;
         }
@@ -220,7 +226,7 @@ fn run_lane(
             if *steps > STEP_LIMIT {
                 return Err(InterpError::StepLimit);
             }
-            if inst.op.is_cross_lane() {
+            if inst.op.is_cross_lane() || inst.op.is_ordered() {
                 return Ok(true);
             }
             let results = execute(function, index, lane, &inst.op, host)?;
@@ -498,6 +504,15 @@ fn execute(
             let bits = u64::from(v(*low)) | u64::from(v(*high)) << 32;
             vec![(bits >> index & 1) as u32]
         }
+        Op::LaneIndex => vec![index as u32],
+        Op::Atomic { .. } | Op::LoadShared { .. } | Op::StoreShared { .. } | Op::Barrier => {
+            return Err(InterpError::Invalid(
+                "an operation the lanes take in order run alone",
+            ));
+        }
+        Op::Reduce { .. } | Op::PrefixSum { .. } => {
+            return Err(InterpError::Invalid("a cross-lane operation run alone"));
+        }
         Op::FirstLane { .. }
         | Op::ReadLane { .. }
         | Op::CountLanes(_)
@@ -510,9 +525,114 @@ fn execute(
     })
 }
 
-/// Resolves the cross-lane operation the lanes of `group` wait at, and
-/// moves them past it. `group` is sorted by lane number.
-fn resolve(function: &Function, group: &[usize], state: &mut [Lane]) -> Result<(), InterpError> {
+/// One lane's turn at an operation the lanes take in order: an atomic
+/// operation, an access to the shared memory, or a barrier.
+fn take_turn(lane: &Lane, op: &Op, host: &mut dyn Host, shared: &mut [u8]) -> Vec<u32> {
+    let v = |value: Value| lane.value(value);
+    // The unit of `bytes` bytes at an offset of the shared memory, if all
+    // of it is inside.
+    let inside = |offset: u32, bytes: usize, size: usize| {
+        let start = offset as usize;
+        (start <= size && bytes <= size - start).then_some(start)
+    };
+    match op {
+        Op::LoadShared {
+            offset,
+            width,
+            words,
+        } => {
+            let bytes = usize::from(*width / 8);
+            (0..u32::from(*words))
+                .map(|unit| {
+                    let offset = v(*offset).wrapping_add(unit * bytes as u32);
+                    match inside(offset, bytes, shared.len()) {
+                        Some(start) => shared[start..start + bytes]
+                            .iter()
+                            .rev()
+                            .fold(0u32, |word, &byte| word << 8 | u32::from(byte)),
+                        None => 0,
+                    }
+                })
+                .collect()
+        }
+        Op::StoreShared {
+            offset,
+            width,
+            values,
+            guard,
+        } => {
+            let bytes = usize::from(*width / 8);
+            if v(*guard) != 0 {
+                for (unit, value) in values.iter().enumerate() {
+                    let offset = v(*offset).wrapping_add((unit * bytes) as u32);
+                    if let Some(start) = inside(offset, bytes, shared.len()) {
+                        let word = v(*value).to_le_bytes();
+                        shared[start..start + bytes].copy_from_slice(&word[..bytes]);
+                    }
+                }
+            }
+            vec![]
+        }
+        Op::Atomic {
+            op,
+            place,
+            value,
+            compare,
+            guard,
+        } => {
+            if v(*guard) == 0 {
+                return vec![0];
+            }
+            let (value, compare) = (v(*value), v(*compare));
+            let at = match place {
+                AtomicPlace::Memory(address) => {
+                    Some(u64::from(v(address.low)) | u64::from(v(address.high)) << 32)
+                }
+                AtomicPlace::Buffer {
+                    descriptor,
+                    position,
+                } => BufferView::from_words([
+                    v(descriptor[0]),
+                    v(descriptor[1]),
+                    v(descriptor[2]),
+                    v(descriptor[3]),
+                ])
+                .locate(v(position.index), v(position.offset)),
+                AtomicPlace::Shared(offset) => {
+                    let Some(start) = inside(v(*offset) & !3, 4, shared.len()) else {
+                        return vec![0];
+                    };
+                    let mut word = [0u8; 4];
+                    word.copy_from_slice(&shared[start..start + 4]);
+                    let old = u32::from_le_bytes(word);
+                    let new = eval::atomic(*op, old, value, compare);
+                    shared[start..start + 4].copy_from_slice(&new.to_le_bytes());
+                    return vec![old];
+                }
+            };
+            match at {
+                Some(at) => {
+                    let at = at & !3;
+                    let old = host.load(at, 32);
+                    host.store(at, 32, eval::atomic(*op, old, value, compare));
+                    vec![old]
+                }
+                None => vec![0],
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// Resolves the operation the lanes of `group` wait at, cross-lane or taken
+/// in order, and moves them past it. `group` is sorted by lane number.
+fn resolve(
+    function: &Function,
+    group: &[usize],
+    state: &mut [Lane],
+    host: &mut dyn Host,
+    shared: &mut [u8],
+) -> Result<(), InterpError> {
     let Some(&first) = group.first() else {
         return Ok(());
     };
@@ -520,6 +640,17 @@ fn resolve(function: &Function, group: &[usize], state: &mut [Lane]) -> Result<(
         .insts
         .get(state[first].at)
         .ok_or(InterpError::Invalid("a lane waits past the end of a block"))?;
+    if inst.op.is_ordered() {
+        let result = inst.result.0 as usize;
+        for &lane in group {
+            let results = take_turn(&state[lane], &inst.op, host, shared);
+            for (offset, value) in results.into_iter().enumerate() {
+                state[lane].temps[result + offset] = value;
+            }
+            state[lane].at += 1;
+        }
+        return Ok(());
+    }
     let value = |lane: usize, value: Value| state[lane].value(value);
     let holds = |lane: usize, flag: Value| state[lane].value(flag) != 0;
     let results: Vec<u32> = match &inst.op {
@@ -584,6 +715,33 @@ fn resolve(function: &Function, group: &[usize], state: &mut [Lane]) -> Result<(
             };
             vec![word; group.len()]
         }
+        Op::Reduce {
+            op,
+            value: word,
+            active,
+        } => {
+            // Every lane of the console's wave, with the identity for one
+            // that is not here or takes no part.
+            let mut words = vec![op.identity(); function.wave.lanes()];
+            for &lane in group {
+                if holds(lane, *active) && lane < words.len() {
+                    words[lane] = value(lane, *word);
+                }
+            }
+            vec![eval::reduce(*op, &words); group.len()]
+        }
+        Op::PrefixSum {
+            value: word,
+            active,
+        } => group
+            .iter()
+            .map(|&reader| {
+                group
+                    .iter()
+                    .filter(|&&lane| lane < reader && holds(lane, *active))
+                    .fold(0u32, |sum, &lane| sum.wrapping_add(value(lane, *word)))
+            })
+            .collect(),
         Op::QuadPermute {
             value: word,
             lanes,

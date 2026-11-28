@@ -412,7 +412,48 @@ fn copy_block(function: &mut Function, source: BlockId) -> Block {
 pub(crate) fn map_operands(op: &mut Op, mut change: impl FnMut(&mut Value)) {
     use super::{ImageKind, Level};
     match op {
-        Op::Get(_) | Op::Input(_) => {}
+        Op::Get(_) | Op::Input(_) | Op::LaneIndex | Op::Barrier => {}
+        Op::Atomic {
+            place,
+            value,
+            compare,
+            guard,
+            ..
+        } => {
+            match place {
+                super::AtomicPlace::Memory(address) => {
+                    change(&mut address.low);
+                    change(&mut address.high);
+                }
+                super::AtomicPlace::Buffer {
+                    descriptor,
+                    position,
+                } => {
+                    descriptor.iter_mut().for_each(&mut change);
+                    change(&mut position.index);
+                    change(&mut position.offset);
+                }
+                super::AtomicPlace::Shared(offset) => change(offset),
+            }
+            change(value);
+            change(compare);
+            change(guard);
+        }
+        Op::LoadShared { offset, .. } => change(offset),
+        Op::StoreShared {
+            offset,
+            values,
+            guard,
+            ..
+        } => {
+            change(offset);
+            values.iter_mut().for_each(&mut change);
+            change(guard);
+        }
+        Op::Reduce { value, active, .. } | Op::PrefixSum { value, active } => {
+            change(value);
+            change(active);
+        }
         Op::Set(_, a)
         | Op::Unary(_, a)
         | Op::FlagNot(a)
@@ -617,6 +658,9 @@ fn has_effect(op: &Op) -> bool {
         | Op::StoreMemory { .. }
         | Op::StoreBuffer { .. }
         | Op::StoreFormat { .. }
+        | Op::StoreShared { .. }
+        | Op::Atomic { .. }
+        | Op::Barrier
         | Op::Export { .. }
         | Op::Discard(_) => true,
         Op::Image(image) => matches!(image.kind, super::ImageKind::Store { .. }),

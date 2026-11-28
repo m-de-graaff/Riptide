@@ -9,9 +9,9 @@ use crate::container::testing::{TestElement, TestProgram, dxbc, dxil_part, machi
 use crate::container::xbox::HardwareStage;
 use crate::ir::cfg::{ControlFlow, make_reducible};
 use crate::ir::{
-    Address, AttributeRow, BinaryOp, BlockId, BufferPosition, CompareOp, Dimension, ExportTarget,
-    FlagOp, Function, ImageKind, ImageOp, Input, Interface, Level, Op, Sampler, Terminator,
-    TernaryOp, UnaryOp, Value, Var, VertexTerm, Weights,
+    Address, AtomicOp, AtomicPlace, AttributeRow, BinaryOp, BlockId, BufferPosition, CompareOp,
+    Dimension, ExportTarget, FlagOp, Function, ImageKind, ImageOp, Input, Interface, Level, Op,
+    ReduceOp, Sampler, Terminator, TernaryOp, UnaryOp, Value, Var, VertexTerm, Weights,
 };
 use crate::lift::tests::asm::{self, O};
 
@@ -1363,7 +1363,7 @@ fn a_container_is_translated_from_its_bytes_and_each_failing_step_is_named() {
     assert!(mesh.to_string().starts_with("emit: "));
 
     // An instruction the lift has no rule for names itself.
-    let code = asm::Code::new().i(asm::sopp("s_barrier", 0)).end();
+    let code = asm::Code::new().i(asm::sopp("s_sendmsg", 0)).end();
     let mut program = TestProgram::new(0x28, false, &code);
     program.stage_data = vec![0u8; 0x18C];
     let dxil = dxil_part(1, &[(0x0C, machine_code(&[program]))]);
@@ -1408,4 +1408,349 @@ fn attribute_rows_of_the_interface_do_not_change_what_is_declared() {
     assert!(!shader.source.contains("ROW9"));
     // Nothing to compile against here is needed for the text to be whole.
     let _ = compile(&shader.source, "ps_6_6").map(|result| result.unwrap());
+}
+
+#[test]
+fn reductions_and_prefix_sums_become_wave_intrinsics() {
+    let reductions = [
+        (ReduceOp::Add, "WaveActiveSum("),
+        (ReduceOp::FloatAdd, "WaveActiveSum(asfloat("),
+        (ReduceOp::And, "WaveActiveBitAnd("),
+        (ReduceOp::Or, "WaveActiveBitOr("),
+        (ReduceOp::Xor, "WaveActiveBitXor("),
+        (ReduceOp::MinUnsigned, "WaveActiveMin("),
+        (ReduceOp::MaxUnsigned, "WaveActiveMax("),
+        (ReduceOp::MinSigned, "WaveActiveMin("),
+        (ReduceOp::MaxSigned, "WaveActiveMax("),
+        (ReduceOp::FloatMin, "WaveActiveMin(f_key("),
+        (ReduceOp::FloatMax, "WaveActiveMax(f_key("),
+    ];
+    for (op, intrinsic) in reductions {
+        for stage in [HardwareStage::Compute, HardwareStage::Pixel] {
+            let mut m = Maker::new();
+            let words = match stage {
+                HardwareStage::Pixel => [0, 1, 2].map(|channel| {
+                    m.op(Op::Input(Input::Interpolated {
+                        attribute: 0,
+                        channel,
+                        weights: Weights::PerspectiveCenter,
+                    }))
+                }),
+                _ => three_words(&mut m),
+            };
+            let active = m.op(Op::Compare(CompareOp::UnsignedLess, words[0], words[1]));
+            let folded = m.op(Op::Reduce {
+                op,
+                value: words[2],
+                active,
+            });
+            let function = match stage {
+                HardwareStage::Pixel => exporting(m, [folded; 4]),
+                _ => storing(m, vec![folded]),
+            };
+            let source = emitted(&function).source;
+            assert!(source.contains(intrinsic), "{op:?}\n{source}");
+            // The lanes that take no part count as the identity.
+            assert!(
+                source.contains(&format!("{:#x}u", op.identity()))
+                    || op.identity() == 0 && source.contains(", 0u)"),
+                "{op:?}\n{source}"
+            );
+            // A helper lane of a pixel shader answers for itself.
+            assert_eq!(
+                source.contains("IsHelperLane()"),
+                stage == HardwareStage::Pixel
+            );
+            let profile = if stage == HardwareStage::Pixel {
+                "ps_6_6"
+            } else {
+                "cs_6_6"
+            };
+            assert_compiles(&source, profile);
+        }
+    }
+    let prefix: fn([Value; 3], Value) -> Op = |[a, _, _], flag| Op::PrefixSum {
+        value: a,
+        active: flag,
+    };
+    let index: fn([Value; 3], Value) -> Op = |_, _| Op::LaneIndex;
+    for (op, intrinsic) in [(prefix, "WavePrefixSum("), (index, "WaveGetLaneIndex()")] {
+        let compute = emitted(&cross_lane(HardwareStage::Compute, op)).source;
+        assert!(compute.contains(intrinsic), "{compute}");
+        assert_compiles(&compute, "cs_6_6");
+        let pixel = emitted(&cross_lane(HardwareStage::Pixel, op)).source;
+        assert_compiles(&pixel, "ps_6_6");
+    }
+}
+
+#[test]
+fn atomic_operations_are_interlocked_ones_and_the_signed_ones_are_refused() {
+    let operations = [
+        (AtomicOp::Swap, "InterlockedExchange("),
+        (AtomicOp::CompareSwap, "InterlockedCompareExchange("),
+        (AtomicOp::Add, "InterlockedAdd("),
+        (AtomicOp::Sub, "InterlockedAdd("),
+        (AtomicOp::Increment, "InterlockedAdd("),
+        (AtomicOp::Decrement, "InterlockedAdd("),
+        (AtomicOp::MinUnsigned, "InterlockedMin("),
+        (AtomicOp::MaxUnsigned, "InterlockedMax("),
+        (AtomicOp::And, "InterlockedAnd("),
+        (AtomicOp::Or, "InterlockedOr("),
+        (AtomicOp::Xor, "InterlockedXor("),
+    ];
+    // The three places an atomic operation can work on.
+    let places = |m: &mut Maker| {
+        let descriptor = descriptor(m);
+        let [a, b, _] = three_words(m);
+        [
+            AtomicPlace::Memory(Address { low: a, high: b }),
+            AtomicPlace::Buffer {
+                descriptor,
+                position: BufferPosition {
+                    index: a,
+                    offset: b,
+                },
+            },
+            AtomicPlace::Shared(a),
+        ]
+    };
+    for (op, intrinsic) in operations {
+        let mut m = Maker::new();
+        let [a, b, c] = three_words(&mut m);
+        let guard = m.op(Op::Compare(CompareOp::UnsignedLess, a, b));
+        let mut results = Vec::new();
+        for place in places(&mut m) {
+            results.push(m.op(Op::Atomic {
+                op,
+                place,
+                value: c,
+                compare: b,
+                guard,
+            }));
+        }
+        let source = emitted(&storing(m, results)).source;
+        // Once for title memory, once for the shared memory.
+        assert!(source.matches(intrinsic).count() >= 2, "{op:?}\n{source}");
+        assert!(source.contains("groupshared uint shared_words["));
+        assert_compiles(&source, "cs_6_6");
+    }
+    for op in [AtomicOp::MinSigned, AtomicOp::MaxSigned] {
+        let mut m = Maker::new();
+        let [a, b, c] = three_words(&mut m);
+        let old = m.op(Op::Atomic {
+            op,
+            place: AtomicPlace::Memory(Address { low: a, high: b }),
+            value: c,
+            compare: Value::Word(0),
+            guard: Value::Flag(true),
+        });
+        let error = refused(&storing(m, vec![old]));
+        assert_eq!(error.op, "Atomic");
+        assert!(error.reason.contains("signed"));
+    }
+}
+
+/// A compute function with shared memory of 1,024 bytes and the given
+/// group size, made of the blocks `build` makes.
+fn sharing(group_size: [u32; 3], build: impl FnOnce(&mut Maker)) -> Function {
+    let mut m = Maker::new();
+    build(&mut m);
+    m.function(
+        HardwareStage::Compute,
+        Interface {
+            group_size,
+            shared_bytes: 1024,
+            ..Interface::default()
+        },
+    )
+}
+
+/// Writes the thread's word to the shared memory.
+fn share(m: &mut Maker) {
+    let [a, b, _] = three_words(m);
+    for width in [8, 16, 32] {
+        m.op(Op::StoreShared {
+            offset: a,
+            width,
+            values: vec![b, a],
+            guard: Value::Flag(true),
+        });
+    }
+}
+
+/// Reads the shared memory and stores what was read.
+fn take(m: &mut Maker) {
+    let [a, _, _] = three_words(m);
+    let mut read = Vec::new();
+    for width in [8, 16, 32] {
+        read.extend(m.all(Op::LoadShared {
+            offset: a,
+            width,
+            words: 2,
+        }));
+    }
+    m.op(Op::StoreMemory {
+        address: Address {
+            low: Value::Word(0x1000),
+            high: Value::Word(0),
+        },
+        width: 32,
+        values: read,
+        guard: Value::Flag(true),
+    });
+}
+
+#[test]
+fn a_group_of_one_wave_gets_the_barriers_the_console_did_not_need() {
+    const BARRIER: &str = "GroupMemoryBarrierWithGroupSync();";
+    // A write and then a read, in the one block every thread runs: one
+    // barrier between them.
+    let straight = |m: &mut Maker| {
+        share(m);
+        take(m);
+        m.end(Terminator::Return);
+    };
+    let source = emitted(&sharing([8, 8, 1], straight)).source;
+    assert!(source.contains("static const uint SHARED_BYTES = 1024u;"));
+    assert!(source.contains("groupshared uint shared_words[256];"));
+    assert_eq!(source.matches(BARRIER).count(), 1, "{source}");
+    let barrier = source.find(BARRIER).unwrap();
+    assert!(source.rfind("shared_store(").unwrap() < barrier);
+    assert!(source[barrier..].contains("shared_load("));
+    assert_compiles(&source, "cs_6_6");
+
+    // A group of more than one wave keeps to the title's own barriers, and
+    // a group of one thread needs none.
+    for group in [[16, 8, 1], [1, 1, 1]] {
+        let source = emitted(&sharing(group, straight)).source;
+        assert!(!source.contains(BARRIER), "{source}");
+        assert_compiles(&source, "cs_6_6");
+    }
+
+    // The title's own barrier is written where it is, and is enough.
+    let fenced = |m: &mut Maker| {
+        share(m);
+        m.op(Op::Barrier);
+        take(m);
+        m.end(Terminator::Return);
+    };
+    let source = emitted(&sharing([8, 8, 1], fenced)).source;
+    assert_eq!(source.matches(BARRIER).count(), 1, "{source}");
+    assert_compiles(&source, "cs_6_6");
+
+    // A read, a write and a read again: two barriers.
+    let twice = |m: &mut Maker| {
+        take(m);
+        share(m);
+        take(m);
+        m.end(Terminator::Return);
+    };
+    let source = emitted(&sharing([8, 8, 1], twice)).source;
+    assert_eq!(source.matches(BARRIER).count(), 2, "{source}");
+
+    // Writes on one side of a branch only, read after the join: the
+    // barrier stands at the join, which every thread passes.
+    let branched = |m: &mut Maker| {
+        let [a, b, _] = three_words(m);
+        let flag = m.op(Op::Compare(CompareOp::UnsignedLess, a, b));
+        m.end(Terminator::Branch {
+            condition: flag,
+            if_true: 1,
+            if_false: 2,
+        });
+        share(m);
+        m.end(Terminator::Jump(2));
+        take(m);
+        m.end(Terminator::Return);
+    };
+    let source = emitted(&sharing([8, 8, 1], branched)).source;
+    assert_eq!(source.matches(BARRIER).count(), 1, "{source}");
+    assert_compiles(&source, "cs_6_6");
+}
+
+#[test]
+fn shared_memory_that_no_barrier_can_order_is_refused() {
+    // A read inside a branch after a write before it: only some threads get
+    // to the read, and a barrier has to be reached by all.
+    let inside = |m: &mut Maker| {
+        let [a, b, _] = three_words(m);
+        share(m);
+        let flag = m.op(Op::Compare(CompareOp::UnsignedLess, a, b));
+        m.end(Terminator::Branch {
+            condition: flag,
+            if_true: 1,
+            if_false: 2,
+        });
+        take(m);
+        m.end(Terminator::Jump(2));
+        m.end(Terminator::Return);
+    };
+    // The barrier stands at the end of the block before the branch, which
+    // every thread passes.
+    let source = emitted(&sharing([8, 8, 1], inside)).source;
+    assert_eq!(
+        source.matches("GroupMemoryBarrierWithGroupSync();").count(),
+        1,
+        "{source}"
+    );
+    let barrier = source.find("GroupMemoryBarrierWithGroupSync();").unwrap();
+    assert!(source.rfind("shared_store(").unwrap() < barrier);
+    assert!(source[barrier..].contains("shared_load("));
+    assert_compiles(&source, "cs_6_6");
+
+    // A write and then a read, both inside the branch: no place for a
+    // barrier that every thread reaches lies between them.
+    let both = |m: &mut Maker| {
+        let [a, b, _] = three_words(m);
+        let flag = m.op(Op::Compare(CompareOp::UnsignedLess, a, b));
+        m.end(Terminator::Branch {
+            condition: flag,
+            if_true: 1,
+            if_false: 2,
+        });
+        share(m);
+        take(m);
+        m.end(Terminator::Jump(2));
+        m.end(Terminator::Return);
+    };
+    let error = refused(&sharing([8, 8, 1], both));
+    assert_eq!(error.op, "LoadShared");
+    assert!(error.reason.contains("no barrier can stand"));
+    // The same program in a group of several waves is the title's to
+    // order.
+    assert_compiles(&emitted(&sharing([16, 16, 1], both)).source, "cs_6_6");
+
+    // A write after a read, in a loop.
+    let looped = |m: &mut Maker| {
+        m.end(Terminator::Jump(1));
+        let [a, b, _] = three_words(m);
+        take(m);
+        share(m);
+        let flag = m.op(Op::Compare(CompareOp::UnsignedLess, a, b));
+        m.end(Terminator::Branch {
+            condition: flag,
+            if_true: 1,
+            if_false: 2,
+        });
+        m.end(Terminator::Return);
+    };
+    let error = refused(&sharing([8, 8, 1], looped));
+    assert!(error.reason.contains("no barrier can stand"), "{error}");
+
+    // Outside a compute shader there is no shared memory and no barrier.
+    let mut m = Maker::new();
+    m.op(Op::StoreShared {
+        offset: Value::Word(0),
+        width: 32,
+        values: vec![Value::Word(1)],
+        guard: Value::Flag(true),
+    });
+    m.end(Terminator::Return);
+    let vertex = m.function(HardwareStage::Vertex, Interface::default());
+    assert_eq!(refused(&vertex).op, "LoadShared");
+    let mut m = Maker::new();
+    m.op(Op::Barrier);
+    m.end(Terminator::Return);
+    let vertex = m.function(HardwareStage::Vertex, Interface::default());
+    assert_eq!(refused(&vertex).op, "Barrier");
 }

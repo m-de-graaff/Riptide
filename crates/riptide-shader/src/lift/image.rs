@@ -12,7 +12,7 @@
 
 use super::{Lift, Lifter, name_of};
 use crate::gfx10::{Detail, Instruction, Operand, Role};
-use crate::ir::{BinaryOp, Dimension, ImageKind, ImageOp, Level, Op, Sampler, UnaryOp, Value, Var};
+use crate::ir::{BinaryOp, Dimension, ImageKind, ImageOp, Level, Op, Sampler, UnaryOp, Value};
 
 impl Lifter<'_> {
     /// Lifts an image instruction.
@@ -103,7 +103,7 @@ impl Lifter<'_> {
                 return self.fail("the instruction is not decoded");
             };
             for index in 0..count {
-                address.push(self.emit(Op::Get(Var::Vector(first.wrapping_add(index)))));
+                address.push(self.vector_word(first.wrapping_add(index))?);
             }
         }
         // With 16-bit addresses the gradients, the coordinates and what
@@ -227,7 +227,7 @@ impl Lifter<'_> {
                 let mut register = data.0;
                 for (channel, value) in values.iter_mut().enumerate() {
                     if component_mask >> channel & 1 != 0 {
-                        *value = self.emit(Op::Get(Var::Vector(register)));
+                        *value = self.vector_word(register)?;
                         register = register.wrapping_add(1);
                     }
                 }

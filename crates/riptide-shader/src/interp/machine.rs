@@ -17,6 +17,12 @@
 //! byte permutation, cube faces) and the buffer descriptor are shared with
 //! the reference interpreter through [`crate::ir::eval`], and have their
 //! own tests there.
+//!
+//! Lane permutations, atomic operations and the group-shared memory are
+//! done here as the instruction set describes them, a wave at a time: every
+//! lane reads before any lane writes, and where lanes change memory they do
+//! so in the order of their numbers. A wave is taken to be the whole thread
+//! group, so a barrier is nothing to wait for.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -81,6 +87,8 @@ struct Wave {
     exported: bool,
     /// Whether conversions to 16-bit floats round toward zero.
     half_toward_zero: bool,
+    /// The group-shared memory of a compute program, zeroes at the start.
+    shared: Vec<u8>,
 }
 
 /// Where the program's own code appears in memory: `s_getpc_b64` gives
@@ -158,6 +166,10 @@ pub fn run_machine(
         started,
         exported: false,
         half_toward_zero: false,
+        shared: match data {
+            StageData::Compute(compute) => vec![0; compute.shared_memory_bytes() as usize],
+            _ => Vec::new(),
+        },
     };
     wave.set_mask(EXEC, started);
     let mut machine = Machine {
@@ -235,10 +247,12 @@ impl Machine<'_> {
         })
     }
 
-    /// The lanes that are live, lowest first.
+    /// The lanes that are live, lowest first. A program can make lanes
+    /// live that never started (a wave reduction runs in every lane of the
+    /// wave), so this goes by the live mask alone.
     fn live_lanes(&self) -> Vec<usize> {
         let exec = self.wave.exec();
-        (0..self.lanes)
+        (0..32 * self.mask_words())
             .filter(|&lane| exec >> lane & 1 != 0)
             .collect()
     }
@@ -401,7 +415,7 @@ impl Machine<'_> {
             Format::Smem | Format::Mubuf | Format::Mtbuf | Format::Global | Format::Flat => {
                 self.memory(instruction, name).map(|()| Flow::Next)
             }
-            Format::Ds => self.swizzle(instruction, name).map(|()| Flow::Next),
+            Format::Ds => self.shared(instruction, name).map(|()| Flow::Next),
             Format::Mimg => self.image(instruction, name).map(|()| Flow::Next),
             Format::Exp => self.export(instruction).map(|()| Flow::Next),
             _ => self.fail("a format the machine has no rule for"),
@@ -412,6 +426,9 @@ impl Machine<'_> {
         let _ = instruction;
         let taken = match name {
             "s_nop" | "s_waitcnt" | "s_inst_prefetch" | "s_clause" => return Ok(Flow::Next),
+            // One wave is the whole thread group here, and it is always
+            // all at the same instruction.
+            "s_barrier" => return Ok(Flow::Next),
             "s_branch" => true,
             "s_cbranch_scc0" => !self.wave.scc,
             "s_cbranch_scc1" => self.wave.scc,
@@ -784,34 +801,67 @@ impl Machine<'_> {
         Ok(Some(value))
     }
 
-    /// Source 0 as each lane sees it through a lane permutation within the
-    /// quad: `Some(None)` for a lane that is not written.
+    /// Source 0 as each lane sees it through a lane permutation: `None` for
+    /// a lane that is not written. `before` holds the source register as
+    /// it was when the instruction began, since the instruction may write
+    /// the register it reads.
     fn permuted(
         &self,
-        operand: Operand,
+        before: &[u32; 64],
         permutation: LanePermutation,
         lane: usize,
     ) -> Run<Option<u32>> {
-        let LanePermutation::Rows {
-            control,
-            fetch_inactive,
-            bound_control,
-            ..
-        } = permutation
-        else {
-            return self.fail("a permutation the machine has no rule for");
+        // The lane read, if the permutation names one inside its row; and
+        // what happens to a lane whose read finds nothing.
+        let (source, fetch_inactive, bound_control) = match permutation {
+            // Any lane of the same group of eight.
+            LanePermutation::Eight {
+                lanes,
+                fetch_inactive,
+            } => (
+                Some((lane & !7) + usize::from(lanes[lane & 7] & 7)),
+                fetch_inactive,
+                false,
+            ),
+            LanePermutation::Rows {
+                control,
+                fetch_inactive,
+                bound_control,
+                bank_mask,
+                row_mask,
+            } => {
+                if bank_mask != 0xF || row_mask != 0xF {
+                    return self.fail("a permutation the machine has no rule for");
+                }
+                let place = (lane % 16) as i32;
+                let by = i32::from(control & 0xF);
+                let from = match control {
+                    // Within the group of four.
+                    0x000..=0x0FF => (place & !3) + i32::from(control >> (2 * (lane & 3)) & 3),
+                    // The row moved left: a lane gets the value from above.
+                    0x101..=0x10F => place + by,
+                    // The row moved right: a lane gets the value from below.
+                    0x111..=0x11F => place - by,
+                    // The same going round.
+                    0x121..=0x12F => (place - by + 16) % 16,
+                    // The row back to front, and each half of it.
+                    0x140 => 15 - place,
+                    0x141 => (place & 8) + (7 - (place & 7)),
+                    _ => return self.fail("a permutation the machine has no rule for"),
+                };
+                let source = (0..16)
+                    .contains(&from)
+                    .then(|| lane - lane % 16 + from as usize);
+                (source, fetch_inactive, bound_control)
+            }
         };
-        if control > 0xFF {
-            return self.fail("a permutation the machine has no rule for");
-        }
-        let source = (lane & !3) + usize::from(control >> (2 * (lane & 3)) & 3);
-        let live = self.wave.exec() >> source & 1 != 0;
-        Ok(if live || fetch_inactive {
-            Some(self.lane_word(operand, source)?)
-        } else if bound_control {
-            Some(0)
-        } else {
-            None
+        let found = source
+            .filter(|&source| fetch_inactive || self.wave.exec() >> source & 1 != 0)
+            .filter(|&source| source < 32 * self.mask_words());
+        Ok(match found {
+            Some(source) => Some(before[source]),
+            None if bound_control => Some(0),
+            None => None,
         })
     }
 
@@ -894,6 +944,52 @@ impl Machine<'_> {
                     carry_out |= u64::from(out) << lane;
                 }
                 return self.write_wide(instruction.arg(Role::SecondResult), words, carry_out);
+            }
+            "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
+                // A register pair shifted by the low six bits of the first
+                // operand.
+                let register = self.vector(target)?;
+                for lane in live {
+                    let by = self.lane_word(source(0), lane)? & 63;
+                    let value = match source(1) {
+                        Operand::Vector { first, .. } => {
+                            u64::from(self.wave.v[usize::from(first)][lane])
+                                | u64::from(self.wave.v[usize::from(first) + 1][lane]) << 32
+                        }
+                        other => self.read_wide(other, 2)?,
+                    };
+                    let shifted = match name {
+                        "v_lshlrev_b64" => value << by,
+                        "v_lshrrev_b64" => value >> by,
+                        _ => ((value as i64) >> by) as u64,
+                    };
+                    self.wave.v[register][lane] = shifted as u32;
+                    self.wave.v[register + 1][lane] = (shifted >> 32) as u32;
+                }
+                return Ok(());
+            }
+            "v_permlanex16_b32" => {
+                // Each lane reads a lane of the other row of sixteen in its
+                // half of the wave: which one is the lane's four bits of the
+                // two selector words. Bit 0 of the select field fetches
+                // lanes that are not live; without it such a read gives
+                // zero if bit 1 is set and otherwise leaves the lane as it
+                // was.
+                let register = self.vector(target)?;
+                let before = self.wave.v[self.vector(Some(source(0)))?];
+                let picks =
+                    u64::from(self.read(source(1), 0)?) | u64::from(self.read(source(2), 0)?) << 32;
+                let exec = self.wave.exec();
+                for lane in live {
+                    let other = lane ^ 16;
+                    let from = other - other % 16 + (picks >> (4 * (lane % 16)) & 0xF) as usize;
+                    if modifiers.select & 1 != 0 || exec >> from & 1 != 0 {
+                        self.wave.v[register][lane] = before[from];
+                    } else if modifiers.select & 2 != 0 {
+                        self.wave.v[register][lane] = 0;
+                    }
+                }
+                return Ok(());
             }
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
                 let register = self.vector(target)?;
@@ -990,12 +1086,18 @@ impl Machine<'_> {
             name,
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16"
         );
+        // Every lane reads before any lane writes.
+        let before = match (modifiers.permutation, sources.first()) {
+            (Some(_), Some(&Operand::Vector { first, .. })) => self.wave.v[usize::from(first)],
+            (Some(_), _) => return self.fail("a permutation of something not a register"),
+            (None, _) => [0; 64],
+        };
         for lane in live {
             let mut values = [0u32; 3];
             let mut written = true;
             for (index, &operand) in sources.iter().enumerate().take(3) {
                 let permuted = match (index, modifiers.permutation) {
-                    (0, Some(permutation)) => Some(self.permuted(operand, permutation, lane)?),
+                    (0, Some(permutation)) => Some(self.permuted(&before, permutation, lane)?),
                     _ => None,
                 };
                 if mix {
@@ -1212,6 +1314,32 @@ impl Machine<'_> {
                 let load = name.contains("_load_");
                 let data =
                     self.vector(instruction.arg(if load { Role::Result } else { Role::Data }))?;
+                if name.contains("_atomic_") {
+                    let Detail::Buffer { glc, .. } = instruction.detail else {
+                        return self.fail("a buffer operation without its fields");
+                    };
+                    for lane in self.live_lanes() {
+                        let mut index = 0;
+                        let mut position = u32::from(offset).wrapping_add(extra);
+                        if let Some(mut register) = address {
+                            if index_enable {
+                                index = self.wave.v[register][lane];
+                                register += 1;
+                            }
+                            if offset_enable {
+                                position = position.wrapping_add(self.wave.v[register][lane]);
+                            }
+                        }
+                        let old = match view.locate(index, position) {
+                            Some(at) => self.atomic(name, at, data, lane)?,
+                            None => 0,
+                        };
+                        if glc {
+                            self.wave.v[data][lane] = old;
+                        }
+                    }
+                    return Ok(());
+                }
                 let channels = match name.rsplit('_').next() {
                     Some("x") => 1,
                     Some("xy") => 2,
@@ -1286,9 +1414,10 @@ impl Machine<'_> {
                 }
                 Ok(())
             }
-            Detail::Flat { offset, .. } => {
+            Detail::Flat { offset, glc, .. } => {
                 let load = name.contains("_load_");
-                if !name.contains("dword") {
+                let atomic = name.contains("_atomic_");
+                if !name.contains("dword") && !atomic {
                     return self.fail("a memory operation the machine has no rule for");
                 }
                 let address_register = self.vector(instruction.arg(Role::Address))?;
@@ -1305,6 +1434,15 @@ impl Machine<'_> {
                         None => first | u64::from(self.wave.v[address_register + 1][lane]) << 32,
                     }
                     .wrapping_add(i64::from(offset) as u64);
+                    if atomic {
+                        let old = self.atomic(name, address, data, lane)?;
+                        if let (true, Some(Operand::Vector { first, .. })) =
+                            (glc, instruction.arg(Role::Result))
+                        {
+                            self.wave.v[usize::from(first)][lane] = old;
+                        }
+                        continue;
+                    }
                     for unit in 0..units(name) {
                         let at = address.wrapping_add(4 * unit as u64);
                         if load {
@@ -1320,14 +1458,191 @@ impl Machine<'_> {
         }
     }
 
-    fn swizzle(&mut self, instruction: &Instruction, name: &str) -> Run<()> {
+    /// What an atomic operation makes of the word that was there and its
+    /// operand: the part of the mnemonic after `atomic_` (or, for the
+    /// group-shared memory, after `ds_`) says which.
+    fn atomic_result(kind: &str, old: u32, value: u32, compare: u32) -> Option<u32> {
+        Some(match kind {
+            "swap" | "wrxchg" => value,
+            "cmpswap" | "cmpst" => {
+                if old == compare {
+                    value
+                } else {
+                    old
+                }
+            }
+            "add" => old.wrapping_add(value),
+            "sub" => old.wrapping_sub(value),
+            "smin" | "min_i" => (old as i32).min(value as i32) as u32,
+            "umin" | "min_u" => old.min(value),
+            "smax" | "max_i" => (old as i32).max(value as i32) as u32,
+            "umax" | "max_u" => old.max(value),
+            "and" => old & value,
+            "or" => old | value,
+            "xor" => old ^ value,
+            "inc" => old.wrapping_add(1),
+            "dec" => old.wrapping_sub(1),
+            _ => return None,
+        })
+    }
+
+    /// One lane's atomic operation on the word of memory at an address.
+    /// The operand is in `data`; a compare-and-swap has the new word there
+    /// and the comparand in the register after it. Returns the old word.
+    fn atomic(&mut self, name: &str, address: u64, data: usize, lane: usize) -> Run<u32> {
+        let kind = name.split_once("_atomic_").map_or("", |(_, kind)| kind);
+        let at = address & !3;
+        let old = self.host.load(at, 32);
+        let value = self.wave.v[data][lane];
+        let compare = self.wave.v[(data + 1) % 256][lane];
+        match Self::atomic_result(kind, old, value, compare) {
+            Some(new) => {
+                self.host.store(at, 32, new);
+                Ok(old)
+            }
+            None => self.fail("an atomic operation the machine has no rule for"),
+        }
+    }
+
+    /// The group-shared memory: reads, writes and atomic operations at the
+    /// lane's address plus a constant, one lane after another; and the lane
+    /// swizzle that is encoded as one of its operations.
+    fn shared(&mut self, instruction: &Instruction, name: &str) -> Run<()> {
         let Detail::Lds {
             offset0, offset1, ..
         } = instruction.detail
         else {
             return self.fail("a shared-memory operation without its fields");
         };
-        if name != "ds_swizzle_b32" || offset1 & 0x80 == 0 {
+        if name == "ds_swizzle_b32" {
+            return self.swizzle(instruction, offset0, offset1);
+        }
+        let Some((kind, ty)) = name
+            .strip_prefix("ds_")
+            .and_then(|rest| rest.rsplit_once('_'))
+        else {
+            return self.fail("a shared-memory operation the machine has no rule for");
+        };
+        // The size of a unit in bytes, and whether a read extends its sign.
+        let (bytes, signed) = match ty {
+            "b8" | "u8" => (1usize, false),
+            "i8" => (1, true),
+            "b16" | "u16" => (2, false),
+            "i16" => (2, true),
+            "b32" | "u32" | "i32" => (4, false),
+            _ => return self.fail("a shared-memory operation the machine has no rule for"),
+        };
+        let address = self.vector(instruction.arg(Role::Address))?;
+        // The forms on two addresses count their offsets in units, the
+        // `st64` ones in 64 units.
+        let (kind, offsets): (&str, Vec<usize>) = match kind {
+            "read2" | "write2" => (
+                kind.trim_end_matches('2'),
+                vec![usize::from(offset0) * bytes, usize::from(offset1) * bytes],
+            ),
+            "read2st64" | "write2st64" => (
+                &kind[..kind.len() - 5],
+                vec![
+                    usize::from(offset0) * bytes * 64,
+                    usize::from(offset1) * bytes * 64,
+                ],
+            ),
+            _ => (kind, vec![usize::from(offset0) | usize::from(offset1) << 8]),
+        };
+        let data: Vec<usize> = instruction
+            .args
+            .iter()
+            .filter(|arg| arg.role == Role::Data)
+            .filter_map(|arg| match arg.operand {
+                Operand::Vector { first, .. } => Some(usize::from(first)),
+                _ => None,
+            })
+            .collect();
+        let result = match instruction.arg(Role::Result) {
+            Some(Operand::Vector { first, .. }) => Some(usize::from(first)),
+            _ => None,
+        };
+        let size = self.wave.shared.len();
+        // Where a unit starts, if all of it is inside the memory.
+        let inside = |start: usize, bytes: usize| start <= size && bytes <= size - start;
+        for lane in self.live_lanes() {
+            let base = self.wave.v[address][lane] as usize;
+            match kind {
+                "read" => {
+                    let Some(result) = result else {
+                        return self.fail("a shared-memory read without a result");
+                    };
+                    // Every address is read before a register is written.
+                    let mut values = Vec::new();
+                    for &offset in &offsets {
+                        let start = (base as u32).wrapping_add(offset as u32) as usize;
+                        let mut value = 0u32;
+                        if inside(start, bytes) {
+                            for byte in (0..bytes).rev() {
+                                value = value << 8 | u32::from(self.wave.shared[start + byte]);
+                            }
+                        }
+                        if signed && bytes < 4 && value >> (8 * bytes - 1) & 1 != 0 {
+                            value |= u32::MAX << (8 * bytes);
+                        }
+                        values.push(value);
+                    }
+                    for (index, value) in values.into_iter().enumerate() {
+                        self.wave.v[result + index][lane] = value;
+                    }
+                }
+                "write" => {
+                    for (&offset, &register) in offsets.iter().zip(&data) {
+                        let start = (base as u32).wrapping_add(offset as u32) as usize;
+                        if inside(start, bytes) {
+                            let word = self.wave.v[register][lane].to_le_bytes();
+                            self.wave.shared[start..start + bytes].copy_from_slice(&word[..bytes]);
+                        }
+                    }
+                }
+                _ => {
+                    // An atomic operation on a word; the forms named `rtn`
+                    // give the word as it was.
+                    let returns = kind.ends_with("_rtn");
+                    let kind = kind.trim_end_matches("_rtn");
+                    let key = match (kind, ty) {
+                        ("min" | "max", "i32") => format!("{kind}_i"),
+                        ("min" | "max", "u32") => format!("{kind}_u"),
+                        _ => kind.to_string(),
+                    };
+                    // A compare-and-store has the comparand first.
+                    let (value, compare) = match (kind, data.as_slice()) {
+                        ("cmpst", &[compare, new]) => {
+                            (self.wave.v[new][lane], self.wave.v[compare][lane])
+                        }
+                        (_, &[value, ..]) => (self.wave.v[value][lane], 0),
+                        _ => return self.fail("a shared-memory operation without its operand"),
+                    };
+                    let start = ((base as u32).wrapping_add(offsets[0] as u32) & !3) as usize;
+                    let mut old = 0;
+                    if bytes == 4 && inside(start, 4) {
+                        let mut word = [0u8; 4];
+                        word.copy_from_slice(&self.wave.shared[start..start + 4]);
+                        old = u32::from_le_bytes(word);
+                        let Some(new) = Self::atomic_result(&key, old, value, compare) else {
+                            return self
+                                .fail("a shared-memory operation the machine has no rule for");
+                        };
+                        self.wave.shared[start..start + 4].copy_from_slice(&new.to_le_bytes());
+                    } else if bytes != 4 {
+                        return self.fail("a shared-memory operation the machine has no rule for");
+                    }
+                    if let (true, Some(result)) = (returns, result) {
+                        self.wave.v[result][lane] = old;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn swizzle(&mut self, instruction: &Instruction, offset0: u8, offset1: u8) -> Run<()> {
+        if offset1 & 0x80 == 0 {
             return self.fail("a shared-memory operation the machine has no rule for");
         }
         let target = self.vector(instruction.arg(Role::Result))?;
@@ -1619,6 +1934,17 @@ fn vector_result(name: &str, s: [u32; 3], half_toward_zero: bool) -> Option<u32>
                 | u32::from(eval::half_from_float(y, true)) << 16,
         ),
         "v_pack_b32_f16" => Some(a & 0xFFFF | b << 16),
+        "v_cvt_pk_u8_f32" => {
+            // To the nearest whole number, ties to even, within 0..255; a
+            // NaN gives 0. Into byte `b` of `c`.
+            let byte = if x.is_nan() {
+                0
+            } else {
+                x.round_ties_even().clamp(0.0, 255.0) as u32
+            };
+            let shift = 8 * (b & 3);
+            Some(c & !(0xFF << shift) | byte << shift)
+        }
         "v_add_nc_u32" => Some(a.wrapping_add(b)),
         "v_sub_nc_u32" => Some(a.wrapping_sub(b)),
         "v_subrev_nc_u32" => Some(b.wrapping_sub(a)),

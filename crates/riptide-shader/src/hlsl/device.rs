@@ -37,8 +37,8 @@ use crate::interp::{Host, run_wave};
 use crate::ir::cfg::make_reducible;
 use crate::ir::eval::{self, BufferFormat};
 use crate::ir::{
-    Address, BinaryOp, BufferPosition, CompareOp, ExportTarget, FlagOp, Function, ImageOp, Input,
-    Interface, Op, Terminator, TernaryOp, UnaryOp, Value, Var,
+    Address, AtomicOp, AtomicPlace, BinaryOp, BufferPosition, CompareOp, ExportTarget, FlagOp,
+    Function, ImageOp, Input, Interface, Op, Terminator, TernaryOp, UnaryOp, Value, Var,
 };
 
 use super::testing::{Maker, compile};
@@ -1391,5 +1391,376 @@ fn on_a_device_structured_control_flow_takes_the_paths_of_the_graph() {
     assert!(
         with_flag >= 5,
         "only {with_flag} graphs needed a jump out of several scopes"
+    );
+}
+
+#[test]
+#[ignore = "needs the shader compiler and a D3D12 device"]
+fn on_a_device_atomic_operations_change_memory_as_the_interpreter_does() {
+    const GROUPS: u32 = 4;
+    let targets = 0x2_0000_0000u64;
+    let mut m = Maker::new();
+    let (lane, operands) = lane_start(&mut m, 8);
+    let loaded = m.all(Op::LoadMemory {
+        address: operands,
+        width: 32,
+        words: 2,
+    });
+    let (a, b) = (loaded[0], loaded[1]);
+    // Eight words that the lanes of every group work on together, for each
+    // operation whose result does not depend on the order: the lanes pick
+    // their word by an operand.
+    let word = m.op(Op::Binary(BinaryOp::And, a, Value::Word(7)));
+    let shared = m.op(Op::Binary(BinaryOp::ShiftLeft, word, Value::Word(2)));
+    let even = m.op(Op::Binary(BinaryOp::And, lane, Value::Word(1)));
+    let even = m.op(Op::Compare(CompareOp::Equal, even, Value::Word(0)));
+    let together = [
+        AtomicOp::Add,
+        AtomicOp::Sub,
+        AtomicOp::Increment,
+        AtomicOp::Decrement,
+        AtomicOp::MinUnsigned,
+        AtomicOp::MaxUnsigned,
+        AtomicOp::And,
+        AtomicOp::Or,
+        AtomicOp::Xor,
+    ];
+    // A buffer over the page of those words: 4 bytes to a record, 512
+    // records, bound by index and offset.
+    let view = [
+        Value::Word(targets as u32),
+        Value::Word((targets >> 32) as u32 | 4 << 16),
+        Value::Word(512),
+        Value::Word(0),
+    ];
+    for (index, &op) in together.iter().enumerate() {
+        // By address, with a low bit set that has to be ignored; and
+        // through the buffer, by every second lane.
+        let low = m.op(Op::Binary(
+            BinaryOp::Add,
+            shared,
+            Value::Word(targets as u32 + 0x40 * index as u32 + 1),
+        ));
+        m.op(Op::Atomic {
+            op,
+            place: AtomicPlace::Memory(Address {
+                low,
+                high: Value::Word((targets >> 32) as u32),
+            }),
+            value: b,
+            compare: Value::Word(0),
+            guard: Value::Flag(true),
+        });
+        let record = m.op(Op::Binary(
+            BinaryOp::Add,
+            word,
+            Value::Word(0x100 + 0x10 * index as u32),
+        ));
+        m.op(Op::Atomic {
+            op,
+            place: AtomicPlace::Buffer {
+                descriptor: view,
+                position: BufferPosition {
+                    index: record,
+                    offset: Value::Word(0),
+                },
+            },
+            value: b,
+            compare: Value::Word(0),
+            guard: even,
+        });
+    }
+    // The operations whose result does depend on the order, and the words
+    // the operations give back, on words of the lane's own: its results.
+    let bytes = 4 * 16;
+    let out = results_at(&mut m, lane, bytes);
+    let own = |m: &mut Maker, word: u32| Address {
+        low: m.op(Op::Binary(BinaryOp::Add, out.low, Value::Word(4 * word))),
+        high: Value::Word(0),
+    };
+    let mut results = Vec::new();
+    for (word, (op, compare)) in [
+        (AtomicOp::Swap, Value::Word(0)),
+        // The words start as the lane's number: one comparison holds, the
+        // other does not.
+        (AtomicOp::CompareSwap, lane),
+        (AtomicOp::CompareSwap, a),
+        (AtomicOp::Add, Value::Word(0)),
+        (AtomicOp::MaxUnsigned, Value::Word(0)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let place = AtomicPlace::Memory(own(&mut m, word as u32));
+        results.push(m.op(Op::Atomic {
+            op,
+            place,
+            value: b,
+            compare,
+            guard: Value::Flag(true),
+        }));
+    }
+    // Nothing happens, and zero comes back: with the guard clear, outside
+    // the buffer, and where no memory is mapped.
+    let place = AtomicPlace::Memory(own(&mut m, 5));
+    results.push(m.op(Op::Atomic {
+        op: AtomicOp::Add,
+        place,
+        value: b,
+        compare: Value::Word(0),
+        guard: Value::Flag(false),
+    }));
+    results.push(m.op(Op::Atomic {
+        op: AtomicOp::Add,
+        place: AtomicPlace::Buffer {
+            descriptor: view,
+            position: BufferPosition {
+                index: Value::Word(512),
+                offset: Value::Word(0),
+            },
+        },
+        value: b,
+        compare: Value::Word(0),
+        guard: Value::Flag(true),
+    }));
+    results.push(m.op(Op::Atomic {
+        op: AtomicOp::Or,
+        place: AtomicPlace::Memory(Address {
+            low: a,
+            high: Value::Word(9),
+        }),
+        value: b,
+        compare: Value::Word(0),
+        guard: Value::Flag(true),
+    }));
+    let address = own(&mut m, 8);
+    m.op(Op::StoreMemory {
+        address,
+        width: 32,
+        values: results,
+        guard: Value::Flag(true),
+    });
+    m.end(Terminator::Return);
+    let function = m.function(HardwareStage::Compute, groups_of_64());
+
+    let lanes = GROUPS * 64;
+    let result_pages = (lanes * bytes).div_ceil(PAGE as u32) as u64;
+    let mut pages = vec![OPERANDS >> 16, targets >> 16];
+    pages.extend((0..result_pages).map(|page| (RESULTS >> 16) + page));
+    let mut memory = Memory::new(&pages);
+    for index in 0..PAGE {
+        memory.pages[1].1[index] = mix(index as u64 ^ 0x1234) as u8;
+    }
+    for lane in 0..lanes {
+        let at = OPERANDS + u64::from(lane * 8);
+        memory.set_word(at, operand(lane, 0));
+        memory.set_word(at + 4, operand(lane, 1));
+        for word in 0..8 {
+            memory.set_word(RESULTS + u64::from(lane * bytes + 4 * word), lane);
+        }
+    }
+    let gpu = Gpu::new(pages.len());
+    check(
+        gpu.as_ref(),
+        &function,
+        &memory,
+        &inputs(),
+        GROUPS,
+        |_, expected, got| expected == got,
+    );
+}
+
+#[test]
+#[ignore = "needs the shader compiler and a D3D12 device"]
+fn on_a_device_threads_see_the_shared_memory_as_the_lanes_of_a_wave_do() {
+    const GROUPS: u32 = 3;
+    let mut m = Maker::new();
+    let (lane, operands) = lane_start(&mut m, 8);
+    let thread = m.op(Op::Input(Input::ThreadId(0)));
+    let loaded = m.all(Op::LoadMemory {
+        address: operands,
+        width: 32,
+        words: 2,
+    });
+    let (a, b) = (loaded[0], loaded[1]);
+    let first = m.op(Op::Compare(CompareOp::Equal, thread, Value::Word(0)));
+    // Every thread writes two words at its own place, and bytes and halves
+    // at odd places of its own further on. The first thread also clears
+    // the words the atomic operations will work on.
+    let place = m.op(Op::Binary(BinaryOp::ShiftLeft, thread, Value::Word(3)));
+    m.op(Op::StoreShared {
+        offset: place,
+        width: 32,
+        values: vec![a, b],
+        guard: Value::Flag(true),
+    });
+    let odd = m.op(Op::Binary(BinaryOp::Add, place, Value::Word(0x401)));
+    m.op(Op::StoreShared {
+        offset: odd,
+        width: 8,
+        values: vec![a],
+        guard: Value::Flag(true),
+    });
+    let odd_half = m.op(Op::Binary(BinaryOp::Add, place, Value::Word(0x403)));
+    m.op(Op::StoreShared {
+        offset: odd_half,
+        width: 16,
+        values: vec![b, a],
+        guard: Value::Flag(true),
+    });
+    let cleared = [0x0u32, 0xFFFF_FFFF, 0, 0, 0xFFFF_FFFF, 0, 0x1234_5678, 0];
+    m.op(Op::StoreShared {
+        offset: Value::Word(0x800),
+        width: 32,
+        values: cleared.iter().map(|&word| Value::Word(word)).collect(),
+        guard: first,
+    });
+    // Past the end, and across it: dropped.
+    m.op(Op::StoreShared {
+        offset: Value::Word(0x1000),
+        width: 32,
+        values: vec![a],
+        guard: Value::Flag(true),
+    });
+    m.op(Op::StoreShared {
+        offset: Value::Word(0xFFE),
+        width: 32,
+        values: vec![a],
+        guard: Value::Flag(true),
+    });
+    // Each thread reads what the thread opposite wrote: on the console a
+    // later instruction of the same wave, here after a barrier the emitter
+    // adds.
+    let opposite = m.op(Op::Binary(BinaryOp::Sub, Value::Word(63), thread));
+    let there = m.op(Op::Binary(BinaryOp::ShiftLeft, opposite, Value::Word(3)));
+    let mut results = m.all(Op::LoadShared {
+        offset: there,
+        width: 32,
+        words: 2,
+    });
+    let odd = m.op(Op::Binary(BinaryOp::Add, there, Value::Word(0x401)));
+    results.extend(m.all(Op::LoadShared {
+        offset: odd,
+        width: 8,
+        words: 1,
+    }));
+    let odd_half = m.op(Op::Binary(BinaryOp::Add, there, Value::Word(0x403)));
+    results.extend(m.all(Op::LoadShared {
+        offset: odd_half,
+        width: 16,
+        words: 2,
+    }));
+    // A word across two words of the memory, and reads past the end.
+    let across = m.op(Op::Binary(BinaryOp::Add, there, Value::Word(3)));
+    results.extend(m.all(Op::LoadShared {
+        offset: across,
+        width: 32,
+        words: 1,
+    }));
+    for offset in [0xFFE, 0x1000, 0xFFFF_FFFF] {
+        results.extend(m.all(Op::LoadShared {
+            offset: Value::Word(offset),
+            width: 32,
+            words: 1,
+        }));
+    }
+    // The atomic operations of all threads on the words the first cleared,
+    // one word each; then every thread reads what they came to.
+    for (index, op) in [
+        AtomicOp::Add,
+        AtomicOp::MinUnsigned,
+        AtomicOp::MaxUnsigned,
+        AtomicOp::Or,
+        AtomicOp::And,
+        AtomicOp::Xor,
+        AtomicOp::Sub,
+        AtomicOp::Increment,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        m.op(Op::Atomic {
+            op,
+            place: AtomicPlace::Shared(Value::Word(0x800 + 4 * index as u32)),
+            value: a,
+            compare: Value::Word(0),
+            guard: Value::Flag(true),
+        });
+    }
+    // Past the end: nothing, and zero back.
+    results.push(m.op(Op::Atomic {
+        op: AtomicOp::Add,
+        place: AtomicPlace::Shared(Value::Word(0x1000)),
+        value: a,
+        compare: Value::Word(0),
+        guard: Value::Flag(true),
+    }));
+    results.extend(m.all(Op::LoadShared {
+        offset: Value::Word(0x800),
+        width: 32,
+        words: 8,
+    }));
+    // An exchange and a compare-and-swap on the thread's own word give
+    // back what was there.
+    m.op(Op::Barrier);
+    for (op, compare) in [(AtomicOp::Swap, Value::Word(0)), (AtomicOp::CompareSwap, b)] {
+        results.push(m.op(Op::Atomic {
+            op,
+            place: AtomicPlace::Shared(place),
+            value: lane,
+            compare,
+            guard: Value::Flag(true),
+        }));
+    }
+    results.extend(m.all(Op::LoadShared {
+        offset: place,
+        width: 32,
+        words: 1,
+    }));
+    let bytes = results.len() as u32 * 4;
+    let address = results_at(&mut m, lane, bytes);
+    m.op(Op::StoreMemory {
+        address,
+        width: 32,
+        values: results,
+        guard: Value::Flag(true),
+    });
+    m.end(Terminator::Return);
+    let function = m.function(
+        HardwareStage::Compute,
+        Interface {
+            shared_bytes: 0x1000,
+            ..groups_of_64()
+        },
+    );
+    // The program has one barrier of its own; the emitter adds one at every
+    // other change between writing, reading and atomic operations.
+    let source = emit(&function, Signatures::default(), &Options::default())
+        .unwrap()
+        .source;
+    assert_eq!(
+        source.matches("GroupMemoryBarrierWithGroupSync();").count(),
+        5,
+        "{source}"
+    );
+
+    let lanes = GROUPS * 64;
+    let result_pages = (lanes * bytes).div_ceil(PAGE as u32) as u64;
+    let mut pages = vec![OPERANDS >> 16];
+    pages.extend((0..result_pages).map(|page| (RESULTS >> 16) + page));
+    let mut memory = Memory::new(&pages);
+    for lane in 0..lanes {
+        let at = OPERANDS + u64::from(lane * 8);
+        memory.set_word(at, operand(lane, 0));
+        memory.set_word(at + 4, operand(lane, 1));
+    }
+    let gpu = Gpu::new(pages.len());
+    check(
+        gpu.as_ref(),
+        &function,
+        &memory,
+        &inputs(),
+        GROUPS,
+        |_, expected, got| expected == got,
     );
 }

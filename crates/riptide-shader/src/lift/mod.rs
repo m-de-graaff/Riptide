@@ -21,9 +21,12 @@
 //!   operands are; the constants 0 and -1 are both. A mask becomes the
 //!   lane's own bit, a flag. Where a mask is read as a number (a bit count,
 //!   a first set bit) or a number as a mask, the lift writes the explicit
-//!   cross-lane operation for it. A register that holds a mask on one path
-//!   into a join and a number on another, and is read after the join, fails
-//!   the program.
+//!   cross-lane operation for it. Where a register holds a mask on one path
+//!   into a join and a number on another, both forms are made on the way
+//!   in: the lane's own bit of the number on the one path, the lanes' bits
+//!   gathered into a number on the other. Whatever reads the register after
+//!   the join then finds the form it wants, and the form nothing reads is
+//!   removed with the other dead writes.
 //! - **Branches.** The console branches the whole wave: "no lane is live",
 //!   "some lane's bit is set". The lane branches on its own bit. That is
 //!   sound for code a compiler made, because such a branch only skips work
@@ -36,6 +39,18 @@
 //!   result is not zero", that is, some lane's bit is set. For a branch the
 //!   lane uses its own bit. Anything else that reads it (a select, a carry)
 //!   gets [`Op::AnyLane`] of it.
+//! - **Whole-wave sections.** A wave reduction or prefix sum is written out
+//!   by the console's compiler as code that runs in every lane and reads
+//!   lanes by their numbers. Such a section is lifted as a whole, to
+//!   [`Op::Reduce`] or [`Op::PrefixSum`]: see the `wave` module. Outside
+//!   such a section a lane permutation that leaves the lane's group of four
+//!   fails the program.
+//! - **What the lanes share.** Atomic operations and the group-shared
+//!   memory of a compute program are lifted to operations that say so
+//!   ([`Op::Atomic`], [`Op::LoadShared`], [`Op::StoreShared`],
+//!   [`Op::Barrier`]). The console does each for the whole wave at one
+//!   instruction; the reference interpreter keeps that order, and an
+//!   emitter has to make it hold on the host.
 //!
 //! # Inputs
 //!
@@ -54,15 +69,18 @@
 //! # What is not lifted
 //!
 //! Mesh programs and the stages the title does not use; a compute program
-//! whose parameters are spilled to memory; group-shared memory; 64-bit
-//! floats; and whatever [`LiftError`] names. `examples/coverage.rs` counts
-//! these over a folder of containers.
+//! whose parameters are spilled to memory; lane reads across groups of
+//! four that are not part of a wave reduction; atomic operations on 64-bit
+//! words, on floats and on images; 64-bit floats; and whatever
+//! [`LiftError`] names. `examples/coverage.rs` counts these over a folder
+//! of containers.
 
 mod image;
 mod memory;
 mod park;
 mod scalar;
 mod vector;
+mod wave;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -123,9 +141,29 @@ const TRUE: u8 = 8;
 /// `s_getpc_b64`; the register above it holds the high half of the address.
 const CODE: u8 = 16;
 
-/// How many scalar register codes the state follows: s0 to s105 and room
-/// for a pair starting at the last.
+/// The register holds what a whole-wave section left in it and the lift did
+/// not follow (`lift/wave.rs`). It cannot be read.
+const LEFT: u8 = 32;
+
+/// How many scalar register codes the state follows: s0 to s105 and, at
+/// the two codes after them, the two halves of `VCC`.
 const SCALARS: usize = 108;
+
+/// The place of `VCC` among the scalar registers the state follows. It
+/// holds a lane mask, in [`Var::Vcc`], unless a program has run out of
+/// scalar registers and keeps a number in it, which is then in
+/// [`Var::Scalar`] of this number (and of the next for the high half).
+const VCC: usize = 106;
+
+/// The variable that holds the lane's bit of the mask that starts at a
+/// register.
+fn mask_var(register: u8) -> Var {
+    if usize::from(register) == VCC {
+        Var::Vcc
+    } else {
+        Var::Mask(register)
+    }
+}
 
 /// What the condition code holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +204,8 @@ enum Exported {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct State {
     /// For each scalar register, the forms it holds: bits [`NUM`], [`MASK`],
-    /// [`HIGH`], [`TRUE`], [`CODE`]. No bit means the paths disagree.
+    /// [`HIGH`], [`TRUE`], [`CODE`], [`LEFT`]. No bit means the paths
+    /// disagree.
     forms: [u8; SCALARS],
     /// For each scalar register, its number if that is a known constant.
     constants: [Option<u32>; SCALARS],
@@ -181,30 +220,97 @@ struct State {
     /// Which of a pixel program's weight registers still hold the weight
     /// the stage handed over: bit n for entry n of `Lifter::weights`.
     pristine: u16,
+    /// The vector registers that hold what a whole-wave section left in
+    /// them and the lift did not follow: bit n of word n / 64 for `v<n>`.
+    left: [u64; 4],
+    /// The scalar registers that hold a mask on one path here and a number
+    /// on another, and for which both forms are made on the way in: bit n
+    /// of word n / 64 for register n.
+    both: [u64; 2],
 }
 
 impl State {
     /// The state at the start of a program.
     fn start() -> State {
+        let mut forms = [NUM; SCALARS];
+        forms[VCC] = MASK;
+        forms[VCC + 1] = HIGH;
         State {
-            forms: [NUM; SCALARS],
+            forms,
             constants: [None; SCALARS],
             condition: Condition::Uniform,
             live: true,
             exported: Exported::No,
             half_rounding: Rounding::Nearest,
             pristine: u16::MAX,
+            left: [0; 4],
+            both: [0; 2],
         }
     }
 
-    /// Narrows this state to what also holds in `other`. Returns whether
-    /// anything changed.
-    fn meet(&mut self, other: &State) -> bool {
+    /// Whether both forms of a register are made on the way in.
+    fn makes_both(&self, index: usize) -> bool {
+        self.both[index / 64] >> (index % 64) & 1 != 0
+    }
+
+    /// Whether this state can give both forms of the lane mask that starts
+    /// at a register: it holds the mask, or the number in as many
+    /// registers as a mask takes. A number that is a known constant does
+    /// not count: its bits would be read by the console's lane numbers,
+    /// and where such a register meets a mask it is most often a constant
+    /// some earlier code left behind.
+    fn gives_both(&self, index: usize, wide: bool) -> bool {
+        let high = if wide {
+            self.forms[index + 1]
+        } else {
+            NUM | HIGH
+        };
+        let constant =
+            self.constants[index].is_some() && (!wide || self.constants[index + 1].is_some());
+        (self.forms[index] & MASK != 0 && high & HIGH != 0)
+            || (self.forms[index] & NUM != 0 && high & NUM != 0 && !constant)
+    }
+
+    /// Narrows this state to what also holds in `other`, which comes in
+    /// along another path. Returns whether anything changed. `wide` says a
+    /// lane mask takes two registers.
+    ///
+    /// A register that holds a mask here and a number there (or the other
+    /// way about) is not given up: from then on it holds both, and
+    /// [`Lifter::convert`] makes the missing form at the end of each block
+    /// that comes in, for as long as every such block has one of the two.
+    fn meet(&mut self, other: &State, wide: bool) -> bool {
         let before = self.clone();
         for index in 0..SCALARS {
             self.forms[index] &= other.forms[index];
             if self.constants[index] != other.constants[index] {
                 self.constants[index] = None;
+            }
+        }
+        for index in 0..SCALARS - 1 {
+            let (mine, theirs) = (before.forms[index], other.forms[index]);
+            if before.makes_both(index) {
+                // Decided earlier. The high half of a mask follows its
+                // start, which is the register before.
+                if mine & MASK != 0 || mine & HIGH == 0 {
+                    let kept = mine & (NUM | MASK) != 0 && other.gives_both(index, wide);
+                    self.forms[index] = if kept { NUM | MASK } else { 0 };
+                    if wide && before.makes_both(index + 1) {
+                        self.forms[index + 1] = if kept { NUM | HIGH } else { 0 };
+                    }
+                }
+                continue;
+            }
+            let only = |forms: u8, wanted: u8| forms & (NUM | MASK) == wanted;
+            let split =
+                (only(mine, MASK) && only(theirs, NUM)) || (only(mine, NUM) && only(theirs, MASK));
+            if split && before.gives_both(index, wide) && other.gives_both(index, wide) {
+                self.forms[index] = NUM | MASK;
+                self.both[index / 64] |= 1 << (index % 64);
+                if wide {
+                    self.forms[index + 1] = NUM | HIGH;
+                    self.both[(index + 1) / 64] |= 1 << ((index + 1) % 64);
+                }
             }
         }
         if self.condition != other.condition {
@@ -218,6 +324,9 @@ impl State {
             self.half_rounding = Rounding::Unknown;
         }
         self.pristine &= other.pristine;
+        for (left, other) in self.left.iter_mut().zip(&other.left) {
+            *left |= other;
+        }
         *self != before
     }
 }
@@ -333,7 +442,9 @@ pub fn lift(program: &Program, data: &StageData) -> Result<Function, LiftError> 
     // Scalars a compiler parked in lanes of a vector register become
     // variables of their own; what that leaves unread goes next.
     park::unpark(&mut function);
-    remove_dead(&mut function);
+    // Removing one dead write can leave the reads that fed it dead in
+    // turn, so this goes round until nothing more is removed.
+    while remove_dead(&mut function) != 0 {}
     if make_reducible(&mut function).is_none() {
         return Err(fail(
             "the program",
@@ -557,6 +668,7 @@ impl<'a> Lifter<'a> {
         let entry_state = self.state.clone();
 
         // Each machine block's entry state, to a fixed point.
+        let wide = self.mask_words() == 2;
         let mut entry: Vec<Option<State>> = vec![None; self.starts.len()];
         entry[0] = Some(entry_state);
         let mut work = vec![0usize];
@@ -573,7 +685,7 @@ impl<'a> Lifter<'a> {
             let lifted = self.block(block, state)?;
             for (successor, out) in lifted.out {
                 let changed = match &mut entry[successor] {
-                    Some(known) => known.meet(&out),
+                    Some(known) => known.meet(&out, wide),
                     slot @ None => {
                         *slot = Some(out);
                         true
@@ -605,11 +717,19 @@ impl<'a> Lifter<'a> {
             insts: entry_insts,
             terminator: Terminator::Jump(target(&number, 0)),
         }];
-        for (block, state) in entry.into_iter().enumerate() {
-            let Some(state) = state else {
+        for (block, state) in entry.iter().enumerate() {
+            let Some(state) = state.clone() else {
                 continue;
             };
-            let lifted = self.block(block, state)?;
+            let mut lifted = self.block(block, state)?;
+            // What the blocks after this one expect that it does not have.
+            self.insts = std::mem::take(&mut lifted.insts);
+            for (successor, out) in &lifted.out {
+                if let Some(wanted) = &entry[*successor] {
+                    self.convert(out, wanted)?;
+                }
+            }
+            lifted.insts = std::mem::take(&mut self.insts);
             let terminator = match lifted.end {
                 End::Jump(to) => Terminator::Jump(target(&number, to)),
                 End::Branch {
@@ -655,7 +775,10 @@ impl<'a> Lifter<'a> {
                     })
                     .collect();
             }
-            StageData::Compute(compute) => interface.group_size = compute.group_size,
+            StageData::Compute(compute) => {
+                interface.group_size = compute.group_size;
+                interface.shared_bytes = compute.shared_memory_bytes();
+            }
             _ => {}
         }
         Ok(Function {
@@ -666,6 +789,58 @@ impl<'a> Lifter<'a> {
             interface,
             code,
         })
+    }
+
+    /// At the end of a block: makes the forms of scalar registers that the
+    /// next block expects (`wanted`) and this one does not have (`have`).
+    /// A number becomes the lane's own bit of it; a mask becomes the lanes'
+    /// bits gathered into a number.
+    fn convert(&mut self, have: &State, wanted: &State) -> Lift<()> {
+        let wide = self.mask_words() == 2;
+        self.at = (None, "the program");
+        for index in 0..SCALARS - 1 {
+            let register = index as u8;
+            let (mine, theirs) = (have.forms[index], wanted.forms[index]);
+            let missing = theirs & !mine;
+            let flag = |lifter: &mut Self, start: u8| {
+                if have.forms[usize::from(start)] & TRUE != 0 {
+                    Value::Flag(true)
+                } else {
+                    lifter.emit(Op::Get(mask_var(start)))
+                }
+            };
+            if missing & MASK != 0 {
+                if !(mine & NUM != 0 && (!wide || have.forms[index + 1] & NUM != 0)) {
+                    return self.fail("the register forms do not settle");
+                }
+                let number =
+                    |lifter: &mut Self, register: u8| match have.constants[usize::from(register)] {
+                        Some(constant) => Value::Word(constant),
+                        None => lifter.emit(Op::Get(Var::Scalar(register))),
+                    };
+                let low = number(self, register);
+                let high = if wide {
+                    number(self, register + 1)
+                } else {
+                    Value::Word(0)
+                };
+                let bit = self.lane_bit(low, high);
+                self.emit(Op::Set(mask_var(register), bit));
+            }
+            if missing & NUM != 0 {
+                let (start, high) = if mine & MASK != 0 {
+                    (register, false)
+                } else if mine & HIGH != 0 && index > 0 {
+                    (register - 1, true)
+                } else {
+                    return self.fail("the register forms do not settle");
+                };
+                let mask = flag(self, start);
+                let word = self.emit(Op::BallotWord { mask, high });
+                self.emit(Op::Set(Var::Scalar(register), word));
+            }
+        }
+        Ok(())
     }
 
     /// Writes the stage's inputs into the registers they arrive in.
@@ -755,6 +930,9 @@ impl<'a> Lifter<'a> {
     /// Lifts one machine block from the given entry state.
     fn block(&mut self, block: usize, state: State) -> Lift<Lifted> {
         self.state = state;
+        // Which registers get both forms on the way in is a fact about the
+        // block's entry, not about what leaves it.
+        self.state.both = [0; 2];
         self.insts = Vec::new();
         let first = self.starts[block];
         let last = self
@@ -763,7 +941,8 @@ impl<'a> Lifter<'a> {
             .copied()
             .unwrap_or(self.instructions.len());
         let mut end = None;
-        for index in first..last {
+        let mut index = first;
+        while index < last {
             let instruction = self.instructions[index].clone();
             let name = instruction.mnemonic.unwrap_or("an unknown instruction");
             self.at = (Some(instruction.offset), name);
@@ -771,7 +950,14 @@ impl<'a> Lifter<'a> {
                 end = Some(found);
                 break;
             }
+            // A wave reduction the compiler wrote out is lifted as a whole.
+            if let Some(after) = self.wave_section(index, last)? {
+                index = after;
+                continue;
+            }
+            self.at = (Some(instruction.offset), name);
             self.instruction(index, &instruction)?;
+            index += 1;
         }
         let end = match end {
             Some(end) => end,
@@ -864,7 +1050,19 @@ impl<'a> Lifter<'a> {
                 conditional(self, condition, name == "s_cbranch_scc1")?
             }
             "s_cbranch_vccz" | "s_cbranch_vccnz" => {
-                let condition = self.emit(Op::Get(Var::Vcc));
+                let condition = if self.state.forms[VCC] & MASK != 0 {
+                    self.emit(Op::Get(Var::Vcc))
+                } else {
+                    // A number: the wave goes by whether it is zero.
+                    let low = self.word_at(Operand::Vcc(Half::Both), 0)?;
+                    let high = if self.mask_words() == 2 {
+                        self.word_at(Operand::Vcc(Half::Both), 1)?
+                    } else {
+                        Value::Word(0)
+                    };
+                    let either = self.binary(BinaryOp::Or, low, high);
+                    self.compare(CompareOp::NotEqual, either, Value::Word(0))
+                };
                 conditional(self, condition, name == "s_cbranch_vccnz")?
             }
             "s_cbranch_execz" | "s_cbranch_execnz" => {
@@ -909,7 +1107,13 @@ impl<'a> Lifter<'a> {
     fn instruction(&mut self, index: usize, instruction: &Instruction) -> Lift<()> {
         let name = name_of(instruction);
         let result = self.dispatch(index, instruction, name);
-        // A weight register that was written no longer holds its weight.
+        self.forget_weights(instruction);
+        result
+    }
+
+    /// Notes that the weight registers an instruction writes no longer
+    /// hold their weights.
+    fn forget_weights(&mut self, instruction: &Instruction) {
         for (register, written) in vector_uses(instruction) {
             if !written {
                 continue;
@@ -920,7 +1124,6 @@ impl<'a> Lifter<'a> {
                 }
             }
         }
-        result
     }
 
     /// Lifts one instruction by its format.
@@ -936,6 +1139,10 @@ impl<'a> Lifter<'a> {
                 "s_nop" | "s_waitcnt" | "s_inst_prefetch" | "s_clause" | "s_code_end"
                 | "s_waitcnt_depctr" | "s_round_mode" | "s_denorm_mode" | "s_ttracedata"
                 | "s_icache_inv" => Ok(()),
+                "s_barrier" => {
+                    self.emit(Op::Barrier);
+                    Ok(())
+                }
                 _ => self.fail("a program-control instruction the lift has no rule for"),
             },
             Format::Sop2 | Format::Sop1 | Format::Sopc | Format::Sopk => self.scalar(instruction),
@@ -1057,6 +1264,8 @@ impl<'a> Lifter<'a> {
         } else if forms & HIGH != 0 {
             let mask = self.mask_of_register(register - 1);
             Ok(self.emit(Op::BallotWord { mask, high: true }))
+        } else if forms & LEFT != 0 {
+            self.fail("a read of what a whole-wave section left in a register")
         } else {
             self.fail("a scalar register holds a lane mask on one path and a number on another")
         }
@@ -1122,6 +1331,10 @@ impl<'a> Lifter<'a> {
             }
             Operand::Vcc(half) if half == whole => {
                 self.emit(Op::Set(Var::Vcc, flag));
+                self.state.forms[VCC] = MASK;
+                self.state.forms[VCC + 1] = HIGH;
+                self.state.constants[VCC] = None;
+                self.state.constants[VCC + 1] = None;
             }
             Operand::Scalar { first, count } if count == self.mask_words() => {
                 self.check_scalar(first)?;
@@ -1137,7 +1350,11 @@ impl<'a> Lifter<'a> {
     /// cannot be read as a number without gathering lanes.
     fn only_mask(&self, operand: Operand) -> bool {
         match operand {
-            Operand::Exec(_) | Operand::Vcc(_) => true,
+            Operand::Exec(_) => true,
+            Operand::Vcc(half) => {
+                let at = VCC + usize::from(half == Half::High);
+                self.state.forms[at] & NUM == 0
+            }
             Operand::Scalar { first, count } => (0..count).any(|index| {
                 let at = usize::from(first) + usize::from(index);
                 at < SCALARS
@@ -1157,7 +1374,20 @@ impl<'a> Lifter<'a> {
         };
         match operand {
             Operand::Exec(half) if half == whole => Ok(self.live()),
-            Operand::Vcc(half) if half == whole => Ok(self.emit(Op::Get(Var::Vcc))),
+            Operand::Vcc(half) if half == whole => {
+                if self.state.forms[VCC] & MASK != 0 {
+                    return Ok(self.emit(Op::Get(Var::Vcc)));
+                }
+                // A number kept in `VCC`, used as a mask: the lane's own
+                // bit of it.
+                let low = self.word_at(operand, 0)?;
+                let high = if self.mask_words() == 2 {
+                    self.word_at(operand, 1)?
+                } else {
+                    Value::Word(0)
+                };
+                Ok(self.lane_bit(low, high))
+            }
             Operand::Scalar { first, count } if count == self.mask_words() => {
                 let index = self.check_scalar(first)?;
                 if self.state.forms[index] & MASK != 0 {
@@ -1209,7 +1439,7 @@ impl<'a> Lifter<'a> {
         match operand {
             Operand::Scalar { first, count } if index < count => self.number(first + index),
             Operand::Vector { first, count } if index < count => {
-                Ok(self.emit(Op::Get(Var::Vector(first.wrapping_add(index)))))
+                self.vector_word(first.wrapping_add(index))
             }
             Operand::Integer(value) => Ok(Value::Word(if index == 0 {
                 value as i32 as u32
@@ -1234,8 +1464,28 @@ impl<'a> Lifter<'a> {
                     (Half::High, 0) | (Half::Both, 1) => true,
                     _ => return self.fail("an operand is read past its width"),
                 };
-                if high && self.mask_words() == 1 {
+                if high && self.mask_words() == 1 && is_exec {
                     return Ok(Value::Word(0));
+                }
+                if !is_exec {
+                    // A number a program keeps in `VCC`.
+                    let at = VCC + usize::from(high);
+                    let forms = self.state.forms[at];
+                    if let Some(constant) = self.state.constants[at] {
+                        return Ok(Value::Word(constant));
+                    }
+                    if forms & NUM != 0 {
+                        return Ok(self.emit(Op::Get(Var::Scalar(at as u8))));
+                    }
+                    let whole = if high { forms & HIGH } else { forms & MASK };
+                    if whole == 0 {
+                        return self.fail(
+                            "a scalar register holds a lane mask on one path and a number on another",
+                        );
+                    }
+                    if high && self.mask_words() == 1 {
+                        return Ok(Value::Word(0));
+                    }
                 }
                 let mask = if is_exec {
                     self.live()
@@ -1286,9 +1536,24 @@ impl<'a> Lifter<'a> {
         self.set_vector_if(register, value, live);
     }
 
+    /// Reads a vector register. One that holds what a whole-wave section
+    /// left in it has no value the lift knows.
+    fn vector_word(&mut self, register: u8) -> Lift<Value> {
+        if self.state.left[usize::from(register / 64)] >> (register % 64) & 1 != 0 {
+            return self.fail("a read of what a whole-wave section left in a register");
+        }
+        Ok(self.emit(Op::Get(Var::Vector(register))))
+    }
+
     /// Writes a word to a vector register in the lanes where `condition`
     /// holds.
+    ///
+    /// A write makes a register that held the leftover of a whole-wave
+    /// section an ordinary one again, also where the write leaves out the
+    /// lanes that are not live: compiled code does not read a lane it has
+    /// not written, which is the ground the lane branches stand on too.
     fn set_vector_if(&mut self, register: u8, value: Value, condition: Value) {
+        self.state.left[usize::from(register / 64)] &= !(1 << (register % 64));
         let value = match condition {
             Value::Flag(true) => value,
             _ => {

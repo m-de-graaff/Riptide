@@ -11,6 +11,50 @@
 //! and a sum into one operation, or assume that no operand is a NaN. NaNs
 //! are told by their bits, never by a float comparison, for the same reason.
 
+/// The helper for one atomic operation on a word of title memory: the old
+/// word, or zero where nothing is mapped.
+macro_rules! mem_atomic {
+    ($name:literal, $call:literal) => {
+        Helper {
+            name: concat!("mem_atomic_", $name),
+            needs: &["mem_place"],
+            text: concat!(
+                "uint mem_atomic_",
+                $name,
+                "(uint low, uint high, uint value, uint compare) {\n",
+                "    uint2 at = mem_place(low, high);\n",
+                "    uint old = 0u;\n",
+                "    if (at.x != 0u) {\n",
+                "        RWByteAddressBuffer bank = ResourceDescriptorHeap[at.x];\n",
+                "        bank.",
+                $call,
+                ";\n    }\n    return old;\n}\n"
+            ),
+        }
+    };
+}
+
+/// The helper for one atomic operation on a word of the group-shared
+/// memory: the old word, or zero past the end.
+macro_rules! shared_atomic {
+    ($name:literal, $call:literal) => {
+        Helper {
+            name: concat!("shared_atomic_", $name),
+            needs: &[],
+            text: concat!(
+                "uint shared_atomic_",
+                $name,
+                "(uint offset, uint value, uint compare) {\n",
+                "    uint index = offset >> 2;\n",
+                "    uint old = 0u;\n",
+                "    if (index < SHARED_BYTES / 4u) ",
+                $call,
+                ";\n    return old;\n}\n"
+            ),
+        }
+    };
+}
+
 /// One helper: its name, the helpers it calls, and its text. `HELPER(x);`
 /// in a text marks where a pixel shader's helper lane leaves with `x`
 /// (section 7 of the research note); in other stages the line is removed.
@@ -678,6 +722,91 @@ void fmt_store(uint4 d, uint index, uint offset, uint format, uint4 values) {
 ",
     },
     Helper {
+        name: "mem_place",
+        needs: &["page_table"],
+        text: "\
+// Where the word of title memory that holds an address can be written: the
+// bank's place in the heap and the word's place in the bank. The first is
+// zero where nothing is mapped.
+uint2 mem_place(uint low, uint high) {
+    bool covered = high < 32u;
+    uint entry = page_table.Load(select(covered, ((low >> 16) | (high << 16)) * 4u, 0u));
+    uint frame = entry - 1u;
+    bool mapped = and(covered, and(entry != 0u, (frame >> 15) < 16u));
+    return uint2(select(mapped, 16u + (frame >> 15), 0u), ((frame & 0x7fffu) << 16) | (low & 0xfffcu));
+}
+",
+    },
+    mem_atomic!("add", "InterlockedAdd(at.y, value, old)"),
+    mem_atomic!("and", "InterlockedAnd(at.y, value, old)"),
+    mem_atomic!("or", "InterlockedOr(at.y, value, old)"),
+    mem_atomic!("xor", "InterlockedXor(at.y, value, old)"),
+    mem_atomic!("umin", "InterlockedMin(at.y, value, old)"),
+    mem_atomic!("umax", "InterlockedMax(at.y, value, old)"),
+    mem_atomic!("swap", "InterlockedExchange(at.y, value, old)"),
+    mem_atomic!(
+        "cmpswap",
+        "InterlockedCompareExchange(at.y, compare, value, old)"
+    ),
+    Helper {
+        name: "shared_load",
+        needs: &[],
+        text: "\
+// A unit of one, two or four bytes of the group-shared memory at any
+// offset; zero if it does not lie wholly inside.
+uint shared_load(uint offset, uint bytes) {
+    uint shift = (offset & 3u) * 8u;
+    uint index = offset >> 2;
+    uint first = shared_words[min(index, SHARED_WORDS - 1u)];
+    uint second = shared_words[min(index + 1u, SHARED_WORDS - 1u)];
+    uint value = select(shift == 0u, first, (first >> shift) | (second << ((32u - shift) & 31u)));
+    bool inside = and(SHARED_BYTES >= bytes, offset <= SHARED_BYTES - bytes);
+    return select(inside, value & (0xffffffffu >> ((4u - bytes) * 8u)), 0u);
+}
+",
+    },
+    Helper {
+        name: "shared_store",
+        needs: &[],
+        text: "\
+// Writes a unit of one, two or four bytes of the group-shared memory at any
+// offset; dropped if it does not lie wholly inside. A part of a word is
+// written with two interlocked operations, as in title memory.
+void shared_store(uint offset, uint value, uint bytes) {
+    if (and(SHARED_BYTES >= bytes, offset <= SHARED_BYTES - bytes)) {
+        uint shift = (offset & 3u) * 8u;
+        uint index = offset >> 2;
+        uint mask = 0xffffffffu >> ((4u - bytes) * 8u);
+        if (and(shift == 0u, bytes == 4u)) {
+            shared_words[index] = value;
+        } else {
+            uint before;
+            InterlockedAnd(shared_words[index], ~(mask << shift), before);
+            InterlockedOr(shared_words[index], (value & mask) << shift, before);
+            if (shift + bytes * 8u > 32u) {
+                InterlockedAnd(shared_words[index + 1u], ~(mask >> (32u - shift)), before);
+                InterlockedOr(shared_words[index + 1u], (value & mask) >> (32u - shift), before);
+            }
+        }
+    }
+}
+",
+    },
+    shared_atomic!("add", "InterlockedAdd(shared_words[index], value, old)"),
+    shared_atomic!("and", "InterlockedAnd(shared_words[index], value, old)"),
+    shared_atomic!("or", "InterlockedOr(shared_words[index], value, old)"),
+    shared_atomic!("xor", "InterlockedXor(shared_words[index], value, old)"),
+    shared_atomic!("umin", "InterlockedMin(shared_words[index], value, old)"),
+    shared_atomic!("umax", "InterlockedMax(shared_words[index], value, old)"),
+    shared_atomic!(
+        "swap",
+        "InterlockedExchange(shared_words[index], value, old)"
+    ),
+    shared_atomic!(
+        "cmpswap",
+        "InterlockedCompareExchange(shared_words[index], compare, value, old)"
+    ),
+    Helper {
         name: "ballot_first",
         needs: &[],
         text: "\
@@ -769,6 +898,155 @@ uint wave_ballot(bool flag, bool high) {
     HELPER(select(and(flag, and((lane >= 32u) == high, lane < 64u)), 1u << (lane & 31u), 0u));
     uint4 ballot = WaveActiveBallot(flag);
     return select(high, ballot.y, ballot.x);
+}
+",
+    },
+    Helper {
+        name: "wave_sum",
+        needs: &[],
+        text: "\
+// The reductions over a wave: the words of the lanes that take part, folded.
+// A lane that does not counts as the identity of the operation.
+uint wave_sum(uint value, bool active) {
+    uint own = select(active, value, 0u);
+    HELPER(own);
+    return WaveActiveSum(own);
+}
+",
+    },
+    Helper {
+        name: "wave_sum_f",
+        needs: &[],
+        text: "\
+// The host adds the lanes in an order of its own; the console adds them as a
+// balanced tree over their numbers.
+uint wave_sum_f(uint value, bool active) {
+    uint own = select(active, value, 0u);
+    HELPER(own);
+    precise float r = WaveActiveSum(asfloat(own));
+    return asuint(r);
+}
+",
+    },
+    Helper {
+        name: "wave_and",
+        needs: &[],
+        text: "\
+uint wave_and(uint value, bool active) {
+    uint own = select(active, value, 0xffffffffu);
+    HELPER(own);
+    return WaveActiveBitAnd(own);
+}
+",
+    },
+    Helper {
+        name: "wave_or",
+        needs: &[],
+        text: "\
+uint wave_or(uint value, bool active) {
+    uint own = select(active, value, 0u);
+    HELPER(own);
+    return WaveActiveBitOr(own);
+}
+",
+    },
+    Helper {
+        name: "wave_xor",
+        needs: &[],
+        text: "\
+uint wave_xor(uint value, bool active) {
+    uint own = select(active, value, 0u);
+    HELPER(own);
+    return WaveActiveBitXor(own);
+}
+",
+    },
+    Helper {
+        name: "wave_min_u",
+        needs: &[],
+        text: "\
+uint wave_min_u(uint value, bool active) {
+    uint own = select(active, value, 0xffffffffu);
+    HELPER(own);
+    return WaveActiveMin(own);
+}
+",
+    },
+    Helper {
+        name: "wave_max_u",
+        needs: &[],
+        text: "\
+uint wave_max_u(uint value, bool active) {
+    uint own = select(active, value, 0u);
+    HELPER(own);
+    return WaveActiveMax(own);
+}
+",
+    },
+    Helper {
+        name: "wave_min_s",
+        needs: &[],
+        text: "\
+uint wave_min_s(uint value, bool active) {
+    int own = (int)select(active, value, 0x7fffffffu);
+    HELPER((uint)own);
+    return (uint)WaveActiveMin(own);
+}
+",
+    },
+    Helper {
+        name: "wave_max_s",
+        needs: &[],
+        text: "\
+uint wave_max_s(uint value, bool active) {
+    int own = (int)select(active, value, 0x80000000u);
+    HELPER((uint)own);
+    return (uint)WaveActiveMax(own);
+}
+",
+    },
+    Helper {
+        name: "f_key",
+        needs: &[],
+        text: "\
+// A float's bits as an unsigned number that orders as the floats do, with
+// -0 below +0, and back.
+uint f_key(uint a) { return a ^ select((a >> 31) != 0u, 0xffffffffu, 0x80000000u); }
+uint f_unkey(uint k) { return k ^ select((k >> 31) != 0u, 0x80000000u, 0xffffffffu); }
+",
+    },
+    Helper {
+        name: "wave_min_f",
+        needs: &["is_nan", "f_key"],
+        text: "\
+// A NaN takes no part. (On the console a wave in which every lane holds a
+// NaN gives one of them; here it gives the identity.)
+uint wave_min_f(uint value, bool active) {
+    uint own = select(and(active, !is_nan(value)), value, 0x7f800000u);
+    HELPER(own);
+    return f_unkey(WaveActiveMin(f_key(own)));
+}
+",
+    },
+    Helper {
+        name: "wave_max_f",
+        needs: &["is_nan", "f_key"],
+        text: "\
+uint wave_max_f(uint value, bool active) {
+    uint own = select(and(active, !is_nan(value)), value, 0xff800000u);
+    HELPER(own);
+    return f_unkey(WaveActiveMax(f_key(own)));
+}
+",
+    },
+    Helper {
+        name: "wave_prefix_sum",
+        needs: &[],
+        text: "\
+// The sum over the lanes before this one that take part.
+uint wave_prefix_sum(uint value, bool active) {
+    HELPER(0u);
+    return WavePrefixSum(select(active, value, 0u));
 }
 ",
     },

@@ -10,7 +10,7 @@
 //! square roots, exponentials, sine and cosine) the functions here give the
 //! correctly rounded result.
 
-use super::{BinaryOp, CompareOp, TernaryOp, UnaryOp};
+use super::{AtomicOp, BinaryOp, CompareOp, ReduceOp, TernaryOp, UnaryOp};
 
 /// Reads a word as a float.
 fn f(word: u32) -> f32 {
@@ -475,6 +475,55 @@ pub fn carry(a: u32, b: u32, carry_in: bool) -> bool {
 /// Whether `a - b - borrow_in` goes below zero.
 pub fn borrow(a: u32, b: u32, borrow_in: bool) -> bool {
     u64::from(a) < u64::from(b) + u64::from(borrow_in)
+}
+
+/// What an atomic operation writes: `old` is the word as it was, `value`
+/// the operand and `compare` the comparand of a compare-and-swap.
+pub fn atomic(op: AtomicOp, old: u32, value: u32, compare: u32) -> u32 {
+    match op {
+        AtomicOp::Swap => value,
+        AtomicOp::CompareSwap => {
+            if old == compare {
+                value
+            } else {
+                old
+            }
+        }
+        AtomicOp::Add => old.wrapping_add(value),
+        AtomicOp::Sub => old.wrapping_sub(value),
+        AtomicOp::MinSigned => (old as i32).min(value as i32) as u32,
+        AtomicOp::MinUnsigned => old.min(value),
+        AtomicOp::MaxSigned => (old as i32).max(value as i32) as u32,
+        AtomicOp::MaxUnsigned => old.max(value),
+        AtomicOp::And => old & value,
+        AtomicOp::Or => old | value,
+        AtomicOp::Xor => old ^ value,
+        AtomicOp::Increment => old.wrapping_add(1),
+        AtomicOp::Decrement => old.wrapping_sub(1),
+    }
+}
+
+/// A reduction over a wave: `words` holds the word of every lane of the
+/// console's wave by lane number, with the identity of `op` for a lane that
+/// takes no part. The words are folded as a balanced tree over the lanes in
+/// their order, which is the order the console adds floats in; for every
+/// other operation the order does not matter.
+pub fn reduce(op: ReduceOp, words: &[u32]) -> u32 {
+    let mut level: Vec<u32> = words.to_vec();
+    if level.is_empty() {
+        return op.identity();
+    }
+    while level.len() > 1 {
+        level = level
+            .chunks(2)
+            .map(|pair| match *pair {
+                [a, b] => binary(op.binary(), a, b),
+                [a] => a,
+                _ => op.identity(),
+            })
+            .collect();
+    }
+    level[0]
 }
 
 /// A buffer descriptor's four words, read the way the console GPU reads
@@ -954,6 +1003,72 @@ mod tests {
             let decoded = format.decode(raw);
             let again = format.encode(decoded).unwrap();
             assert_eq!(format.decode(again), decoded, "format {code}");
+        }
+    }
+
+    #[test]
+    fn a_reduction_folds_the_lanes_as_a_balanced_tree() {
+        // A float sum in which the order shows: the large values cancel
+        // only if the neighbours are added first.
+        let words = [bits(1e30), bits(-1e30), bits(1.0), bits(2.0)];
+        assert_eq!(reduce(ReduceOp::FloatAdd, &words), bits(3.0));
+        let words = [bits(1e30), bits(1.0), bits(-1e30), bits(2.0)];
+        assert_eq!(reduce(ReduceOp::FloatAdd, &words), bits(0.0));
+        // The identity of each operation changes nothing, and with nothing
+        // but identities the result is the identity.
+        for op in [
+            ReduceOp::Add,
+            ReduceOp::And,
+            ReduceOp::Or,
+            ReduceOp::Xor,
+            ReduceOp::MinUnsigned,
+            ReduceOp::MaxUnsigned,
+            ReduceOp::MinSigned,
+            ReduceOp::MaxSigned,
+            ReduceOp::FloatMin,
+            ReduceOp::FloatMax,
+        ] {
+            let identity = op.identity();
+            assert_eq!(reduce(op, &[identity; 32]), identity, "{op:?}");
+            for word in [0, 1, 0x8000_0000, 0x7FFF_FFFF, bits(-2.5), bits(1e-40)] {
+                // As a float the largest signed number is a NaN, which the
+                // float operations leave out.
+                let float = matches!(op, ReduceOp::FloatMin | ReduceOp::FloatMax);
+                if float && word == 0x7FFF_FFFF {
+                    continue;
+                }
+                let mut words = [identity; 64];
+                words[37] = word;
+                assert_eq!(reduce(op, &words), word, "{op:?} of {word:#x}");
+            }
+        }
+        // A NaN never wins a float minimum or maximum.
+        let words = [bits(f32::NAN), bits(4.0), bits(-0.0), bits(0.0)];
+        assert_eq!(reduce(ReduceOp::FloatMin, &words), bits(-0.0));
+        assert_eq!(reduce(ReduceOp::FloatMax, &words), bits(4.0));
+        assert_eq!(reduce(ReduceOp::Add, &[]), 0);
+    }
+
+    #[test]
+    fn an_atomic_operation_writes_what_its_name_says() {
+        let cases = [
+            (AtomicOp::Swap, 5, 9, 0, 9),
+            (AtomicOp::CompareSwap, 5, 9, 5, 9),
+            (AtomicOp::CompareSwap, 5, 9, 6, 5),
+            (AtomicOp::Add, u32::MAX, 2, 0, 1),
+            (AtomicOp::Sub, 1, 2, 0, u32::MAX),
+            (AtomicOp::MinSigned, 1, u32::MAX, 0, u32::MAX),
+            (AtomicOp::MinUnsigned, 1, u32::MAX, 0, 1),
+            (AtomicOp::MaxSigned, 1, u32::MAX, 0, 1),
+            (AtomicOp::MaxUnsigned, 1, u32::MAX, 0, u32::MAX),
+            (AtomicOp::And, 0b1100, 0b1010, 0, 0b1000),
+            (AtomicOp::Or, 0b1100, 0b1010, 0, 0b1110),
+            (AtomicOp::Xor, 0b1100, 0b1010, 0, 0b0110),
+            (AtomicOp::Increment, u32::MAX, 77, 0, 0),
+            (AtomicOp::Decrement, 0, 77, 0, u32::MAX),
+        ];
+        for (op, old, value, compare, new) in cases {
+            assert_eq!(atomic(op, old, value, compare), new, "{op:?}");
         }
     }
 }

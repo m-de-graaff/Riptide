@@ -34,8 +34,9 @@ use crate::container::xbox::HardwareStage;
 use crate::ir::cfg::ControlFlow;
 use crate::ir::eval::{BufferFormat, ChannelKind};
 use crate::ir::{
-    BinaryOp, BlockId, CompareOp, ExportTarget, FlagOp, Function, ImageKind, Input, Inst, Op,
-    Sampler, Terminator, TernaryOp, Ty, UnaryOp, Value, Var, VertexTerm, Weights,
+    AtomicOp, AtomicPlace, BinaryOp, BlockId, CompareOp, ExportTarget, FlagOp, Function, ImageKind,
+    Input, Inst, Op, ReduceOp, Sampler, Terminator, TernaryOp, Ty, UnaryOp, Value, Var, VertexTerm,
+    Weights,
 };
 
 use super::helpers::HELPERS;
@@ -79,6 +80,31 @@ fn fuel(stage: HardwareStage) -> u32 {
         _ => 4_096,
     }
 }
+
+/// The helpers for the atomic operations on title memory, by the name of
+/// the operation at their end.
+const MEMORY_ATOMICS: [&str; 8] = [
+    "mem_atomic_add",
+    "mem_atomic_and",
+    "mem_atomic_or",
+    "mem_atomic_xor",
+    "mem_atomic_umin",
+    "mem_atomic_umax",
+    "mem_atomic_swap",
+    "mem_atomic_cmpswap",
+];
+
+/// The same for the group-shared memory.
+const SHARED_ATOMICS: [&str; 8] = [
+    "shared_atomic_add",
+    "shared_atomic_and",
+    "shared_atomic_or",
+    "shared_atomic_xor",
+    "shared_atomic_umin",
+    "shared_atomic_umax",
+    "shared_atomic_swap",
+    "shared_atomic_cmpswap",
+];
 
 /// The most samplers a root signature may fix: the stage input words 67 to
 /// 77 carry their places.
@@ -220,6 +246,12 @@ struct Emitter<'a> {
     uses_fuel: bool,
     /// How many clip and cull distances the output signature declares.
     distances: [u32; 2],
+    /// Whether the program uses the group-shared memory.
+    uses_shared: bool,
+    /// The places, as a block and an instruction of it, before which a
+    /// group barrier is written that the program does not have: see
+    /// [`Emitter::order_shared`].
+    barriers: BTreeSet<(BlockId, usize)>,
 }
 
 /// Writes the HLSL of `function`.
@@ -271,8 +303,11 @@ pub(crate) fn emit(
         uses_go: false,
         uses_fuel: false,
         distances,
+        uses_shared: false,
+        barriers: BTreeSet::new(),
     };
     emitter.gather()?;
+    emitter.order_shared()?;
     emitter.finish()
 }
 
@@ -381,6 +416,12 @@ impl Emitter<'_> {
                             self.uses.position = true;
                         }
                     }
+                    Op::LoadShared { .. }
+                    | Op::StoreShared { .. }
+                    | Op::Atomic {
+                        place: AtomicPlace::Shared(_),
+                        ..
+                    } => self.uses_shared = true,
                     _ => {}
                 }
             }
@@ -395,6 +436,167 @@ impl Emitter<'_> {
             .collect();
         self.uses.weights.extend(by_hand);
         Ok(())
+    }
+
+    /// Decides where group barriers have to stand for the lanes to see the
+    /// group-shared memory as they do on the console.
+    ///
+    /// The console runs a wave an instruction at a time, so a lane reads
+    /// what another lane of its wave wrote at an earlier instruction, and
+    /// its compiler leaves out the barriers of a thread group that is one
+    /// wave. A host promises no such order without a barrier. For such a
+    /// group one is therefore written wherever the program goes from one
+    /// kind of access to another: between reading, writing and atomic
+    /// operations. Accesses of one kind in a row are left as they are: lanes
+    /// that write one after another write places of their own in compiled
+    /// code, and atomic operations are made to be done in any order.
+    ///
+    /// A barrier has to be reached by every thread of the group, once. That
+    /// is only sure in a block that lies on every path through the program
+    /// and in no loop. Where the change of kind happens in such a block the
+    /// barrier stands right before the access; where it happens elsewhere
+    /// (under a branch, in a loop) the barrier stands at the end of the
+    /// last such block before it, which serves as long as nothing of
+    /// another kind lies between the two. A program for which neither
+    /// works is refused. A group of several waves keeps its own barriers,
+    /// which the title needed there on the console too, and gets no others;
+    /// a group of one thread needs none.
+    fn order_shared(&mut self) -> Result<(), EmitError> {
+        const READ: u8 = 1;
+        const WRITTEN: u8 = 2;
+        const ATOMIC: u8 = 4;
+        let function = self.function;
+        if !self.uses_shared {
+            return Ok(());
+        }
+        if self.stage() != HardwareStage::Compute {
+            return self.unsupported("LoadShared", "group-shared memory outside a compute shader");
+        }
+        let threads: u64 = function
+            .interface
+            .group_size
+            .iter()
+            .map(|&axis| u64::from(axis.max(1)))
+            .product();
+        if threads <= 1 || threads > function.wave.lanes() as u64 {
+            return Ok(());
+        }
+        let flow = ControlFlow::of(function);
+        let count = function.blocks.len();
+        // The blocks every lane passes exactly once: those that every path
+        // to an end of the program goes through, and that are in no loop.
+        let reachable: Vec<bool> = (0..count)
+            .map(|block| flow.place[block].is_some())
+            .collect();
+        let mut sure = vec![false; count];
+        for (block, sure) in sure.iter_mut().enumerate() {
+            if !reachable[block] || flow.loops.iter().any(|known| known.contains(block)) {
+                continue;
+            }
+            // Without this block no end can be reached.
+            let mut seen = vec![false; count];
+            let mut work = vec![0usize];
+            let mut ends = false;
+            while let Some(at) = work.pop() {
+                if at == block || std::mem::replace(&mut seen[at], true) {
+                    continue;
+                }
+                ends |= matches!(function.blocks[at].terminator, Terminator::Return);
+                work.extend(function.blocks[at].terminator.successors());
+            }
+            *sure = !ends;
+        }
+        // What an operation does to the memory.
+        let access = |op: &Op| match op {
+            Op::LoadShared { .. } => READ,
+            Op::StoreShared { .. } => WRITTEN,
+            Op::Atomic {
+                place: AtomicPlace::Shared(_),
+                ..
+            } => ATOMIC,
+            _ => 0,
+        };
+        loop {
+            // What may have been done to the memory since the last barrier
+            // when each block is entered, to a fixed point.
+            let mut entry = vec![0u8; count];
+            let mut found = None;
+            let mut changed = true;
+            while changed {
+                changed = false;
+                found = None;
+                for block in 0..count {
+                    if !reachable[block] {
+                        continue;
+                    }
+                    let mut state = entry[block];
+                    for (index, inst) in function.blocks[block].insts.iter().enumerate() {
+                        if matches!(inst.op, Op::Barrier) || self.barriers.contains(&(block, index))
+                        {
+                            state = 0;
+                        }
+                        let kind = access(&inst.op);
+                        // An access after one of another kind.
+                        if kind != 0 && state & !kind != 0 && found.is_none() {
+                            found = Some((block, index, kind));
+                        }
+                        state |= kind;
+                    }
+                    if self
+                        .barriers
+                        .contains(&(block, function.blocks[block].insts.len()))
+                    {
+                        state = 0;
+                    }
+                    for successor in function.blocks[block].terminator.successors() {
+                        if entry[successor] | state != entry[successor] {
+                            entry[successor] |= state;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            // Where a barrier can stand for the access found: before it, or
+            // at the end of the nearest block before it that every thread
+            // passes.
+            let place = found.and_then(|(block, index, _)| {
+                if sure[block] {
+                    return Some((block, index));
+                }
+                let mut at = block;
+                loop {
+                    match flow.dominator[at] {
+                        Some(before) if before != at => at = before,
+                        _ => return None,
+                    }
+                    if sure[at] {
+                        return Some((at, function.blocks[at].insts.len()));
+                    }
+                }
+            });
+            match found {
+                None => return Ok(()),
+                Some(_) if place.is_some_and(|place| self.barriers.insert(place)) => {}
+                Some((_, _, READ)) => {
+                    return self.unsupported(
+                        "LoadShared",
+                        "group-shared memory read after a write where no barrier can stand",
+                    );
+                }
+                Some((_, _, WRITTEN)) => {
+                    return self.unsupported(
+                        "StoreShared",
+                        "group-shared memory written after another access where no barrier can stand",
+                    );
+                }
+                Some(_) => {
+                    return self.unsupported(
+                        "Atomic",
+                        "an atomic operation on group-shared memory after another access where no barrier can stand",
+                    );
+                }
+            }
+        }
     }
 
     fn gather_input(&mut self, input: Input) -> Result<(), EmitError> {
@@ -1184,6 +1386,154 @@ impl Emitter<'_> {
                 }
                 return Ok(());
             }
+            Op::Atomic {
+                op,
+                place,
+                value,
+                compare,
+                guard,
+            } => {
+                // The host has these on unsigned words. A subtraction is
+                // the sum with the negation, a step up or down the sum
+                // with one or with all ones.
+                let (kind, operand) = match op {
+                    AtomicOp::Swap => ("swap", self.v(*value)),
+                    AtomicOp::CompareSwap => ("cmpswap", self.v(*value)),
+                    AtomicOp::Add => ("add", self.v(*value)),
+                    AtomicOp::Sub => ("add", format!("(0u - {})", self.v(*value))),
+                    AtomicOp::Increment => ("add", word(1)),
+                    AtomicOp::Decrement => ("add", word(u32::MAX)),
+                    AtomicOp::MinUnsigned => ("umin", self.v(*value)),
+                    AtomicOp::MaxUnsigned => ("umax", self.v(*value)),
+                    AtomicOp::And => ("and", self.v(*value)),
+                    AtomicOp::Or => ("or", self.v(*value)),
+                    AtomicOp::Xor => ("xor", self.v(*value)),
+                    AtomicOp::MinSigned | AtomicOp::MaxSigned => {
+                        return self.unsupported(
+                            "Atomic",
+                            "a signed atomic minimum or maximum, which the host has only for unsigned words",
+                        );
+                    }
+                };
+                let (compare, guard) = (self.v(*compare), self.v(*guard));
+                let _ = writeln!(out, "{indent}uint t{first} = 0u;");
+                match place {
+                    AtomicPlace::Memory(address) => {
+                        let name = MEMORY_ATOMICS
+                            .iter()
+                            .find(|name| name.ends_with(kind))
+                            .copied()
+                            .unwrap_or("mem_atomic_add");
+                        self.need(name);
+                        let _ = writeln!(
+                            out,
+                            "{indent}if ({guard}) t{first} = {name}({}, {}, {operand}, {compare});",
+                            self.v(address.low),
+                            self.v(address.high)
+                        );
+                    }
+                    AtomicPlace::Buffer {
+                        descriptor,
+                        position,
+                    } => {
+                        let name = MEMORY_ATOMICS
+                            .iter()
+                            .find(|name| name.ends_with(kind))
+                            .copied()
+                            .unwrap_or("mem_atomic_add");
+                        self.need(name);
+                        self.need("buf_locate");
+                        let _ = writeln!(
+                            out,
+                            "{indent}uint3 a{first} = buf_locate({}, {}, {});
+{indent}if (and({guard}, a{first}.z != 0u)) t{first} = {name}(a{first}.x, a{first}.y, {operand}, {compare});",
+                            self.descriptor(descriptor),
+                            self.v(position.index),
+                            self.v(position.offset)
+                        );
+                    }
+                    AtomicPlace::Shared(offset) => {
+                        let name = SHARED_ATOMICS
+                            .iter()
+                            .find(|name| name.ends_with(kind))
+                            .copied()
+                            .unwrap_or("shared_atomic_add");
+                        self.need(name);
+                        let _ = writeln!(
+                            out,
+                            "{indent}if ({guard}) t{first} = {name}({}, {operand}, {compare});",
+                            self.v(*offset)
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            Op::LoadShared {
+                offset,
+                width,
+                words,
+            } => {
+                self.need("shared_load");
+                let bytes = u32::from(*width / 8);
+                for unit in 0..u32::from(*words) {
+                    let _ = writeln!(
+                        out,
+                        "{indent}uint t{} = shared_load({}, {bytes}u);",
+                        first + unit,
+                        self.offset(*offset, unit * bytes)
+                    );
+                }
+                return Ok(());
+            }
+            Op::StoreShared {
+                offset,
+                width,
+                values,
+                guard,
+            } => {
+                self.need("shared_store");
+                let bytes = u32::from(*width / 8);
+                let _ = writeln!(out, "{indent}if ({}) {{", self.v(*guard));
+                for (unit, value) in values.iter().enumerate() {
+                    let _ = writeln!(
+                        out,
+                        "{indent}    shared_store({}, {}, {bytes}u);",
+                        self.offset(*offset, unit as u32 * bytes),
+                        self.v(*value)
+                    );
+                }
+                let _ = writeln!(out, "{indent}}}");
+                return Ok(());
+            }
+            Op::Barrier => {
+                if self.stage() != HardwareStage::Compute {
+                    return self.unsupported("Barrier", "a group barrier outside a compute shader");
+                }
+                let _ = writeln!(out, "{indent}GroupMemoryBarrierWithGroupSync();");
+                return Ok(());
+            }
+            Op::LaneIndex => "WaveGetLaneIndex()".to_string(),
+            Op::Reduce { op, value, active } => {
+                let name = match op {
+                    ReduceOp::Add => "wave_sum",
+                    ReduceOp::FloatAdd => "wave_sum_f",
+                    ReduceOp::And => "wave_and",
+                    ReduceOp::Or => "wave_or",
+                    ReduceOp::Xor => "wave_xor",
+                    ReduceOp::MinUnsigned => "wave_min_u",
+                    ReduceOp::MaxUnsigned => "wave_max_u",
+                    ReduceOp::MinSigned => "wave_min_s",
+                    ReduceOp::MaxSigned => "wave_max_s",
+                    ReduceOp::FloatMin => "wave_min_f",
+                    ReduceOp::FloatMax => "wave_max_f",
+                };
+                self.need(name);
+                format!("{name}({}, {})", self.v(*value), self.v(*active))
+            }
+            Op::PrefixSum { value, active } => {
+                self.need("wave_prefix_sum");
+                format!("wave_prefix_sum({}, {})", self.v(*value), self.v(*active))
+            }
             Op::FirstLane { value, active } => {
                 self.need("wave_first");
                 format!("wave_first({}, {})", self.v(*value), self.v(*active))
@@ -1431,6 +1781,7 @@ impl Emitter<'_> {
     /// variable right after it is written to the variable directly.
     fn block(&mut self, block: BlockId, indent: &str, out: &mut String) -> Result<(), EmitError> {
         let function = self.function;
+        let id = block;
         let block = &function.blocks[block];
         let insts = &block.insts;
         // Where each temporary is last used, and how often. The branch at
@@ -1457,6 +1808,10 @@ impl Emitter<'_> {
         let mut index = 0;
         while let Some(inst) = insts.get(index) {
             let first = inst.result.0;
+            if self.barriers.contains(&(id, index)) {
+                // A barrier the console did not need: see `order_shared`.
+                let _ = writeln!(out, "{indent}GroupMemoryBarrierWithGroupSync();");
+            }
             match &inst.op {
                 Op::Get(var) => {
                     let until = last_use.get(&first).copied().unwrap_or(index);
@@ -1500,6 +1855,9 @@ impl Emitter<'_> {
                 _ => self.inst(inst, indent, out)?,
             }
             index += 1;
+        }
+        if self.barriers.contains(&(id, insts.len())) {
+            let _ = writeln!(out, "{indent}GroupMemoryBarrierWithGroupSync();");
         }
         Ok(())
     }
@@ -1781,6 +2139,19 @@ impl Emitter<'_> {
             source,
             "cbuffer Inputs : register(b0, space{space}) {{ uint4 input_words[20]; }}"
         );
+        if self.uses_shared {
+            // The memory a thread group shares, in words. A program that
+            // names no size has one word, which nothing reaches.
+            let bytes = function.interface.shared_bytes;
+            let _ = writeln!(
+                source,
+                "// The group-shared memory.
+static const uint SHARED_BYTES = {bytes}u;
+static const uint SHARED_WORDS = {words}u;
+groupshared uint shared_words[{words}];",
+                words = bytes.div_ceil(4).max(1)
+            );
+        }
         if self.code_table {
             let words: Vec<String> = function.code.iter().map(|&value| word(value)).collect();
             let count = words.len().max(1);

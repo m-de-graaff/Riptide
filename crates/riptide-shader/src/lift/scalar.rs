@@ -5,9 +5,9 @@
 //! whose width is that of a lane mask can work on masks or on numbers; the
 //! module documentation of [`super`] says how that is decided.
 
-use super::{CODE, HIGH, Lift, Lifter, MASK, Rounding, TRUE, name_of};
+use super::{CODE, HIGH, Lift, Lifter, MASK, NUM, Rounding, TRUE, VCC, name_of};
 use crate::container::stage::StageData;
-use crate::gfx10::{Detail, Instruction, Operand, Role};
+use crate::gfx10::{Detail, Half, Instruction, Operand, Role};
 use crate::ir::{BinaryOp, CompareOp, FlagOp, Input, Op, UnaryOp, Value, Var};
 
 /// A bitwise operation of two operands.
@@ -151,6 +151,25 @@ impl Lifter<'_> {
                 Ok(())
             }
             Some(Operand::Null) => Ok(()),
+            // A program that has run out of scalar registers keeps numbers
+            // in `VCC`.
+            Some(Operand::Vcc(half)) if values.len() == if half == Half::Both { 2 } else { 1 } => {
+                let first = VCC + usize::from(half == Half::High);
+                for (index, &value) in values.iter().enumerate() {
+                    let at = first + index;
+                    self.emit(Op::Set(Var::Scalar(at as u8), value));
+                    self.state.forms[at] = NUM;
+                    self.state.constants[at] = value.as_word();
+                }
+                // The other half of a mask that was there is one no more.
+                if half == Half::Low && self.state.forms[VCC + 1] & NUM == 0 {
+                    self.state.forms[VCC + 1] = 0;
+                }
+                if half == Half::High {
+                    self.state.forms[VCC] &= !(MASK | TRUE);
+                }
+                Ok(())
+            }
             Some(Operand::Exec(_) | Operand::Vcc(_)) => {
                 self.fail("a number is written to a lane mask register")
             }
@@ -301,7 +320,13 @@ impl Lifter<'_> {
     }
 
     /// A 64-bit shift of the pair (low, high) by the low 6 bits of `count`.
-    fn shift64(&mut self, kind: BinaryOp, low: Value, high: Value, count: Value) -> (Value, Value) {
+    pub(super) fn shift64(
+        &mut self,
+        kind: BinaryOp,
+        low: Value,
+        high: Value,
+        count: Value,
+    ) -> (Value, Value) {
         let count = self.binary(BinaryOp::And, count, Value::Word(63));
         let big = self.compare(CompareOp::UnsignedGreaterEqual, count, Value::Word(32));
         let small = self.binary(BinaryOp::And, count, Value::Word(31));
@@ -428,6 +453,11 @@ impl Lifter<'_> {
         }
 
         match name {
+            // Waiting for memory operations to finish changes nothing a
+            // lane sees.
+            "s_waitcnt_vscnt" | "s_waitcnt_vmcnt" | "s_waitcnt_expcnt" | "s_waitcnt_lgkmcnt" => {
+                Ok(())
+            }
             "s_mov_b32" | "s_mov_b64" => {
                 let width = if name == "s_mov_b64" { 2 } else { 1 };
                 self.copy(width, target, source(self, 0)?, None)

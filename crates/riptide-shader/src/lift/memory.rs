@@ -1,6 +1,7 @@
 //! Lifting memory access: scalar loads, buffer access through a
-//! descriptor, access by address, and the lane swizzle that is encoded as a
-//! group-shared memory operation.
+//! descriptor, access by address, atomic operations, the group-shared
+//! memory of a compute program, and the lane swizzle that is encoded as one
+//! of its operations.
 //!
 //! Address shapes are those of section 4 of the research note. What was
 //! seen in the real title's programs and agrees with it: a table's address
@@ -11,8 +12,31 @@
 //! rules of [`crate::ir::eval::BufferView`].
 
 use super::{CODE, Lift, Lifter, name_of};
+use crate::container::xbox::HardwareStage;
 use crate::gfx10::{Detail, Format, Instruction, Operand, Role};
-use crate::ir::{Address, BinaryOp, BufferPosition, Op, Value, Var, eval};
+use crate::ir::{Address, AtomicOp, AtomicPlace, BinaryOp, BufferPosition, Op, Value, eval};
+
+/// The operation an atomic instruction on a buffer or by address names
+/// after `_atomic_`, if the lift has a rule for it.
+fn atomic_op(name: &str) -> Option<AtomicOp> {
+    let (_, kind) = name.split_once("_atomic_")?;
+    Some(match kind {
+        "swap" => AtomicOp::Swap,
+        "cmpswap" => AtomicOp::CompareSwap,
+        "add" => AtomicOp::Add,
+        "sub" => AtomicOp::Sub,
+        "smin" => AtomicOp::MinSigned,
+        "umin" => AtomicOp::MinUnsigned,
+        "smax" => AtomicOp::MaxSigned,
+        "umax" => AtomicOp::MaxUnsigned,
+        "and" => AtomicOp::And,
+        "or" => AtomicOp::Or,
+        "xor" => AtomicOp::Xor,
+        "inc" => AtomicOp::Increment,
+        "dec" => AtomicOp::Decrement,
+        _ => return None,
+    })
+}
 
 /// What a memory instruction's name says about its data.
 struct Access {
@@ -192,6 +216,7 @@ impl Lifter<'_> {
             offset,
             offset_enable,
             index_enable,
+            glc,
             tfe,
             format,
             ..
@@ -201,8 +226,9 @@ impl Lifter<'_> {
         };
         let load = name.contains("buffer_load_");
         let store = name.contains("buffer_store_");
-        if !load && !store {
-            return self.fail("an atomic buffer operation");
+        let atomic = name.contains("_atomic_");
+        if !load && !store && !atomic {
+            return self.fail("a buffer operation the lift has no rule for");
         }
         if tfe {
             return self.fail("a buffer load that reports a miss");
@@ -227,6 +253,11 @@ impl Lifter<'_> {
                 units: channels,
                 signed: false,
             },
+            None if atomic => Access {
+                width: 32,
+                units: 1,
+                signed: false,
+            },
             None => return self.fail("a buffer operation the lift has no rule for"),
         };
         let descriptor = self.descriptor(instruction.arg(Role::Resource))?;
@@ -237,11 +268,11 @@ impl Lifter<'_> {
         if let Some(Operand::Vector { first, .. }) = instruction.arg(Role::Address) {
             let mut register = first;
             if index_enable {
-                index = self.emit(Op::Get(Var::Vector(register)));
+                index = self.vector_word(register)?;
                 register = register.wrapping_add(1);
             }
             if offset_enable {
-                let value = self.emit(Op::Get(Var::Vector(register)));
+                let value = self.vector_word(register)?;
                 position = self.binary(BinaryOp::Add, position, value);
             }
         }
@@ -253,6 +284,16 @@ impl Lifter<'_> {
             index,
             offset: position,
         };
+        if atomic {
+            let (data, _) = self.vector_register(instruction.arg(Role::Data))?;
+            let place = AtomicPlace::Buffer {
+                descriptor,
+                position,
+            };
+            // With the GLC bit the old word comes back in the data
+            // register.
+            return self.atomic(name, place, data, glc.then_some(data));
+        }
         if typed {
             // The format is in the instruction (the typed buffer format) or
             // in bits 12 to 18 of the descriptor's word 3.
@@ -288,7 +329,7 @@ impl Lifter<'_> {
                 }
                 let mut values = [Value::Word(0); 4];
                 for (index, value) in values.iter_mut().take(usize::from(channels)).enumerate() {
-                    *value = self.emit(Op::Get(Var::Vector(data.wrapping_add(index as u8))));
+                    *value = self.vector_word(data.wrapping_add(index as u8))?;
                 }
                 let guard = self.live();
                 self.emit(Op::StoreFormat {
@@ -322,8 +363,8 @@ impl Lifter<'_> {
                 return self.fail("the instruction is not decoded");
             }
             let values = (0..count)
-                .map(|index| self.emit(Op::Get(Var::Vector(data.wrapping_add(index)))))
-                .collect();
+                .map(|index| self.vector_word(data.wrapping_add(index)))
+                .collect::<Lift<Vec<Value>>>()?;
             let guard = self.live();
             self.emit(Op::StoreBuffer {
                 descriptor,
@@ -339,25 +380,32 @@ impl Lifter<'_> {
     /// FLAT and GLOBAL: loads and stores of vector registers by address.
     fn by_address(&mut self, instruction: &Instruction) -> Lift<()> {
         let name = name_of(instruction);
-        let Detail::Flat { offset, lds, .. } = instruction.detail else {
+        let Detail::Flat {
+            offset, lds, glc, ..
+        } = instruction.detail
+        else {
             return self.fail("the instruction is not decoded");
         };
         if lds {
-            return self.fail("group-shared memory is not lifted");
+            return self.fail("group-shared memory reached by address");
         }
         let load = name.contains("_load_");
         let store = name.contains("_store_");
-        if !load && !store {
-            return self.fail("an atomic memory operation");
-        }
-        let Some(shape) = access(name) else {
-            return self.fail("a memory operation the lift has no rule for");
+        let atomic = name.contains("_atomic_");
+        let shape = match access(name) {
+            Some(shape) if load || store => shape,
+            _ if atomic => Access {
+                width: 32,
+                units: 1,
+                signed: false,
+            },
+            _ => return self.fail("a memory operation the lift has no rule for"),
         };
         // The address is a register pair, or a scalar pair plus a 32-bit
         // vector offset; the constant is signed.
         let (address_register, address_count) =
             self.vector_register(instruction.arg(Role::Address))?;
-        let first = self.emit(Op::Get(Var::Vector(address_register)));
+        let first = self.vector_word(address_register)?;
         let (low, high) = match instruction.arg(Role::Base) {
             Some(base) => {
                 let base_low = self.word_at(base, 0)?;
@@ -369,7 +417,7 @@ impl Lifter<'_> {
                 if address_count != 2 {
                     return self.fail("the instruction is not decoded");
                 }
-                let second = self.emit(Op::Get(Var::Vector(address_register.wrapping_add(1))));
+                let second = self.vector_word(address_register.wrapping_add(1))?;
                 (first, second)
             }
         };
@@ -389,6 +437,14 @@ impl Lifter<'_> {
                 high: self.binary(BinaryOp::Sub, high, borrow),
             }
         };
+        if atomic {
+            let (data, _) = self.vector_register(instruction.arg(Role::Data))?;
+            let result = match instruction.arg(Role::Result) {
+                Some(Operand::Vector { first, .. }) if glc => Some(first),
+                _ => None,
+            };
+            return self.atomic(name, AtomicPlace::Memory(address), data, result);
+        }
         if load {
             let (target, count) = self.vector_register(instruction.arg(Role::Result))?;
             if count != shape.units {
@@ -409,8 +465,8 @@ impl Lifter<'_> {
                 return self.fail("the instruction is not decoded");
             }
             let values = (0..count)
-                .map(|index| self.emit(Op::Get(Var::Vector(data.wrapping_add(index)))))
-                .collect();
+                .map(|index| self.vector_word(data.wrapping_add(index)))
+                .collect::<Lift<Vec<Value>>>()?;
             let guard = self.live();
             self.emit(Op::StoreMemory {
                 address,
@@ -422,22 +478,229 @@ impl Lifter<'_> {
         Ok(())
     }
 
-    /// DS: only the lane swizzle within a quad is lifted. The rest is
-    /// group-shared memory.
+    /// An atomic operation on a word of memory. `data` is the register of
+    /// the operand (and, for a compare-and-swap, the comparand in the
+    /// register after it: the new word comes first, as the research note
+    /// has it). `result` is the register the old word goes to, if the
+    /// instruction returns it.
+    fn atomic(
+        &mut self,
+        name: &'static str,
+        place: AtomicPlace,
+        data: u8,
+        result: Option<u8>,
+    ) -> Lift<()> {
+        if name.ends_with("_x2") {
+            return self.fail("an atomic operation on a 64-bit word");
+        }
+        let Some(op) = atomic_op(name) else {
+            return self.fail("an atomic operation the lift has no rule for");
+        };
+        let value = self.vector_word(data)?;
+        let compare = if op == AtomicOp::CompareSwap {
+            self.vector_word(data.wrapping_add(1))?
+        } else {
+            Value::Word(0)
+        };
+        let guard = self.live();
+        let old = self.emit(Op::Atomic {
+            op,
+            place,
+            value,
+            compare,
+            guard,
+        });
+        if let Some(result) = result {
+            self.set_vector(result, old);
+        }
+        Ok(())
+    }
+
+    /// DS: the group-shared memory of a compute program, and the lane
+    /// swizzle within a quad that is encoded as one of its operations.
+    ///
+    /// The address is the lane's word of the address register plus a
+    /// constant: one 16-bit offset, or for the forms on two addresses one
+    /// offset byte each, counted in units (in 64 units for the `st64`
+    /// forms). Taken on trust from the research note and AMD's public
+    /// description: which data register of a compare-and-store is the
+    /// comparand (the first), and that the forms named `rtn` give the word
+    /// as it was.
     pub(super) fn shared(&mut self, instruction: &Instruction) -> Lift<()> {
         let name = name_of(instruction);
         let Detail::Lds {
-            offset0, offset1, ..
+            offset0,
+            offset1,
+            gds,
         } = instruction.detail
         else {
             return self.fail("the instruction is not decoded");
         };
-        if name != "ds_swizzle_b32" {
-            return self.fail("group-shared memory is not lifted");
+        if name == "ds_swizzle_b32" {
+            return self.swizzle(instruction, offset0, offset1);
         }
-        // With bit 15 of the offset set, the low 8 bits pick a source lane
-        // of the same quad for each of its four lanes. A source lane that
-        // is not live gives zero. No memory is touched.
+        if self.stage != HardwareStage::Compute {
+            return self.fail("group-shared memory outside a compute program");
+        }
+        if gds {
+            return self.fail("memory shared between programs");
+        }
+        let Some(rest) = name.strip_prefix("ds_") else {
+            return self.fail("a group-shared memory operation the lift has no rule for");
+        };
+        if rest.contains("d16") || rest.contains("addtid") || rest.contains("src2") {
+            return self.fail("a group-shared memory operation the lift has no rule for");
+        }
+        let Some((kind, ty)) = rest.rsplit_once('_') else {
+            return self.fail("a group-shared memory operation the lift has no rule for");
+        };
+        // The unit: its width, how many of them one address holds, and
+        // whether a narrow one is sign-extended when read.
+        let (width, units, signed) = match ty {
+            "b8" | "u8" => (8u8, 1u8, false),
+            "i8" => (8, 1, true),
+            "b16" | "u16" => (16, 1, false),
+            "i16" => (16, 1, true),
+            "b32" | "u32" | "i32" => (32, 1, false),
+            "b64" => (32, 2, false),
+            _ => return self.fail("a group-shared memory operation the lift has no rule for"),
+        };
+        let unit_bytes = u32::from(width / 8) * u32::from(units);
+        let (address, _) = self.vector_register(instruction.arg(Role::Address))?;
+        let base = self.vector_word(address)?;
+        // The byte offsets the operation works at.
+        let (kind, offsets): (&str, Vec<u32>) = match kind {
+            "read2" | "write2" => (
+                &kind[..kind.len() - 1],
+                vec![
+                    u32::from(offset0) * unit_bytes,
+                    u32::from(offset1) * unit_bytes,
+                ],
+            ),
+            "read2st64" | "write2st64" => (
+                &kind[..kind.len() - 5],
+                vec![
+                    u32::from(offset0) * unit_bytes * 64,
+                    u32::from(offset1) * unit_bytes * 64,
+                ],
+            ),
+            _ => (kind, vec![u32::from(offset0) | u32::from(offset1) << 8]),
+        };
+        let data: Vec<u8> = instruction
+            .args
+            .iter()
+            .filter(|arg| arg.role == Role::Data)
+            .filter_map(|arg| match arg.operand {
+                Operand::Vector { first, .. } => Some(first),
+                _ => None,
+            })
+            .collect();
+        match kind {
+            "read" => {
+                let (target, _) = self.vector_register(instruction.arg(Role::Result))?;
+                let mut register = target;
+                // Everything is read before anything is written.
+                let mut values = Vec::new();
+                for offset in offsets {
+                    let offset = self.binary(BinaryOp::Add, base, Value::Word(offset));
+                    values.extend(self.emit_many(Op::LoadShared {
+                        offset,
+                        width,
+                        words: units,
+                    }));
+                }
+                let shape = Access {
+                    width,
+                    units,
+                    signed,
+                };
+                for value in values {
+                    let value = self.extend(value, &shape);
+                    self.set_vector(register, value);
+                    register = register.wrapping_add(1);
+                }
+                Ok(())
+            }
+            "write" => {
+                if data.len() != offsets.len() {
+                    return self.fail("the instruction is not decoded");
+                }
+                let guard = self.live();
+                for (offset, &register) in offsets.into_iter().zip(&data) {
+                    let offset = self.binary(BinaryOp::Add, base, Value::Word(offset));
+                    let mut values = Vec::new();
+                    for unit in 0..units {
+                        values.push(self.vector_word(register.wrapping_add(unit))?);
+                    }
+                    self.emit(Op::StoreShared {
+                        offset,
+                        width,
+                        values,
+                        guard,
+                    });
+                }
+                Ok(())
+            }
+            _ => {
+                // The atomic operations, with or without the old word
+                // returned.
+                let returns = kind.ends_with("_rtn");
+                let op = match kind.strip_suffix("_rtn").unwrap_or(kind) {
+                    "add" => AtomicOp::Add,
+                    "sub" => AtomicOp::Sub,
+                    "inc" => AtomicOp::Increment,
+                    "dec" => AtomicOp::Decrement,
+                    "min" if ty == "i32" => AtomicOp::MinSigned,
+                    "min" if ty == "u32" => AtomicOp::MinUnsigned,
+                    "max" if ty == "i32" => AtomicOp::MaxSigned,
+                    "max" if ty == "u32" => AtomicOp::MaxUnsigned,
+                    "and" => AtomicOp::And,
+                    "or" => AtomicOp::Or,
+                    "xor" => AtomicOp::Xor,
+                    "wrxchg" => AtomicOp::Swap,
+                    "cmpst" => AtomicOp::CompareSwap,
+                    _ => {
+                        return self
+                            .fail("a group-shared memory operation the lift has no rule for");
+                    }
+                };
+                if (width, units) != (32, 1) {
+                    return self.fail("an atomic operation on other than a 32-bit word");
+                }
+                let (value, compare) = match (op, data.as_slice()) {
+                    // The comparand comes first, then the new word.
+                    (AtomicOp::CompareSwap, &[compare, new]) => {
+                        (self.vector_word(new)?, self.vector_word(compare)?)
+                    }
+                    (AtomicOp::CompareSwap, _) => {
+                        return self.fail("the instruction is not decoded");
+                    }
+                    (_, &[value, ..]) => (self.vector_word(value)?, Value::Word(0)),
+                    _ => return self.fail("the instruction is not decoded"),
+                };
+                let offset = self.binary(BinaryOp::Add, base, Value::Word(offsets[0]));
+                let guard = self.live();
+                let old = self.emit(Op::Atomic {
+                    op,
+                    place: AtomicPlace::Shared(offset),
+                    value,
+                    compare,
+                    guard,
+                });
+                if returns {
+                    let (target, _) = self.vector_register(instruction.arg(Role::Result))?;
+                    self.set_vector(target, old);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The lane swizzle within a quad. With bit 15 of the offset set, the
+    /// low 8 bits pick a source lane of the same quad for each of its four
+    /// lanes. A source lane that is not live gives zero. No memory is
+    /// touched.
+    fn swizzle(&mut self, instruction: &Instruction, offset0: u8, offset1: u8) -> Lift<()> {
         if offset1 & 0x80 == 0 {
             return self.fail("a lane swizzle across quads");
         }
@@ -449,7 +712,7 @@ impl Lifter<'_> {
         ];
         let (target, _) = self.vector_register(instruction.arg(Role::Result))?;
         let (source, _) = self.vector_register(instruction.arg(Role::Address))?;
-        let value = self.emit(Op::Get(Var::Vector(source)));
+        let value = self.vector_word(source)?;
         let active = self.live();
         let swizzled = self.emit(Op::QuadPermute {
             value,

@@ -217,6 +217,89 @@ pub(crate) mod asm {
         checked(name, vec![first, second])
     }
 
+    /// A two-source operation whose first source each lane reads from
+    /// another lane of its group of eight: `lanes[n]` is where lane n
+    /// reads.
+    pub(crate) fn vop2_eight(name: &str, target: u8, a: u8, b: u8, lanes: [u32; 8]) -> Vec<u32> {
+        let first =
+            op(Format::Vop2, name) << 25 | u32::from(target) << 17 | u32::from(b) << 9 | 0xE9;
+        let mut second = u32::from(a);
+        for (lane, pick) in lanes.into_iter().enumerate() {
+            second |= pick << (8 + 3 * lane);
+        }
+        checked(name, vec![first, second])
+    }
+
+    /// A two-source operation whose first source each lane reads from
+    /// another lane of its row of sixteen, chosen by a control number.
+    /// `bound` makes a read that finds nothing give zero.
+    pub(crate) fn vop2_rows(
+        name: &str,
+        target: u8,
+        a: u8,
+        b: u8,
+        control: u32,
+        bound: bool,
+    ) -> Vec<u32> {
+        let first =
+            op(Format::Vop2, name) << 25 | u32::from(target) << 17 | u32::from(b) << 9 | 0xFA;
+        let second = u32::from(a) | control << 8 | u32::from(bound) << 19 | 0xFF << 24;
+        checked(name, vec![first, second])
+    }
+
+    /// `v_permlanex16_b32`: each lane reads a lane of the other row of its
+    /// half of the wave, picked by four bits of the two selectors. Bit 0 of
+    /// `select` fetches lanes that are not live.
+    pub(crate) fn across_rows(target: u8, source: u8, selectors: i8, select: u32) -> Vec<u32> {
+        vop3(
+            "v_permlanex16_b32",
+            u32::from(target),
+            [O::V(source), O::K(selectors), O::K(selectors)],
+            select << 3,
+            0,
+        )
+    }
+
+    /// `v_readlane_b32`: one lane's word into a scalar register.
+    pub(crate) fn read_lane(target: u8, source: u8, lane: i8) -> Vec<u32> {
+        vop3(
+            "v_readlane_b32",
+            u32::from(target),
+            [O::V(source), O::K(lane), O::K(0)],
+            0,
+            0,
+        )
+    }
+
+    /// An operation on the group-shared memory: the result, address and two
+    /// data registers, and the two offset bytes.
+    pub(crate) fn ds(
+        name: &str,
+        result: u8,
+        address: u8,
+        data: [u8; 2],
+        offsets: [u8; 2],
+    ) -> Vec<u32> {
+        let first = 0x36 << 26
+            | op(Format::Ds, name) << 18
+            | u32::from(offsets[1]) << 8
+            | u32::from(offsets[0]);
+        let second = u32::from(result) << 24
+            | u32::from(data[1]) << 16
+            | u32::from(data[0]) << 8
+            | u32::from(address);
+        checked(name, vec![first, second])
+    }
+
+    /// Sets the bit of a buffer or by-address operation that makes an
+    /// atomic one return the word as it was.
+    pub(crate) fn returning(mut words: Vec<u32>) -> Vec<u32> {
+        // Buffer operations have it at bit 14, the others at bit 16.
+        let buffer = words[0] >> 26 == 0x38;
+        words[0] |= 1 << if buffer { 14 } else { 16 };
+        words
+    }
+
     pub(crate) fn smem(
         name: &str,
         data: u8,
@@ -2083,24 +2166,6 @@ fn an_instruction_without_a_rule_fails_the_program_and_names_itself() {
     );
     let error = lift(&mesh, &StageData::NotRead).unwrap_err();
     assert_eq!(error.offset, None);
-
-    // A register that is a mask on one path and a number on the other
-    // cannot be read after the join.
-    let code = Code::new()
-        .i(asm::sopc("s_cmp_eq_u32", O::S(8), O::K(0)))
-        .branch("s_cbranch_scc1", "mask")
-        .i(asm::sop1("s_mov_b32", O::S(12), O::S(9)))
-        .i(asm::sop1("s_mov_b32", O::S(13), O::S(9)))
-        .branch("s_branch", "join")
-        .label("mask")
-        .i(asm::vopc("v_cmp_lt_u32", O::V(3), 0))
-        .i(asm::sop1("s_mov_b64", O::S(12), O::Vcc))
-        .label("join")
-        .i(asm::sop2("s_add_u32", O::S(14), O::S(12), O::K(1)))
-        .end();
-    let error = lift(&vertex(code), &vertex_data()).unwrap_err();
-    assert_eq!(error.instruction, "s_add_u32");
-    assert!(error.reason.contains("lane mask on one path"));
 }
 
 #[test]
@@ -2125,5 +2190,872 @@ fn a_loop_entered_in_its_middle_is_lifted_to_a_reducible_graph() {
         });
         assert!(ControlFlow::of(&function).reducible);
         assert_eq!(position(&outcome, 2)[0], if user == 0 { 69 } else { 68 });
+    }
+}
+
+/// A vertex program over a wave of 64 or 32 lanes with user data in `s8`
+/// to `s11`.
+fn wave_program(wide: bool, code: Vec<u32>) -> Program {
+    let wave = if wide {
+        WaveSize::Wave64
+    } else {
+        WaveSize::Wave32
+    };
+    program(HardwareStage::Vertex, wave, code, &[8, 9, 10, 11])
+}
+
+/// The names of the mask-wide scalar operations for a wave size: the one
+/// that saves the live mask and makes every lane live, the bitwise and, and
+/// the move.
+fn mask_operations(wide: bool) -> (&'static str, &'static str, &'static str) {
+    if wide {
+        ("s_or_saveexec_b64", "s_and_b64", "s_mov_b64")
+    } else {
+        ("s_or_saveexec_b32", "s_and_b32", "s_mov_b32")
+    }
+}
+
+/// The section a compiler writes out for a reduction over the wave: the
+/// words of `value` in the live lanes (and, with `part`, only those of
+/// them whose bit is set in the mask at that register), folded with the
+/// operation `name`, into `s20`. `v1` and `v2` are its scratch registers,
+/// `s30` holds the saved mask and `s28` the lanes that take part.
+fn reduction(name: &str, identity: u32, wide: bool, part: Option<u8>, value: u8) -> Vec<u32> {
+    let (save, and, mov) = mask_operations(wide);
+    let mut words = asm::sop1(save, O::S(30), O::K(-1));
+    let mut mask = O::S(30);
+    if let Some(part) = part {
+        words.extend(asm::sop2(and, O::S(28), O::S(part), O::S(30)));
+        mask = O::S(28);
+    }
+    // The identity goes into the lanes that take no part.
+    let other = match identity {
+        0 => O::K(0),
+        u32::MAX => O::K(-1),
+        identity => {
+            words.extend(asm::vop1("v_mov_b32", 1, O::Lit(identity)));
+            O::V(1)
+        }
+    };
+    words.extend(asm::vop3(
+        "v_cndmask_b32",
+        1,
+        [other, O::V(value), mask],
+        0,
+        0,
+    ));
+    // Pairs, fours, eights, the row, the two rows, and for 64 lanes the
+    // two halves.
+    for lanes in [
+        [1, 0, 3, 2, 5, 4, 7, 6],
+        [2, 2, 0, 0, 6, 6, 4, 4],
+        [4, 4, 4, 4, 0, 0, 0, 0],
+    ] {
+        words.extend(asm::vop2_eight(name, 1, 1, 1, lanes));
+    }
+    words.extend(asm::vop2_rows(name, 1, 1, 1, 0x140, true));
+    words.extend(asm::across_rows(2, 1, 0, 0));
+    words.extend(asm::vop2(name, 1, O::V(2), 1));
+    if wide {
+        words.extend(asm::read_lane(20, 1, 32));
+        words.extend(asm::vop2(name, 1, O::S(20), 1));
+    }
+    words.extend(asm::read_lane(20, 1, 0));
+    words.extend(asm::sop1(mov, O::Exec, O::S(30)));
+    words
+}
+
+/// Whether a lane is live after `v_cmpx_lt_u32 v3, v0` in a vertex program.
+fn lane_is_live(lane: usize) -> bool {
+    lane_word(lane, 2) < lane_word(lane, 1)
+}
+
+/// Whether a lane's bit is set by `v_cmp_lt_u32 vcc, 0x40000000, v3`.
+fn lane_takes_part(lane: usize) -> bool {
+    lane_word(lane, 2) > 0x4000_0000
+}
+
+#[test]
+fn a_reduction_the_compiler_wrote_out_becomes_one_operation_over_the_wave() {
+    // Every operation, in waves of both sizes, over the live lanes and
+    // over a part of them. The float sum gets floats made from integers,
+    // large enough that every addition rounds, so that the order of the
+    // additions shows; the others get the lanes' raw words, NaNs and both
+    // zeroes among them.
+    let operations: [(&str, u32); 11] = [
+        ("v_or_b32", 0),
+        ("v_and_b32", u32::MAX),
+        ("v_xor_b32", 0),
+        ("v_add_nc_u32", 0),
+        ("v_min_u32", u32::MAX),
+        ("v_max_u32", 0),
+        ("v_min_i32", 0x7FFF_FFFF),
+        ("v_max_i32", 0x8000_0000),
+        ("v_min_f32", 0x7F80_0000),
+        ("v_max_f32", 0xFF80_0000),
+        ("v_add_f32", 0),
+    ];
+    for wide in [true, false] {
+        let lanes = if wide { 64 } else { 32 };
+        let (_, _, mov) = mask_operations(wide);
+        for (name, identity) in operations {
+            for part in [None, Some(24)] {
+                let value = if name == "v_add_f32" { 6 } else { 0 };
+                let code = Code::new()
+                    .i(asm::sop1(mov, O::S(10), O::Exec))
+                    .i(asm::vop1("v_cvt_f32_u32", 6, O::V(0)))
+                    .i(asm::vopc("v_cmp_lt_u32", O::Lit(0x4000_0000), 3))
+                    .i(asm::sop1(mov, O::S(24), O::Vcc))
+                    .i(asm::vopc("v_cmpx_lt_u32", O::V(3), 0))
+                    .i(reduction(name, identity, wide, part, value))
+                    // Every lane gets the result, the ones that took no
+                    // part too.
+                    .i(asm::sop1(mov, O::Exec, O::S(10)))
+                    .i(asm::vop1("v_mov_b32", 5, O::S(20)))
+                    .i(export_position([5, 0, 3, 5]))
+                    .end();
+                let (function, outcome) =
+                    run_both(&wave_program(wide, code), &vertex_data(), lanes);
+                let ops: Vec<&Op> = function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.insts)
+                    .map(|inst| &inst.op)
+                    .collect();
+                let reductions = ops
+                    .iter()
+                    .filter(|op| matches!(op, Op::Reduce { .. }))
+                    .count();
+                assert_eq!(reductions, 1, "{name}\n{function}");
+                // Nothing is left that reads a lane by its number.
+                assert!(
+                    !ops.iter().any(|op| matches!(
+                        op,
+                        Op::ReadLane { .. } | Op::QuadPermute { .. } | Op::LaneBit { .. }
+                    )),
+                    "{name}\n{function}"
+                );
+                // For the integer operations the result is worked out here
+                // a third time.
+                let fold: Option<fn(u32, u32) -> u32> = match name {
+                    "v_or_b32" => Some(|a, b| a | b),
+                    "v_and_b32" => Some(|a, b| a & b),
+                    "v_xor_b32" => Some(|a, b| a ^ b),
+                    "v_add_nc_u32" => Some(u32::wrapping_add),
+                    "v_min_u32" => Some(u32::min),
+                    "v_max_u32" => Some(u32::max),
+                    "v_min_i32" => Some(|a, b| (a as i32).min(b as i32) as u32),
+                    "v_max_i32" => Some(|a, b| (a as i32).max(b as i32) as u32),
+                    _ => None,
+                };
+                if let Some(fold) = fold {
+                    let expected = (0..lanes)
+                        .filter(|&lane| lane_is_live(lane))
+                        .filter(|&lane| part.is_none() || lane_takes_part(lane))
+                        .fold(identity, |folded, lane| fold(folded, lane_word(lane, 1)));
+                    for lane in 0..lanes {
+                        assert_eq!(position(&outcome, lane)[0], expected, "{name} lane {lane}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The section a compiler writes out for a prefix sum: in each lane the sum
+/// of `value` over the live lanes below it (and the lane's own, if
+/// `inclusive`), into `v3`. `v2` and `v4` are scratch, as is `s21`.
+fn prefix_sum(wide: bool, inclusive: bool, value: u8) -> Vec<u32> {
+    let (save, _, mov) = mask_operations(wide);
+    let add = "v_add_nc_u32";
+    let mut words = asm::sop1(save, O::S(30), O::K(-1));
+    words.extend(asm::vop3(
+        "v_cndmask_b32",
+        2,
+        [O::K(0), O::V(value), O::S(30)],
+        0,
+        0,
+    ));
+    words.extend(asm::vop1("v_mov_b32", 3, O::V(2)));
+    // Within each row of sixteen: shifts by one, two, four and eight.
+    words.extend(asm::vop2_rows(add, 3, 3, 3, 0x111, true));
+    for control in [0x112, 0x114, 0x118] {
+        words.extend(asm::vop2_rows(add, 3, 3, 3, control, false));
+    }
+    // The upper row of each half takes the lower row's total.
+    words.extend(asm::sop1("s_mov_b32", O::Exec, O::Lit(0xFFFF_0000)));
+    if wide {
+        words.extend(asm::sop1("s_mov_b32", O::ExecHigh, O::Lit(0xFFFF_0000)));
+    }
+    words.extend(asm::across_rows(4, 3, -1, 9));
+    words.extend(asm::vop2(add, 3, O::V(4), 3));
+    if wide {
+        // The upper half takes the lower half's total.
+        words.extend(asm::read_lane(21, 3, 31));
+        words.extend(asm::sop1("s_mov_b32", O::Exec, O::K(0)));
+        words.extend(asm::sop1("s_mov_b32", O::ExecHigh, O::K(-1)));
+        words.extend(asm::vop2(add, 3, O::S(21), 3));
+        words.extend(asm::sop1("s_mov_b32", O::ExecHigh, O::K(-1)));
+    }
+    words.extend(asm::sop1("s_mov_b32", O::Exec, O::K(-1)));
+    if !inclusive {
+        words.extend(asm::vop2("v_sub_nc_u32", 3, O::V(3), 2));
+    }
+    words.extend(asm::sop1(mov, O::Exec, O::S(30)));
+    words
+}
+
+#[test]
+fn a_prefix_sum_the_compiler_wrote_out_becomes_one_operation_over_the_wave() {
+    for wide in [true, false] {
+        let lanes = if wide { 64 } else { 32 };
+        for inclusive in [false, true] {
+            let code = Code::new()
+                .i(asm::vopc("v_cmpx_lt_u32", O::V(3), 0))
+                .i(prefix_sum(wide, inclusive, 0))
+                .i(asm::vop1("v_mov_b32", 5, O::V(3)))
+                .i(export_position([5, 2, 0, 3]))
+                .end();
+            let (function, outcome) = run_both(&wave_program(wide, code), &vertex_data(), lanes);
+            let sums = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .filter(|inst| matches!(inst.op, Op::PrefixSum { .. }))
+                .count();
+            assert_eq!(sums, 1, "{function}");
+            let mut sum = 0u32;
+            for lane in (0..lanes).filter(|&lane| lane_is_live(lane)) {
+                let own = lane_word(lane, 1);
+                let expected = if inclusive {
+                    sum.wrapping_add(own)
+                } else {
+                    sum
+                };
+                // The sum, and the scratch register that holds the lane's
+                // own word.
+                assert_eq!(position(&outcome, lane)[..2], [expected, own]);
+                sum = sum.wrapping_add(own);
+            }
+        }
+    }
+}
+
+#[test]
+fn what_a_reduction_leaves_behind_cannot_be_read_and_other_permutations_are_refused() {
+    // `v2` holds the fold of the other row of sixteen when the section
+    // ends, which is not something a host lane can be given.
+    let code = Code::new()
+        .i(reduction("v_or_b32", 0, true, None, 0))
+        .i(asm::vop1("v_mov_b32", 5, O::V(2)))
+        .i(export_position([5, 5, 5, 5]))
+        .end();
+    let error = lift(&wave_program(true, code), &vertex_data()).unwrap_err();
+    assert_eq!(error.instruction, "v_mov_b32");
+    assert!(error.reason.contains("whole-wave section left"), "{error}");
+
+    // Written again, it is a register like any other.
+    let code = Code::new()
+        .i(reduction("v_or_b32", 0, true, None, 0))
+        .i(asm::vop1("v_mov_b32", 2, O::V(3)))
+        .i(asm::vop1("v_mov_b32", 5, O::V(2)))
+        .i(export_position([5, 5, 5, 5]))
+        .end();
+    run_both(&wave_program(true, code), &vertex_data(), 64);
+
+    // The same steps without the section around them, or with a step that
+    // counts a lane twice, are not a reduction.
+    let code = Code::new()
+        .i(asm::vop2_eight(
+            "v_or_b32",
+            1,
+            0,
+            0,
+            [1, 0, 3, 2, 5, 4, 7, 6],
+        ))
+        .i(export_position([1, 1, 1, 1]))
+        .end();
+    let error = lift(&wave_program(true, code), &vertex_data()).unwrap_err();
+    assert!(error.reason.contains("eight lanes"), "{error}");
+    let (save, _, mov) = mask_operations(true);
+    let code = Code::new()
+        .i(asm::sop1(save, O::S(30), O::K(-1)))
+        .i(asm::vop3(
+            "v_cndmask_b32",
+            1,
+            [O::K(0), O::V(0), O::S(30)],
+            0,
+            0,
+        ))
+        .i(asm::vop2_eight(
+            "v_add_nc_u32",
+            1,
+            1,
+            1,
+            [1, 0, 3, 2, 5, 4, 7, 6],
+        ))
+        // Lane 0 would add lane 1's pair, which holds lane 0 already.
+        .i(asm::vop2_eight(
+            "v_add_nc_u32",
+            1,
+            1,
+            1,
+            [1, 0, 3, 2, 5, 4, 7, 6],
+        ))
+        .i(asm::read_lane(20, 1, 0))
+        .i(asm::sop1(mov, O::Exec, O::S(30)))
+        .i(asm::vop1("v_mov_b32", 5, O::S(20)))
+        .i(export_position([5, 5, 5, 5]))
+        .end();
+    let error = lift(&wave_program(true, code), &vertex_data()).unwrap_err();
+    assert!(error.reason.contains("whole-wave section left"), "{error}");
+
+    // A lane read of a copy the section made is a step the lift has no
+    // rule for: the section is then lifted like any other code, and fails
+    // at its first permutation.
+    let mut section = reduction("v_or_b32", 0, true, None, 0);
+    let restore = section.split_off(section.len() - 1);
+    section.extend(asm::vop1("v_mov_b32", 4, O::V(3)));
+    section.extend(asm::read_lane(21, 4, 5));
+    section.extend(restore);
+    let code = Code::new()
+        .i(section)
+        .i(asm::vop1("v_mov_b32", 5, O::S(20)))
+        .i(export_position([5, 5, 5, 5]))
+        .end();
+    let error = lift(&wave_program(true, code), &vertex_data()).unwrap_err();
+    assert!(error.reason.contains("eight lanes"), "{error}");
+}
+
+#[test]
+fn a_count_of_all_lanes_below_is_the_lanes_number() {
+    // With every bit of the mask operand set the count is the lane's
+    // number, whichever lanes are live; with a number, the bits of the
+    // number below the lane.
+    for wide in [true, false] {
+        let lanes = if wide { 64 } else { 32 };
+        let count = |target: u8, low: O, high: O| {
+            let mut words = asm::vop3(
+                "v_mbcnt_lo_u32_b32",
+                u32::from(target),
+                [low, O::K(0), O::K(0)],
+                0,
+                0,
+            );
+            if wide {
+                words.extend(asm::vop3(
+                    "v_mbcnt_hi_u32_b32",
+                    u32::from(target),
+                    [high, O::V(target), O::K(0)],
+                    0,
+                    0,
+                ));
+            }
+            words
+        };
+        let code = Code::new()
+            .i(asm::vopc("v_cmpx_lt_u32", O::V(3), 0))
+            .i(count(5, O::K(-1), O::K(-1)))
+            .i(count(6, O::S(8), O::S(9)))
+            .i(export_position([5, 6, 0, 3]))
+            .end();
+        let (function, outcome) = run_both(&wave_program(wide, code), &vertex_data(), lanes);
+        assert!(!function.has_cross_lane(), "{function}");
+        let user = TestHost::new().user;
+        let number = u64::from(user[8]) | if wide { u64::from(user[9]) << 32 } else { 0 };
+        for lane in (0..lanes).filter(|&lane| lane_is_live(lane)) {
+            let below = (number & ((1u64 << lane) - 1)).count_ones();
+            assert_eq!(position(&outcome, lane)[..2], [lane as u32, below]);
+        }
+    }
+}
+
+#[test]
+fn a_register_that_is_a_mask_on_one_path_and_a_number_on_another_gets_both_forms() {
+    // After the join the register is read as a number and as a mask. On
+    // the path where it holds a number, the mask is the lane's own bit of
+    // it; on the path where it holds a mask, the number is the lanes' bits
+    // gathered.
+    let code = Code::new()
+        .i(asm::sopc("s_cmp_eq_u32", O::S(8), O::K(0)))
+        .branch("s_cbranch_scc1", "mask")
+        .i(asm::sop1("s_mov_b32", O::S(12), O::S(9)))
+        .i(asm::sop1("s_mov_b32", O::S(13), O::S(10)))
+        .branch("s_branch", "join")
+        .label("mask")
+        .i(asm::vopc("v_cmp_lt_u32", O::V(3), 0))
+        .i(asm::sop1("s_mov_b64", O::S(12), O::Vcc))
+        .label("join")
+        .i(asm::sop2("s_add_u32", O::S(14), O::S(12), O::K(1)))
+        .i(asm::sop2("s_add_u32", O::S(15), O::S(13), O::K(1)))
+        .i(asm::vop1("v_mov_b32", 5, O::S(14)))
+        .i(asm::vop1("v_mov_b32", 6, O::S(15)))
+        .i(asm::vop3(
+            "v_cndmask_b32",
+            7,
+            [O::K(0), O::K(1), O::S(12)],
+            0,
+            0,
+        ))
+        .i(export_position([5, 6, 7, 0]))
+        .end();
+    for user in [0, 1] {
+        let (_, outcome) = run_both_with(&vertex(code.clone()), &vertex_data(), 64, |host| {
+            host.user[8] = user
+        });
+        let host = TestHost::new();
+        let bits = if user == 0 {
+            (0..64).fold(0u64, |bits, lane| {
+                bits | u64::from(lane_is_live(lane)) << lane
+            })
+        } else {
+            u64::from(host.user[9]) | u64::from(host.user[10]) << 32
+        };
+        for lane in 0..64 {
+            assert_eq!(
+                position(&outcome, lane)[..3],
+                [
+                    (bits as u32).wrapping_add(1),
+                    ((bits >> 32) as u32).wrapping_add(1),
+                    (bits >> lane & 1) as u32
+                ],
+                "user {user} lane {lane}"
+            );
+        }
+    }
+
+    // A known constant is not taken for a mask: its bits would be read by
+    // the console's lane numbers. The register cannot be read then.
+    let code = Code::new()
+        .i(asm::sopc("s_cmp_eq_u32", O::S(8), O::K(0)))
+        .branch("s_cbranch_scc1", "mask")
+        .i(asm::sop1("s_mov_b32", O::S(12), O::K(5)))
+        .i(asm::sop1("s_mov_b32", O::S(13), O::K(7)))
+        .branch("s_branch", "join")
+        .label("mask")
+        .i(asm::vopc("v_cmp_lt_u32", O::V(3), 0))
+        .i(asm::sop1("s_mov_b64", O::S(12), O::Vcc))
+        .label("join")
+        .i(asm::sop2("s_add_u32", O::S(14), O::S(12), O::K(1)))
+        .end();
+    let error = lift(&vertex(code), &vertex_data()).unwrap_err();
+    assert_eq!(error.instruction, "s_add_u32");
+    assert!(error.reason.contains("lane mask on one path"));
+}
+
+/// A buffer descriptor in `s20` to `s23` around the address in `s10` and
+/// `s11`: records of one byte, no bound.
+fn raw_descriptor() -> Vec<u32> {
+    let mut words = asm::sop1("s_mov_b32", O::S(20), O::S(10));
+    words.extend(asm::sop2(
+        "s_or_b32",
+        O::S(21),
+        O::S(11),
+        O::Lit(0x0001_0000),
+    ));
+    words.extend(asm::sop1("s_mov_b32", O::S(22), O::K(-1)));
+    words.extend(asm::sop1("s_mov_b32", O::S(23), O::Lit(0x1000_0000)));
+    words
+}
+
+#[test]
+fn atomic_operations_change_memory_a_lane_at_a_time() {
+    // Sixty-four lanes work on eight words, so every word is worked on by
+    // several lanes. Each operation has its own eight words.
+    let operations = [
+        "add", "sub", "smin", "umin", "smax", "umax", "and", "or", "xor", "inc", "dec", "swap",
+    ];
+    let mut code = Code::new()
+        .i(raw_descriptor())
+        .i(asm::vopc("v_cmpx_lt_u32", O::V(3), 0))
+        .i(asm::vop2("v_and_b32", 6, O::K(7), 0))
+        .i(asm::vop2("v_lshlrev_b32", 7, O::K(2), 6));
+    for (index, operation) in operations.iter().enumerate() {
+        code = code.i(asm::mubuf(
+            &format!("buffer_atomic_{operation}"),
+            0,
+            7,
+            20,
+            0x40 * index as u32,
+            false,
+            true,
+        ));
+    }
+    let code = code
+        // A compare-and-swap of the lane's word for a zero: the first lane
+        // at each word wins. The new word is in v8, the comparand in v9.
+        .i(asm::vop1("v_mov_b32", 8, O::V(0)))
+        .i(asm::vop1("v_mov_b32", 9, O::K(0)))
+        .i(asm::mubuf(
+            "buffer_atomic_cmpswap",
+            8,
+            7,
+            20,
+            0x400,
+            false,
+            true,
+        ))
+        // The forms that give the old word back: each lane sees what the
+        // lanes before it left.
+        .i(asm::vop1("v_mov_b32", 10, O::V(3)))
+        .i(asm::returning(asm::mubuf(
+            "buffer_atomic_add",
+            10,
+            7,
+            20,
+            0x440,
+            false,
+            true,
+        )))
+        .i(asm::vop1("v_mov_b32", 11, O::V(3)))
+        .i(asm::returning(asm::mubuf(
+            "buffer_atomic_cmpswap",
+            11,
+            7,
+            20,
+            0x480,
+            false,
+            true,
+        )))
+        // By address: the base in s10 and s11, the offset in v7.
+        .i(asm::global("global_atomic_umax", 0, 7, 0, 10, 0x4C0))
+        .i(asm::returning(asm::global(
+            "global_atomic_add",
+            13,
+            7,
+            3,
+            10,
+            0x500,
+        )))
+        .i(export_position([10, 11, 13, 0]))
+        .end();
+    let view = 0x34_0000_0100u64;
+    let prepare = |host: &mut TestHost| {
+        host.user[10] = view as u32;
+        host.user[11] = (view >> 32) as u32;
+        // The words the compare-and-swaps work on start as zero.
+        host.write_words(view + 0x400, &[0; 8]);
+        host.write_words(view + 0x480, &[0; 8]);
+    };
+    let (function, outcome) = run_both_with(&vertex(code), &vertex_data(), 64, prepare);
+    assert!(!function.has_cross_lane());
+    let mut host = TestHost::new();
+    prepare(&mut host);
+    let stored = |at: u64| {
+        let bytes: Vec<u8> = (0..4).map(|byte| outcome.stores[&(at + byte)]).collect();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    };
+    let lanes_at = |word: u64| {
+        (0..64).filter(move |&lane| lane_is_live(lane) && u64::from(lane_word(lane, 1) & 7) == word)
+    };
+    for word in 0..8u64 {
+        if lanes_at(word).next().is_none() {
+            continue;
+        }
+        // The sum: what was there and every lane's word.
+        let before = host.load(view + 4 * word, 32);
+        let sum = lanes_at(word).fold(before, |sum, lane| sum.wrapping_add(lane_word(lane, 1)));
+        assert_eq!(stored(view + 4 * word), sum);
+        // The swap: the last lane's word.
+        let last = lanes_at(word).next_back().unwrap();
+        assert_eq!(stored(view + 0x40 * 11 + 4 * word), lane_word(last, 1));
+        // The compare-and-swap: the first lane's word that is not zero.
+        let swapped = lanes_at(word).fold(
+            0,
+            |held, lane| {
+                if held == 0 { lane_word(lane, 1) } else { held }
+            },
+        );
+        assert_eq!(stored(view + 0x400 + 4 * word), swapped);
+        // The sum that gives the old word back: a running sum.
+        let mut running = host.load(view + 0x440 + 4 * word, 32);
+        for lane in lanes_at(word) {
+            assert_eq!(position(&outcome, lane)[0], running);
+            running = running.wrapping_add(lane_word(lane, 2));
+        }
+    }
+}
+
+/// A compute program of one wave of 64 threads with the given amount of
+/// group-shared memory and user data in `s4` to `s7`.
+fn shared_program(code: Vec<u32>, shared_bytes: u32) -> (Program, StageData) {
+    let program = program(
+        HardwareStage::Compute,
+        WaveSize::Wave64,
+        code,
+        &[4, 5, 6, 7],
+    );
+    let data = StageData::Compute(ComputeData {
+        // Eight user registers, one thread component, the shared memory
+        // in units of 512 bytes.
+        resources: 8 << 1 | (shared_bytes / 512) << 15,
+        group_size: [64, 1, 1],
+    });
+    (program, data)
+}
+
+#[test]
+fn lanes_see_what_other_lanes_wrote_to_the_shared_memory() {
+    // v0 is the thread's number. Each thread writes a word at its own
+    // place, then reads the place of the thread opposite: what it reads was
+    // written by another lane at an earlier instruction.
+    let code = Code::new()
+        // A descriptor for the results: s20 to s23 around s6 and s7.
+        .i(asm::sop1("s_mov_b32", O::S(20), O::S(6)))
+        .i(asm::sop2(
+            "s_or_b32",
+            O::S(21),
+            O::S(7),
+            O::Lit(0x0001_0000),
+        ))
+        .i(asm::sop1("s_mov_b32", O::S(22), O::K(-1)))
+        .i(asm::sop1("s_mov_b32", O::S(23), O::Lit(0x1000_0000)))
+        .i(asm::vop2("v_lshlrev_b32", 6, O::K(2), 0))
+        .i(asm::vop3(
+            "v_mul_lo_u32",
+            7,
+            [O::S(4), O::V(0), O::K(0)],
+            0,
+            0,
+        ))
+        .i(asm::vop2("v_sub_nc_u32", 8, O::K(63), 0))
+        .i(asm::vop2("v_lshlrev_b32", 8, O::K(2), 8))
+        .i(asm::vop1("v_mov_b32", 12, O::K(0)))
+        .i(asm::ds("ds_write_b32", 0, 6, [7, 0], [0, 0]))
+        .i(asm::ds("ds_read_b32", 16, 8, [0, 0], [0, 0]))
+        // Two words at once, 64 and 130 words on.
+        .i(asm::ds("ds_write2_b32", 0, 6, [16, 0], [64, 130]))
+        .i(asm::ds("ds_read2_b32", 17, 8, [0, 0], [64, 130]))
+        // Atomic operations of every lane on one word at byte 0x320, and
+        // the ones that give the old word back at 0x330 and on.
+        .i(asm::ds("ds_add_u32", 0, 12, [0, 0], [0x20, 0x03]))
+        .i(asm::ds("ds_min_u32", 0, 12, [7, 0], [0x24, 0x03]))
+        .i(asm::ds("ds_max_i32", 0, 12, [7, 0], [0x28, 0x03]))
+        .i(asm::ds("ds_or_b32", 0, 12, [7, 0], [0x2C, 0x03]))
+        .i(asm::ds("ds_add_rtn_u32", 19, 12, [7, 0], [0x30, 0x03]))
+        .i(asm::ds("ds_wrxchg_rtn_b32", 20, 12, [7, 0], [0x34, 0x03]))
+        // A compare-and-store of the thread's number for a zero: the
+        // comparand is the first data register.
+        .i(asm::ds("ds_cmpst_rtn_b32", 21, 12, [12, 7], [0x38, 0x03]))
+        .i(asm::sopp("s_barrier", 0))
+        .i(asm::ds("ds_read_b32", 22, 12, [0, 0], [0x20, 0x03]))
+        .i(asm::ds("ds_read_b32", 23, 12, [0, 0], [0x24, 0x03]))
+        // Bytes and halves, at odd places; a signed half read.
+        .i(asm::ds("ds_write_b8", 0, 0, [7, 0], [0x01, 0x05]))
+        .i(asm::ds("ds_write_b16", 0, 6, [7, 0], [0x01, 0x06]))
+        .i(asm::ds("ds_read_u8", 24, 0, [0, 0], [0x01, 0x05]))
+        .i(asm::ds("ds_read_i16", 25, 6, [0, 0], [0x01, 0x06]))
+        // In units of 64 words; and past the end of the memory, where a
+        // write is dropped and a read gives zero.
+        .i(asm::ds("ds_write2st64_b32", 0, 6, [7, 16], [7, 8]))
+        .i(asm::ds("ds_read2st64_b32", 26, 8, [0, 0], [7, 8]))
+        .i(asm::ds("ds_write_b32", 0, 6, [7, 0], [0xFE, 0xFF]))
+        .i(asm::ds("ds_read_b32", 28, 6, [0, 0], [0xFE, 0xFF]))
+        // Everything read goes to memory, 64 bytes for each thread.
+        .i(asm::vop2("v_lshlrev_b32", 9, O::K(6), 0))
+        .i(asm::mubuf(
+            "buffer_store_dwordx4",
+            16,
+            9,
+            20,
+            0,
+            false,
+            true,
+        ))
+        .i(asm::mubuf(
+            "buffer_store_dwordx4",
+            20,
+            9,
+            20,
+            16,
+            false,
+            true,
+        ))
+        .i(asm::mubuf(
+            "buffer_store_dwordx4",
+            24,
+            9,
+            20,
+            32,
+            false,
+            true,
+        ))
+        .i(asm::mubuf("buffer_store_dword", 28, 9, 20, 48, false, true))
+        .end();
+    let (program, data) = shared_program(code, 4096);
+    let view = 0x21_0000_4000u64;
+    let prepare = |host: &mut TestHost| {
+        host.user[6] = view as u32;
+        host.user[7] = (view >> 32) as u32;
+    };
+    let (function, outcome) = run_both_with(&program, &data, 64, prepare);
+    assert_eq!(function.interface.shared_bytes, 4096);
+    let barriers = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter(|inst| matches!(inst.op, Op::Barrier))
+        .count();
+    assert_eq!(barriers, 1);
+    let stored = |lane: u64, word: u64| {
+        let at = view + 64 * lane + 4 * word;
+        let bytes: Vec<u8> = (0..4).map(|byte| outcome.stores[&(at + byte)]).collect();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    };
+    let scale = TestHost::new().user[4];
+    let written = |lane: u64| scale.wrapping_mul(lane as u32);
+    let total = (0..64u32).sum::<u32>();
+    for lane in 0..64u64 {
+        // The word of the thread opposite.
+        assert_eq!(stored(lane, 0), written(63 - lane), "lane {lane}");
+        // The first of the two words is what the opposite thread read
+        // first, which is this thread's own word.
+        assert_eq!(stored(lane, 1), written(lane), "lane {lane}");
+        // The sum of all thread numbers, read after the barrier.
+        assert_eq!(stored(lane, 6), total, "lane {lane}");
+        // The running sum of the words the lanes before added.
+        let running = (0..lane).fold(0u32, |sum, other| sum.wrapping_add(written(other)));
+        assert_eq!(stored(lane, 3), running, "lane {lane}");
+        // Past the end of the memory.
+        assert_eq!(stored(lane, 12), 0, "lane {lane}");
+    }
+}
+
+#[test]
+fn shared_memory_outside_a_compute_program_is_refused() {
+    let code = Code::new()
+        .i(asm::ds("ds_write_b32", 0, 0, [3, 0], [0, 0]))
+        .i(export_position([0, 0, 0, 0]))
+        .end();
+    let error = lift(&vertex(code), &vertex_data()).unwrap_err();
+    assert_eq!(error.instruction, "ds_write_b32");
+    assert!(error.reason.contains("outside a compute program"));
+}
+
+#[test]
+fn a_register_pair_is_shifted_as_one_64_bit_value() {
+    for name in ["v_lshlrev_b64", "v_lshrrev_b64", "v_ashrrev_i64"] {
+        // The pair v6:v7 holds the vertex and instance numbers. Shifted by
+        // a constant, by 32 and more, and by a count that differs per lane.
+        let code = Code::new()
+            .i(asm::vop1("v_mov_b32", 6, O::V(0)))
+            .i(asm::vop1("v_mov_b32", 7, O::V(3)))
+            .i(asm::vop3(name, 8, [O::K(6), O::V(6), O::K(0)], 0, 0))
+            .i(asm::vop3(name, 10, [O::K(37), O::V(6), O::K(0)], 0, 0))
+            .i(asm::vop3(name, 12, [O::V(0), O::V(6), O::K(0)], 0, 0))
+            .i(export_position([8, 9, 10, 11]))
+            .i(asm::exp(32, [12, 13, 6, 7], false))
+            .end();
+        let (_, outcome) = run_both(&vertex(code), &vertex_data(), 64);
+        for lane in 0..64 {
+            let value = u64::from(lane_word(lane, 1)) | u64::from(lane_word(lane, 2)) << 32;
+            let shift = |by: u32| match name {
+                "v_lshlrev_b64" => value << by,
+                "v_lshrrev_b64" => value >> by,
+                _ => ((value as i64) >> by) as u64,
+            };
+            let (by_6, by_37) = (shift(6), shift(37));
+            assert_eq!(
+                position(&outcome, lane),
+                [
+                    by_6 as u32,
+                    (by_6 >> 32) as u32,
+                    by_37 as u32,
+                    (by_37 >> 32) as u32
+                ],
+                "{name} lane {lane}"
+            );
+            let by_lane = shift(lane_word(lane, 1) & 63);
+            let (_, values) = outcome.exports[&lane][1];
+            assert_eq!(values[0], Some(by_lane as u32));
+            assert_eq!(values[1], Some((by_lane >> 32) as u32));
+        }
+    }
+}
+
+#[test]
+fn a_float_is_rounded_into_one_byte_of_a_word() {
+    // The vertex number as a float, scaled so that the lanes hold values
+    // below 0, above 255 and in between, goes into each byte in turn of
+    // the instance number.
+    let code = Code::new()
+        .i(asm::vop1("v_cvt_f32_i32", 6, O::V(0)))
+        .i(asm::vop2("v_mul_f32", 6, O::Lit(0x3280_0000), 6))
+        .i(asm::vop3(
+            "v_cvt_pk_u8_f32",
+            8,
+            [O::V(6), O::K(0), O::V(3)],
+            0,
+            0,
+        ))
+        .i(asm::vop3(
+            "v_cvt_pk_u8_f32",
+            9,
+            [O::V(6), O::K(1), O::V(3)],
+            0,
+            0,
+        ))
+        .i(asm::vop3(
+            "v_cvt_pk_u8_f32",
+            10,
+            [O::V(0), O::K(2), O::V(3)],
+            0,
+            0,
+        ))
+        .i(asm::vop3(
+            "v_cvt_pk_u8_f32",
+            11,
+            [O::V(6), O::K(7), O::V(3)],
+            0,
+            0,
+        ))
+        .i(export_position([8, 9, 10, 11]))
+        .end();
+    let (_, outcome) = run_both(&vertex(code), &vertex_data(), 64);
+    let mut inside = 0;
+    for lane in 0..64 {
+        let scaled = lane_word(lane, 1) as i32 as f32 * f32::from_bits(0x3280_0000);
+        let byte = scaled.round_ties_even().clamp(0.0, 255.0) as u32;
+        inside += u32::from(byte > 0 && byte < 255);
+        let old = lane_word(lane, 2);
+        let words = position(&outcome, lane);
+        assert_eq!(words[0], old & !0xFF | byte, "lane {lane}");
+        assert_eq!(words[1], old & !0xFF00 | byte << 8, "lane {lane}");
+        // The place is the low two bits of its operand: 7 is byte 3.
+        assert_eq!(words[3], old & !0xFF00_0000 | byte << 24, "lane {lane}");
+    }
+    assert!(inside > 4, "the lanes do not cover the bytes in between");
+}
+
+#[test]
+fn a_number_kept_in_the_vector_condition_register_is_a_number() {
+    // A compiler that has run out of scalar registers keeps numbers in
+    // `VCC`. Afterwards a comparison makes it a lane mask again.
+    for wide in [true, false] {
+        let lanes = if wide { 64 } else { 32 };
+        let code = Code::new()
+            .i(asm::sop2("s_add_i32", O::Vcc, O::S(8), O::K(16)))
+            .i(asm::vop1("v_mov_b32", 5, O::Vcc))
+            .i(asm::sop2("s_lshl_b32", O::S(12), O::Vcc, O::K(2)))
+            .i(asm::vop1("v_mov_b32", 6, O::S(12)))
+            .i(asm::vopc("v_cmp_lt_u32", O::V(3), 0))
+            .i(asm::vop2("v_cndmask_b32", 7, O::K(0), 0))
+            .i(export_position([5, 6, 7, 0]))
+            .end();
+        let (function, outcome) = run_both(&wave_program(wide, code), &vertex_data(), lanes);
+        assert!(!function.has_cross_lane(), "{function}");
+        let number = TestHost::new().user[8].wrapping_add(16);
+        for lane in 0..lanes {
+            let chosen = if lane_is_live(lane) {
+                lane_word(lane, 1)
+            } else {
+                0
+            };
+            assert_eq!(
+                position(&outcome, lane)[..3],
+                [number, number << 2, chosen],
+                "lane {lane}"
+            );
+        }
     }
 }

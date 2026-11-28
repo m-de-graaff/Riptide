@@ -21,6 +21,9 @@
 //!   comparing form 1,024 places on.
 //! - Parameter n passes from a vertex shader to a pixel shader as
 //!   `float4 ROWn`, and the position is `SV_Position` after the rows.
+//! - The group-shared memory of a compute program is the shader's own
+//!   `groupshared` array of words, of the size the program's stage data
+//!   names; nothing is bound for it.
 //!
 //! [`rectangle_geometry_shader`] writes the geometry shader that completes
 //! a console rectangle from its three vertices.
@@ -56,7 +59,7 @@ use emit::{Signatures, emit};
 /// The version of the emitter. It changes whenever the text emitted for the
 /// same program could change, so that a cache of translations keyed by it
 /// never serves a stale one.
-pub const VERSION: &str = "1";
+pub const VERSION: &str = "2";
 
 /// The arguments to give the DirectX shader compiler besides the profile
 /// and the entry point: the 2021 language, strict IEEE float rules, and
