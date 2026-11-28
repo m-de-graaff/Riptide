@@ -197,6 +197,96 @@ unsafe extern "system" fn state(_this: usize, user: *const User, out: *mut u32) 
     unsafe { tell(user, out, 0) }
 }
 
+/// +0x98 `XUserGetAgeGroup`: `(user, age group out)`. 3 is an adult. The one user is taken
+/// to be the adult who owns this machine; no account says otherwise.
+///
+/// # Safety
+/// `out` is null or where the group goes.
+unsafe extern "system" fn age_group(_this: usize, user: *const User, out: *mut u32) -> i32 {
+    // SAFETY: as received.
+    unsafe { tell(user, out, 3) }
+}
+
+/// +0xa0 `XUserCheckPrivilege`: `(user, options, privilege, whether held out, reason
+/// out)`. A privilege is leave to use a part of the service: multiplayer, messages, shared
+/// content. With no connection to the service the user holds none, and the reason is
+/// "unknown", which is what the console gives when it cannot ask.
+///
+/// # Safety
+/// `held` is null or where the answer goes; `reason` likewise.
+unsafe extern "system" fn check_privilege(
+    _this: usize,
+    user: *const User,
+    _options: u32,
+    privilege: u32,
+    held: *mut bool,
+    reason: *mut u32,
+) -> i32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SHOWN: AtomicU32 = AtomicU32::new(0);
+    if SHOWN.fetch_add(1, Ordering::Relaxed) < 8 {
+        trace!("XUserCheckPrivilege(privilege {privilege}): not held, the user is offline");
+    }
+    // SAFETY: the title's out-pointer; null is tolerated.
+    if let Some(reason) = unsafe { reason.as_mut() } {
+        *reason = u32::MAX;
+    }
+    // SAFETY: as received.
+    unsafe { tell(user, held, false) }
+}
+
+/// The interface id a title asks for the user's name by:
+/// `cef4fac0-7676-4a94-a119-4c43f9eb5b74`.
+pub(crate) const GAMERTAG_INTERFACE: [u8; 16] = [
+    0xc0, 0xfa, 0xf4, 0xce, 0x76, 0x76, 0x94, 0x4a, 0xa1, 0x19, 0x4c, 0x43, 0xf9, 0xeb, 0x5b, 0x74,
+];
+
+pub(crate) const GAMERTAG_NAME: &str = "user names";
+
+/// The one user's name. It is the same on every machine and names no real account.
+const GAMERTAG: &str = "Player";
+
+/// The part of the name a component number asks for: 0 the classic name, 1 the modern
+/// name, 2 the modern name's number suffix (there is none), 3 the two together.
+fn gamertag(component: u32) -> Option<&'static str> {
+    match component {
+        0 | 1 | 3 => Some(GAMERTAG),
+        2 => Some(""),
+        _ => None,
+    }
+}
+
+/// +0x18 `XUserGetGamertag`: `(user, component, buffer size, buffer, bytes used out)`.
+///
+/// # Safety
+/// `buffer` is null or has room for `size` bytes; `used` is null or where the count goes.
+unsafe extern "system" fn get_gamertag(
+    _this: usize,
+    user: *const User,
+    component: u32,
+    size: usize,
+    buffer: *mut u8,
+    used: *mut usize,
+) -> i32 {
+    if user != handle() {
+        return E_GAMEUSER_USER_NOT_FOUND;
+    }
+    let Some(text) = gamertag(component) else {
+        return E_INVALIDARG;
+    };
+    // SAFETY: the title's out-pointer; null is tolerated.
+    if let Some(used) = unsafe { used.as_mut() } {
+        *used = text.len() + 1;
+    }
+    // SAFETY: the title's buffer, as it describes it.
+    unsafe { crate::package::copy_text(text, size, buffer) }
+}
+
+/// The methods of the user names interface that are built, by position.
+pub(crate) fn gamertag_methods() -> Vec<(usize, usize)> {
+    vec![(3, get_gamertag as *const () as usize)]
+}
+
 /// The methods that are built, by position.
 pub(crate) fn methods() -> Vec<(usize, usize)> {
     vec![
@@ -212,6 +302,8 @@ pub(crate) fn methods() -> Vec<(usize, usize)> {
         (12, find_by_id as *const () as usize),
         (13, is_guest as *const () as usize),
         (14, state as *const () as usize),
+        (19, age_group as *const () as usize),
+        (20, check_privilege as *const () as usize),
         // +0x108 and +0x110 `XUserRegisterForChangeEvent`: told when a user signs in or out,
         // which never happens here.
         (33, crate::com::register_for_nothing as *const () as usize),
@@ -243,6 +335,15 @@ mod tests {
             assert_eq!(is_guest(0, user, &mut guest), S_OK);
             assert_eq!(state(0, user, &mut signed), S_OK);
             assert_eq!(max_users(0, &mut count), S_OK);
+            let mut age = 0;
+            assert_eq!(age_group(0, user, &mut age), S_OK);
+            assert_eq!(age, 3);
+            let (mut held, mut reason) = (true, 0);
+            assert_eq!(
+                check_privilege(0, user, 0, 254, &mut held, &mut reason),
+                S_OK
+            );
+            assert_eq!((held, reason), (false, u32::MAX));
             assert_eq!(find_by_local_id(0, machine_id, &mut found), S_OK);
             assert_eq!(
                 find_by_id(0, service_id + 1, &mut found),
@@ -258,6 +359,25 @@ mod tests {
         assert_eq!((guest, signed, count), (false, 0, 1));
         assert_eq!(found, handle());
         assert_eq!(compare(0, user, found), 0);
+        let mut name = [0xffu8; 16];
+        let mut used = 0;
+        // SAFETY: a buffer of the size given.
+        unsafe {
+            assert_eq!(
+                get_gamertag(0, user, 0, 16, name.as_mut_ptr(), &mut used),
+                S_OK
+            );
+            assert_eq!((&name[..7], used), (&b"Player\0"[..], 7));
+            assert_eq!(
+                get_gamertag(0, user, 2, 16, name.as_mut_ptr(), &mut used),
+                S_OK
+            );
+            assert_eq!((name[0], used), (0, 1));
+            assert_eq!(
+                get_gamertag(0, user, 9, 16, name.as_mut_ptr(), &mut used),
+                E_INVALIDARG
+            );
+        }
         assert_ne!(compare(0, user, std::ptr::null()), 0);
     }
 }

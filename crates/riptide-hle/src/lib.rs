@@ -13,6 +13,7 @@ mod display;
 pub mod dstorage;
 mod files;
 mod game;
+mod gamesave;
 mod graphics;
 mod imports;
 mod localstorage;
