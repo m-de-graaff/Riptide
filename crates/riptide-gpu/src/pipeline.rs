@@ -1,11 +1,11 @@
 //! Pipeline states: a set of shader programs and the fixed state they draw with.
 //!
 //! A title's shader programs are the console GPU's machine code, which the host GPU cannot
-//! run. They have to be translated first, and the translator (`riptide-shader`) is not
-//! built yet. So a pipeline made here keeps what the title described, whole, and has no
-//! host pipeline: what would be drawn with it is not drawn (decision D7 already skips the
-//! draws of a pipeline that is not ready). The copy is what a host pipeline is made from
-//! once programs can be translated.
+//! run. So a pipeline made here keeps what the title described, whole, and its host
+//! pipeline is made from that the first time something is drawn with it, by translating
+//! the programs (`translate.rs`). A title makes pipelines by the ten thousand and draws
+//! with few of them. A pipeline whose programs cannot be translated has no host pipeline,
+//! and what would be drawn with it is not drawn (decision D7).
 
 use std::sync::OnceLock;
 
@@ -597,8 +597,8 @@ fn show(pipeline: &Pipeline) {
     let shown = SHOWN.fetch_add(1, Ordering::Relaxed);
     if shown == 0 {
         trace!(
-            "pipelines are kept as described and not made on the host: shader programs \
-             cannot be translated yet, so nothing is drawn with them"
+            "pipelines are kept as described; a host pipeline is made the first time \
+             something is drawn with one"
         );
     }
     if shown < 6 {
