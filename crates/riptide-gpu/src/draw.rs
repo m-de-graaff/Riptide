@@ -6,6 +6,10 @@
 //! title's arguments are kept here and turned into what a translated shader reads when a
 //! draw is made.
 //!
+//! A draw is made if the pipeline has a host pipeline, which is made the first time
+//! something is drawn with it (`translate.rs`). Until then, and for a pipeline whose
+//! programs cannot be translated, the draw is counted and not made.
+//!
 //! What a shader program is given is the console's *user data*: a row of 32-bit words,
 //! one per scalar register the program starts with. Each program says which root
 //! parameter goes in which words (`riptide-shader` reads that from the program), and
@@ -15,6 +19,8 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use riptide_shader::container::xbox::RootParameter;
+use windows::Win32::Graphics::Direct3D12::{D3D12_INDEX_BUFFER_VIEW, D3D12_VERTEX_BUFFER_VIEW};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
 use crate::descriptor::Heap;
 use crate::list::List;
@@ -46,8 +52,9 @@ pub(crate) enum Argument {
 /// A root signature and the arguments set for it.
 #[derive(Debug, Default)]
 pub(crate) struct Roots {
-    /// The title's root signature object, or zero.
-    #[allow(dead_code)] // the first user is a draw with translated shaders
+    /// The title's root signature object, or zero. What a program expects of it is in the
+    /// program itself, so nothing reads this; it is kept for the session log.
+    #[allow(dead_code)]
     pub(crate) signature: usize,
     pub(crate) arguments: Vec<Argument>,
 }
@@ -107,6 +114,18 @@ pub(crate) struct State {
     pub(crate) index: Buffer,
     pub(crate) vertex: [Buffer; VERTEX_BUFFERS],
     pub(crate) topology: u32,
+    /// The host textures bound as render and depth targets, by their addresses.
+    pub(crate) targets: Vec<usize>,
+    /// Whether the host list being recorded has been given what every draw with
+    /// translated shaders needs: the heaps, the root signature and the page table.
+    bound: bool,
+}
+
+impl State {
+    /// The list goes on in another host list, which has nothing bound.
+    pub(crate) fn on_new_host_list(&mut self) {
+        self.bound = false;
+    }
 }
 
 /// A list's drawing state, in the list.
@@ -141,7 +160,6 @@ impl Kept {
 /// | 5 and 6, the heaps | the address of the view heap's or the sampler heap's first descriptor |
 ///
 /// A parameter that was never set leaves its words zero.
-#[allow(dead_code)] // the first user is a draw with translated shaders
 pub(crate) fn user_data(
     parameters: &[RootParameter],
     roots: &Roots,
@@ -433,17 +451,164 @@ fn show_first_use(state: &State, what: &str) {
     );
 }
 
-/// `DrawInstanced`, `DrawIndexedInstanced` and the console's mesh draws: not made yet.
-/// The methods bound to this take different arguments, none of which is read.
-extern "system" fn draw(this: &List) {
-    show_first_use(this.drawing().state(), "a draw");
-    skipped("host pipelines of translated shader programs are not made yet");
+/// Gets the host list ready to draw or dispatch with the pipeline that is set: the heaps,
+/// root signature and page table if this host list has not been given them, the host
+/// pipeline, each stage's inputs, and for a draw the vertex and index buffers. `more` is
+/// what the stage is told besides its user data. An error says why nothing can be drawn.
+fn prepare(list: &List, compute: bool, indexed: bool, more: &[u32]) -> Result<(), String> {
+    let state = list.drawing().state();
+    // SAFETY: the pipeline a list was given is live while the list draws with it.
+    let pipeline =
+        unsafe { (state.pipeline as *const Pipeline).as_ref() }.ok_or("no pipeline is set")?;
+    let host = pipeline.host()?;
+    let host_list = list.host();
+    // SAFETY: plain calls on the host list, with host objects that live for the run or as
+    // long as the title's pipeline, and buffers found in title memory.
+    unsafe {
+        if !state.bound {
+            let heaps = crate::bindless::heaps().ok_or("the host gave no heaps for shaders")?;
+            let root = crate::stage::root_signature().ok_or("there is no host root signature")?;
+            let table = crate::pagetable::buffer()
+                .ok_or("there is no page table for the GPU")?
+                .GetGPUVirtualAddress();
+            host_list.SetDescriptorHeaps(&heaps);
+            host_list.SetGraphicsRootSignature(&root);
+            host_list.SetComputeRootSignature(&root);
+            host_list.SetGraphicsRootShaderResourceView(crate::stage::PAGE_TABLE, table);
+            host_list.SetComputeRootShaderResourceView(crate::stage::PAGE_TABLE, table);
+            state.bound = true;
+        }
+        host_list.SetPipelineState(&host.state);
+        let roots = if compute {
+            &state.compute
+        } else {
+            &state.graphics
+        };
+        for (parameter, parameters) in &host.stages {
+            let mut words = [0u32; crate::stage::WORDS];
+            words[..USER_WORDS].copy_from_slice(&user_data(parameters, roots, state.heaps));
+            for (word, &value) in words[USER_WORDS..].iter_mut().zip(more) {
+                *word = value;
+            }
+            let block = crate::stage::block(list.allocator_key(), &words)
+                .ok_or("the host gave no memory for a stage's inputs")?;
+            if compute {
+                host_list.SetComputeRootConstantBufferView(*parameter, block);
+            } else {
+                host_list.SetGraphicsRootConstantBufferView(*parameter, block);
+            }
+        }
+        if !compute {
+            let slots = pipeline
+                .layout()
+                .iter()
+                .map(|element| element.slot as usize + 1)
+                .max()
+                .unwrap_or(0)
+                .min(VERTEX_BUFFERS);
+            let mut views = Vec::with_capacity(slots);
+            for buffer in &state.vertex[..slots] {
+                views.push(if buffer.address == 0 || buffer.bytes == 0 {
+                    D3D12_VERTEX_BUFFER_VIEW::default()
+                } else {
+                    D3D12_VERTEX_BUFFER_VIEW {
+                        BufferLocation: in_place(buffer, "a vertex buffer")?,
+                        SizeInBytes: buffer.bytes,
+                        StrideInBytes: buffer.stride_or_format,
+                    }
+                });
+            }
+            if !views.is_empty() {
+                host_list.IASetVertexBuffers(0, Some(&views));
+            }
+            if indexed {
+                let view = D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: in_place(&state.index, "the index buffer")?,
+                    SizeInBytes: state.index.bytes,
+                    Format: DXGI_FORMAT(state.index.stride_or_format as i32),
+                };
+                host_list.IASetIndexBuffer(Some(&view));
+            }
+        }
+    }
+    // What this list drew to before can be read by this draw, but not what it draws to.
+    list.rest_all_but(&state.targets);
+    Ok(())
 }
 
-/// `Dispatch` and its console forms: not made yet.
-extern "system" fn dispatch(this: &List) {
+/// Where the host GPU finds a vertex or index buffer, which is title memory.
+fn in_place(buffer: &Buffer, what: &str) -> Result<u64, String> {
+    crate::inplace::find(buffer.address, u64::from(buffer.bytes))
+        .map(|place| place.gpu_address)
+        .ok_or_else(|| {
+            format!(
+                "{what} at {:#x}, {} bytes, is not title memory in one stretch of one bank",
+                buffer.address, buffer.bytes
+            )
+        })
+}
+
+/// `DrawInstanced`: `(vertices, instances, first vertex, first instance)`.
+extern "system" fn draw_instanced(
+    this: &List,
+    vertices: u32,
+    instances: u32,
+    first_vertex: u32,
+    first_instance: u32,
+) {
+    show_first_use(this.drawing().state(), "a draw");
+    match prepare(this, false, false, &[]) {
+        // SAFETY: a plain call on the host list, which has all the draw needs.
+        Ok(()) => unsafe {
+            this.host()
+                .DrawInstanced(vertices, instances, first_vertex, first_instance);
+        },
+        Err(why) => skipped(&why),
+    }
+}
+
+/// `DrawIndexedInstanced`: `(indices, instances, first index, what is added to each index,
+/// first instance)`.
+extern "system" fn draw_indexed(
+    this: &List,
+    indices: u32,
+    instances: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+) {
+    show_first_use(this.drawing().state(), "an indexed draw");
+    match prepare(this, false, true, &[]) {
+        // SAFETY: a plain call on the host list, which has all the draw needs.
+        Ok(()) => unsafe {
+            this.host().DrawIndexedInstanced(
+                indices,
+                instances,
+                first_index,
+                base_vertex,
+                first_instance,
+            );
+        },
+        Err(why) => skipped(&why),
+    }
+}
+
+/// `Dispatch`: `(groups across, down and deep)`. The program is told the three counts
+/// after its user data.
+extern "system" fn dispatch(this: &List, x: u32, y: u32, z: u32) {
     show_first_use(this.drawing().state(), "a dispatch");
-    skipped("host pipelines of translated shader programs are not made yet");
+    match prepare(this, true, false, &[x, y, z]) {
+        // SAFETY: a plain call on the host list, which has all the dispatch needs.
+        Ok(()) => unsafe { this.host().Dispatch(x, y, z) },
+        Err(why) => skipped(&why),
+    }
+}
+
+/// Indirect draws, mesh draws and the console's own dispatch: not built yet. The methods
+/// bound to this take different arguments, none of which is read.
+extern "system" fn unbuilt_draw(this: &List) {
+    show_first_use(this.drawing().state(), "a draw of a kind not built yet");
+    skipped("indirect draws, mesh draws and the console's own dispatch are not built yet");
 }
 
 /// The methods here by their position in the older list layout.
@@ -464,10 +629,13 @@ pub(crate) fn methods() -> Vec<(usize, usize)> {
     ];
     methods.extend([41, 43, 45].map(|slot| (slot, set_compute_view as *const () as usize)));
     methods.extend([42, 44, 46].map(|slot| (slot, set_graphics_view as *const () as usize)));
-    // Draws: instanced, indexed, indirect, and the two mesh dispatches.
-    methods.extend([12, 13, 59, 98, 127].map(|slot| (slot, draw as *const () as usize)));
-    // Dispatches: the PC's and the console's own.
-    methods.extend([14, 78].map(|slot| (slot, dispatch as *const () as usize)));
+    methods.extend([
+        (12, draw_instanced as *const () as usize),
+        (13, draw_indexed as *const () as usize),
+        (14, dispatch as *const () as usize),
+    ]);
+    // Indirect, the console's own dispatch, and the two mesh dispatches.
+    methods.extend([59, 78, 98, 127].map(|slot| (slot, unbuilt_draw as *const () as usize)));
     methods
 }
 

@@ -61,14 +61,31 @@ unsafe extern "system" fn scissors(this: &List, count: u32, rectangles: *const R
 }
 
 /// `IASetPrimitiveTopology`.
+///
+/// The console has topologies the host does not: 17 is a list of rectangles, three
+/// vertices each, which a pipeline for them draws as triangles and completes in a geometry
+/// shader. The others of the console's own (a line loop, quads) have not been met; they
+/// are said once and drawn as triangles.
 extern "system" fn topology(this: &List, topology: u32) {
     crate::draw::note_topology(this, topology);
+    let host = match topology {
+        17 => 4,
+        14..=32 => {
+            show_once(&TOPOLOGY, || {
+                format!("topology {topology} is the console's own and is drawn as triangles")
+            });
+            4
+        }
+        other => other,
+    };
     // SAFETY: a plain call on the host list.
     unsafe {
         this.host()
-            .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(topology as i32))
+            .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32))
     };
 }
+
+static TOPOLOGY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `OMSetBlendFactor`: `(four factors, or null for all ones)`.
 ///
@@ -246,6 +263,8 @@ unsafe extern "system" fn set_render_targets(
 ) {
     let step = u64::from(crate::descriptor::increment(2).unwrap_or(0));
     let mut views = Vec::new();
+    // The host textures bound as targets, which a draw leaves as they are.
+    let mut bound = Vec::new();
     for index in 0..count.min(8) {
         // SAFETY: the title's handles, as the contract says.
         let handle = unsafe {
@@ -264,6 +283,7 @@ unsafe extern "system" fn set_render_targets(
             break;
         };
         this.use_texture(&target.texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        bound.push(target.texture.as_raw() as usize);
         views.push(target.view);
     }
     // SAFETY: the title's handle; null is no depth target.
@@ -271,8 +291,10 @@ unsafe extern "system" fn set_render_targets(
         // SAFETY: the title's descriptor.
         let target = unsafe { crate::target::depth_target(handle) }?;
         this.use_texture(&target.texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        bound.push(target.texture.as_raw() as usize);
         Some(target.view)
     });
+    this.drawing().state().targets = bound;
     // SAFETY: a plain call on the host list with views made on the host.
     unsafe {
         this.host().OMSetRenderTargets(

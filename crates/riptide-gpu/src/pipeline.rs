@@ -115,6 +115,9 @@ pub(crate) struct Pipeline {
     /// The vertex layout named in the stream, copied: its names are the title's strings,
     /// which may not outlive the call.
     layout: Vec<Element>,
+    /// The host pipeline, made the first time something is drawn with this one, or why
+    /// there is none.
+    host: OnceLock<Result<crate::translate::HostPipeline, String>>,
 }
 
 /// One element of a vertex layout: `D3D12_INPUT_ELEMENT_DESC` with its name copied.
@@ -187,8 +190,27 @@ unsafe impl Child for Pipeline {
 }
 
 impl Pipeline {
+    /// The host pipeline, made now if this is the first time it is asked for. Making it
+    /// translates and compiles the programs, which takes a while.
+    pub(crate) fn host(&self) -> Result<&crate::translate::HostPipeline, &str> {
+        self.host
+            .get_or_init(|| {
+                let made = crate::translate::host_pipeline(self);
+                if let Err(why) = &made {
+                    show_unmade(why);
+                }
+                made
+            })
+            .as_ref()
+            .map_err(String::as_str)
+    }
+
+    /// The stream as the title gave it, and where its subobjects are.
+    pub(crate) fn stream(&self) -> (&[u8], &[Subobject]) {
+        (&self.stream, &self.subobjects)
+    }
+
     /// The vertex layout.
-    #[allow(dead_code)] // the first user is making the host pipeline
     pub(crate) fn layout(&self) -> &[Element] {
         &self.layout
     }
@@ -231,7 +253,6 @@ impl Pipeline {
     }
 
     /// The bytes of the subobject of type `kind`, with its type word.
-    #[allow(dead_code)] // the first user is making the host pipeline
     pub(crate) fn subobject(&self, kind: u32) -> Option<&[u8]> {
         self.subobjects
             .iter()
@@ -243,6 +264,16 @@ impl Pipeline {
     #[allow(dead_code)] // the first user is making the host pipeline
     pub(crate) fn root(&self) -> usize {
         self.root
+    }
+}
+
+/// Says why a pipeline has no host pipeline, for the first few and then by count.
+fn show_unmade(why: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static UNMADE: AtomicU64 = AtomicU64::new(0);
+    let unmade = UNMADE.fetch_add(1, Ordering::Relaxed) + 1;
+    if unmade <= 12 || unmade.is_power_of_two() {
+        trace!("a pipeline has no host pipeline ({unmade} so far): {why}");
     }
 }
 
@@ -375,6 +406,7 @@ pub(crate) unsafe extern "system" fn create(
         programs,
         root,
         layout: elements,
+        host: OnceLock::new(),
     });
     show(&pipeline);
     // SAFETY: `accepts` checked the out-pointer.
@@ -428,6 +460,7 @@ pub(crate) unsafe extern "system" fn create_compute(
         programs: vec![(Stage::Compute, program)],
         root: description.root,
         layout: Vec::new(),
+        host: OnceLock::new(),
     });
     show(&pipeline);
     // SAFETY: `accepts` checked the out-pointer.

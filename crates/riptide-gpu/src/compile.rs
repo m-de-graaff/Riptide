@@ -7,9 +7,6 @@
 //! SDK, then in a Vulkan SDK. It is loaded the first time something is compiled and stays
 //! for the run.
 
-// Nothing draws with translated shaders yet; a test on a real GPU does (`hosttest.rs`).
-#![allow(dead_code)]
-
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -84,6 +81,7 @@ fn newest_first(folder: &Path) -> Vec<PathBuf> {
 }
 
 /// The compiler library: where it was found and how to make its objects.
+#[allow(dead_code)] // the first user is the translation of a program, once it writes HLSL
 struct Library {
     create: CreateInstance,
     folder: PathBuf,
@@ -166,6 +164,7 @@ thread_local! {
 /// Compiles `source`, whose entry point is `entry`, for the shader model `profile` (as
 /// `vs_6_6`). `arguments` are passed to the compiler after those. Returns the compiled
 /// program, or what the compiler said was wrong.
+#[allow(dead_code)] // the first user is the translation of a program, once it writes HLSL
 pub(crate) fn compile(
     source: &str,
     entry: &str,

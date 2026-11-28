@@ -18,7 +18,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_DESCRIPTOR_HEAP_FLAG_NONE, D3D12_DESCRIPTOR_HEAP_TYPE, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
     D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES,
     D3D12_HEAP_TYPE_DEFAULT, D3D12_RENDER_TARGET_VIEW_DESC, D3D12_RESOURCE_DESC,
-    D3D12_RESOURCE_DIMENSION, D3D12_RESOURCE_FLAGS, D3D12_RESOURCE_STATE_COMMON,
+    D3D12_RESOURCE_DIMENSION, D3D12_RESOURCE_FLAGS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATES,
     D3D12_TEXTURE_LAYOUT_UNKNOWN, ID3D12DescriptorHeap, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
@@ -77,7 +78,16 @@ pub(crate) fn host_description(description: &Description) -> Option<D3D12_RESOUR
     })
 }
 
-/// Makes the host texture for a title's texture, in video memory, in the common state.
+/// The state every host texture is in between the commands that need it in another:
+/// readable by shaders of every stage. A shader names a texture by a number it reads from
+/// memory, so nothing here knows which textures a draw reads, and every texture that is
+/// not being written has to be readable. A list that needs a texture in another state
+/// puts it there and puts it back (see `List::use_texture`).
+pub(crate) const REST: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
+    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0,
+);
+
+/// Makes the host texture for a title's texture, in video memory, at rest.
 pub(crate) fn make(description: &Description) -> Option<ID3D12Resource> {
     if description.dimension < 2 {
         return None;
@@ -98,7 +108,7 @@ pub(crate) fn make(description: &Description) -> Option<ID3D12Resource> {
             &heap,
             D3D12_HEAP_FLAG_NONE,
             &host_description,
-            D3D12_RESOURCE_STATE_COMMON,
+            REST,
             None,
             &mut made,
         )

@@ -12,15 +12,16 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_FLAG_NONE, D3D12_COMMAND_LIST_TYPE, D3D12_RESOURCE_BARRIER,
     D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-    D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATES,
-    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER, ID3D12CommandAllocator,
-    ID3D12Device4, ID3D12GraphicsCommandList, ID3D12Resource,
+    D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER,
+    D3D12_RESOURCE_UAV_BARRIER, ID3D12CommandAllocator, ID3D12Device4, ID3D12GraphicsCommandList,
+    ID3D12Resource,
 };
 
 use windows::core::Interface;
 
 use crate::device::Device;
 use crate::object::{self, Child, E_INVALIDARG, Hresult, Iid, Object, S_OK, guid};
+use crate::target::REST;
 use crate::trace;
 
 /// `ID3D12CommandAllocator`.
@@ -91,6 +92,12 @@ pub(crate) struct Allocator {
     object: Object,
     kind: u32,
     host: ID3D12CommandAllocator,
+}
+
+impl Drop for Allocator {
+    fn drop(&mut self) {
+        crate::stage::give_back(windows::core::Interface::as_raw(&self.host) as usize);
+    }
 }
 
 // SAFETY: `Allocator` is `#[repr(C)]` and starts with its header.
@@ -566,6 +573,8 @@ extern "system" fn allocator_callback(_this: &Allocator) {}
 
 /// Allocator `Reset`: the memory of every list recorded into it is free again.
 extern "system" fn allocator_reset(this: &Allocator) -> Hresult {
+    // The GPU is done with everything recorded here, the stage inputs of its draws too.
+    crate::stage::give_back(windows::core::Interface::as_raw(&this.host) as usize);
     // SAFETY: a plain call on the host allocator.
     match unsafe { this.host.Reset() } {
         Ok(()) => S_OK,
@@ -602,7 +611,7 @@ impl List {
     ///
     /// Lists are recorded on many threads in an order that is not the order they run in,
     /// so no list can know what state another left a texture in. Each list therefore takes
-    /// every texture as being in the common state when it starts and puts it back when it
+    /// every texture as being at rest (`target::REST`) when it starts and puts it back when it
     /// is closed.
     pub(crate) fn use_texture(&self, texture: &ID3D12Resource, wanted: D3D12_RESOURCE_STATES) {
         let key = windows::core::Interface::as_raw(texture) as usize;
@@ -612,7 +621,7 @@ impl List {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let entry = textures
             .entry(key)
-            .or_insert_with(|| (texture.clone(), D3D12_RESOURCE_STATE_COMMON));
+            .or_insert_with(|| (texture.clone(), REST));
         if entry.1 != wanted {
             self.transition(texture, entry.1, wanted);
             entry.1 = wanted;
@@ -645,7 +654,23 @@ impl List {
         unsafe { self.current().ResourceBarrier(&[barrier]) };
     }
 
-    /// Puts every host texture this list used back in the common state, and forgets them.
+    /// Puts every host texture this list has in another state back at rest, but those in
+    /// `keep` (by the host texture's address): before a draw, so that what was drawn to
+    /// earlier can be read now, while the draw's own targets stay targets.
+    pub(crate) fn rest_all_but(&self, keep: &[usize]) {
+        let mut textures = self
+            .textures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (key, (texture, state)) in textures.iter_mut() {
+            if *state != REST && !keep.contains(key) {
+                self.transition(texture, *state, REST);
+                *state = REST;
+            }
+        }
+    }
+
+    /// Puts every host texture this list used back at rest, and forgets them.
     /// The list holds them until then, so that one the title releases meanwhile outlives
     /// the commands that name it.
     fn settle_textures(&self, forget: bool) {
@@ -654,9 +679,9 @@ impl List {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (texture, state) in textures.values_mut() {
-            if *state != D3D12_RESOURCE_STATE_COMMON {
-                self.transition(texture, *state, D3D12_RESOURCE_STATE_COMMON);
-                *state = D3D12_RESOURCE_STATE_COMMON;
+            if *state != REST {
+                self.transition(texture, *state, REST);
+                *state = REST;
             }
         }
         if forget {
@@ -670,6 +695,17 @@ impl List {
         // which is the console's rule for a title and the host's own; so nothing swaps the
         // host list while this reference is in use.
         unsafe { &*self.host.get() }
+    }
+
+    /// A number that stands for the allocator the list records into, for what has to
+    /// live as long as the allocator's commands do.
+    pub(crate) fn allocator_key(&self) -> usize {
+        // SAFETY: as in `current`: only the thread recording this list touches it.
+        unsafe { &*self.allocator.get() }
+            .as_ref()
+            .map_or(0, |allocator| {
+                windows::core::Interface::as_raw(allocator) as usize
+            })
     }
 
     /// What the list has been told to draw with.
@@ -744,6 +780,8 @@ impl List {
         }
         *gate = Some(wait);
         self.recorded.store(0, Ordering::Relaxed);
+        // The new host list has nothing bound yet.
+        self.drawing.state().on_new_host_list();
         true
     }
 

@@ -253,7 +253,7 @@ impl Presenter {
                 .GetBuffer(self.chain.GetCurrentBackBufferIndex())?;
             let moves = |from: D3D12_RESOURCE_STATES, to: D3D12_RESOURCE_STATES| {
                 [
-                    transition(frame, D3D12_RESOURCE_STATE_COMMON, from),
+                    transition(frame, crate::target::REST, from),
                     transition(&buffer, D3D12_RESOURCE_STATE_COMMON, to),
                 ]
             };
@@ -263,11 +263,7 @@ impl Presenter {
             ));
             self.list.CopyResource(&buffer, frame);
             self.list.ResourceBarrier(&[
-                transition(
-                    frame,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                    D3D12_RESOURCE_STATE_COMMON,
-                ),
+                transition(frame, D3D12_RESOURCE_STATE_COPY_SOURCE, crate::target::REST),
                 transition(
                     &buffer,
                     D3D12_RESOURCE_STATE_COPY_DEST,

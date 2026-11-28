@@ -7,9 +7,6 @@
 //! become compiled translations, and the vertex layout is pointed at this crate's copy of
 //! it. What the host has no use for (stream output, a cached pipeline) is left out.
 
-// Nothing draws with translated shaders yet; a test on a real GPU does (`hosttest.rs`).
-#![allow(dead_code)]
-
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_PIPELINE_STATE_STREAM_DESC, D3D12_SHADER_BYTECODE,
     ID3D12Device2, ID3D12PipelineState,

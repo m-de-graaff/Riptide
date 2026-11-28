@@ -34,6 +34,7 @@ mod root;
 mod signature;
 mod stage;
 mod target;
+mod translate;
 mod view;
 
 use std::sync::{Arc, OnceLock};

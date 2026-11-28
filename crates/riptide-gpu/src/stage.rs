@@ -17,9 +17,6 @@
 //! when the title resets or frees it, which it may only do when the GPU is done with
 //! everything recorded there.
 
-// Nothing draws with translated shaders yet; a test on a real GPU does (`hosttest.rs`).
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 
