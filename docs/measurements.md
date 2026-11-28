@@ -133,3 +133,17 @@ The first picture. `riptide run` on the real title, debug build, in a 1280 by 72
 The seven are six drawing pipelines and one compute pipeline. Before the picture the title's frames are black by its own doing: it clears, draws a full-screen rectangle multiplied by constants that are zero, and copies the result to the frame. Making a host pipeline took 3 to 6 ms with its shaders already kept on disc from an earlier run, about 90 ms for the two drawing pipelines met with nothing kept, and 557 ms for the compute pipeline. From about 85 s the frame is the title's first screen, with its row of button prompts, and stays so: the title waits there for a button.
 
 Not measured: frame times, which the debug build and the host's checking would both distort.
+
+### 2026-11-28 · past the first screen, with scripted input · commit e6b68ff
+
+Driver 32.0.32029.2010, Windows 11 build 26200. `riptide run` on the real title, debug build, 1280 by 720 window, 570 s, with `RIPTIDE_INPUT_SCRIPT` pressing A at 100 s and then every 20 s from 240 s, and BCPack tables supplied through `RIPTIDE_BCPACK_TABLES`. One run, without the host's checking.
+
+| Ran for | Frames presented | Host pipelines made | Screens reached | BCPack streams that did not decode | Stopped by |
+| --- | --- | --- | --- | --- | --- |
+| 570 s | more than 8,192 | 16 or more | first screen, navigation, brightness, legal notices, legal terms | 0 | the time limit |
+
+The title reaches its page of legal terms, which asks the player to agree to them; the script stops there. Between the first press and the next screen the title takes about 140 s, most of it opening its packs. Its own check at one place in its pack reader (a breakpoint) was stepped over 16 times.
+
+The BCPack decoder against the reference decoder, on 129 streams the title asked for in such a run (7 of BC1, 100 of BC5, 22 of BC7, written out with `RIPTIDE_BCPACK_DUMP`): all 129 come out the same byte for byte. Speed on one core, release build: about 70 MB of blocks a second for BC1, 65 for BC5 and 32 for BC7.
+
+A run of the same length with the host checking every call (`RIPTIDE_GPU_CHECKS=1`) lost no device. It says three things: the known one about a clear value, and two about the state of a bank's buffer (see `riptide-gpu`'s README).
