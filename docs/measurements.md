@@ -155,10 +155,10 @@ Driver 32.0.32029.2010, Windows 11 build 26200. `riptide run` on the real title 
 | Build | First frame presented | First screen drawn | A pressed (script) | Packs opened, store asked | Next pictures drawn |
 | --- | --- | --- | --- | --- | --- |
 | Release | 3.3 s | 15 s | 60 s | 61 s | 83 s |
-| Debug | about 5 s | about 85 s | 100 s | about 205 s | about 240 s |
+| Debug | about 5 s | about 85 s | 100 s | about 101 s | about 240 s |
 
 The release run presented more than 4,096 frames in 150 s and was stopped by the time limit after 240 s.
 
 With streamed textures filled (commit 7cc8ff8) the title shows its intro pictures and its publisher's logo, textured, where it showed black before; more than 512 textures are kept filled by then.
 
-The keyboard, debug build, no script: the window was brought to the front and a real Enter key pressed at 110 s. The title left its first screen as it does for the gamepad's A, and asked the store 106 s later.
+The keyboard, debug build, no script: the window was brought to the front and a real Enter key pressed at 110 s. The title left its first screen as it does for the gamepad's A, and asked the store within a second.
