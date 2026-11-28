@@ -32,6 +32,34 @@ struct Census {
 
 static CENSUS: Mutex<Option<Census>> = Mutex::new(None);
 
+/// Writes a program to the folder `RIPTIDE_SHADER_DUMP` names, if it names one, as a file
+/// named by the program's hash. For working on the translator with a real title's
+/// programs: the folder is the user's own and its files are the title's data, never part
+/// of this project.
+fn keep(hash: u64, code: &[u8]) {
+    use std::sync::OnceLock;
+    static FOLDER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let folder = FOLDER.get_or_init(|| {
+        let folder = std::path::PathBuf::from(std::env::var_os("RIPTIDE_SHADER_DUMP")?);
+        match std::fs::create_dir_all(&folder) {
+            Ok(()) => {
+                trace!("shader programs are written to {}", folder.display());
+                Some(folder)
+            }
+            Err(error) => {
+                trace!(
+                    "shader programs are not written to {}: {error}",
+                    folder.display()
+                );
+                None
+            }
+        }
+    });
+    if let Some(folder) = folder {
+        let _ = std::fs::write(folder.join(format!("{hash:016x}.bin")), code);
+    }
+}
+
 /// Counts one program, if it has not been counted before.
 pub(crate) fn count(code: &[u8]) {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -44,6 +72,7 @@ pub(crate) fn count(code: &[u8]) {
     if !census.seen.insert(hash) {
         return;
     }
+    keep(hash, code);
     census.programs += 1;
     match riptide_shader::summarize(code) {
         Ok(summary) => {
