@@ -16,8 +16,10 @@ use crate::list::List;
 use crate::object::{self, Child, E_INVALIDARG, Hresult, Iid, Object, S_OK, guid};
 #[cfg(test)]
 use crate::object::{E_NOINTERFACE, E_POINTER};
+use crate::ordered::{Job, Ordered};
 use crate::resource::Resource;
 use crate::trace;
+use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList;
 
 /// `ID3D12CommandQueue`.
 const IID: Iid = guid(
@@ -57,6 +59,8 @@ pub(crate) struct Queue {
     kind: u32,
     description: Description,
     host: ID3D12CommandQueue,
+    /// The order of what is submitted, for when a submission has to wait.
+    ordered: std::sync::Arc<Ordered>,
 }
 
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
@@ -176,6 +180,7 @@ unsafe fn make(description: Description, iid: *const Iid, out: *mut *const Queue
         object: Object::new(table(crate::device::newer()), 1),
         kind: description.kind,
         description,
+        ordered: Ordered::new(host.clone()),
         host,
     });
     trace!(
@@ -240,15 +245,12 @@ unsafe extern "system" fn signal(this: &Queue, fence: *const Fence, value: u64) 
     let Some(fence) = (unsafe { fence.as_ref() }) else {
         return E_INVALIDARG;
     };
-    // SAFETY: a plain call on the host queue with a live host fence.
-    match unsafe { this.host.Signal(fence.host(), value) } {
-        Ok(()) => {
-            // The fence's own value follows when the host GPU gets there.
-            fence.expect(value);
-            S_OK
-        }
-        Err(error) => error.code().0,
-    }
+    // The fence's own value follows when the host GPU gets there, whenever that is.
+    fence.expect(value);
+    // In its turn, behind whatever was submitted before and has not run yet.
+    this.ordered
+        .submit(vec![Job::Signal(fence.host().clone(), value)], true);
+    S_OK
 }
 
 /// `Wait`: the queue runs nothing more until the fence reaches `value`.
@@ -278,23 +280,59 @@ unsafe extern "system" fn execute(this: &Queue, count: u32, lists: *const *const
     }
     // SAFETY: the title passes `count` pointers.
     let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-    let host: Vec<Option<ID3D12CommandList>> = lists
+    let lists: Vec<&List> = lists
         .iter()
         // SAFETY: each is null or a live list.
         .filter_map(|&list| unsafe { list.as_ref() })
-        .filter_map(|list| list.host().cast::<ID3D12CommandList>().ok())
-        .map(Some)
         .collect();
-    if host.is_empty() {
+    if lists.is_empty() {
         return;
     }
-    let submitted = SUBMITTED.fetch_add(host.len() as u64, Ordering::Relaxed);
+    let submitted = SUBMITTED.fetch_add(lists.len() as u64, Ordering::Relaxed);
     if submitted == 0 {
         trace!("the title's first command lists are submitted to the host GPU");
     }
-    // SAFETY: a plain call on the host queue with closed host lists.
-    unsafe { this.host.ExecuteCommandLists(&host) };
+    // The usual case: no list waits for anything and nothing earlier is still waiting.
+    // The host lists stay their lists' own and run now.
+    let waits = lists.iter().any(|list| list.has_waits());
+    if !waits && !this.ordered.behind() {
+        let host: Vec<Option<ID3D12CommandList>> = lists
+            .iter()
+            .filter_map(|list| list.submitted().cast::<ID3D12CommandList>().ok())
+            .map(Some)
+            .collect();
+        if this.ordered.submit(vec![Job::Borrowed(host)], true) {
+            return;
+        }
+    }
+    // Otherwise the host lists are taken from their lists, which the title may record
+    // again at once, and run in order when their turn comes.
+    let mut jobs = Vec::new();
+    let mut run: Vec<(u32, ID3D12GraphicsCommandList)> = Vec::new();
+    for list in lists {
+        for (wait, host) in list.take_pieces() {
+            if let Some(wait) = wait {
+                if !run.is_empty() {
+                    jobs.push(Job::Lists(std::mem::take(&mut run)));
+                }
+                jobs.push(Job::Gate(wait));
+            }
+            run.push((list.kind(), host));
+        }
+    }
+    if !run.is_empty() {
+        jobs.push(Job::Lists(run));
+    }
+    if DEFERRED.fetch_add(1, Ordering::Relaxed) == 0 {
+        trace!(
+            "a submission waits for a value in memory: its queue now submits in order on a thread of its own"
+        );
+    }
+    this.ordered.submit(jobs, false);
 }
+
+/// Submissions that had to wait their turn.
+static DEFERRED: AtomicU64 = AtomicU64::new(0);
 
 /// Lists submitted so far.
 static SUBMITTED: AtomicU64 = AtomicU64::new(0);
@@ -465,14 +503,20 @@ unsafe extern "system" fn present(
     let Some(resource) = (unsafe { plane.resources.read_unaligned().as_ref() }) else {
         return E_INVALIDARG;
     };
-    let shown = resource
-        .host()
-        .is_some_and(|frame| crate::present::show(&this.host, frame));
+    // In its turn, behind whatever was submitted before and has not run yet.
+    let shown = resource.host().is_some_and(|frame| {
+        this.ordered.submit(vec![Job::Present(frame.clone())], true);
+        true
+    });
     if frames <= 3 || frames.is_power_of_two() {
         trace!(
             "frame {frames} presented ({count} planes, token {}): {}",
             plane.token,
-            if shown { "shown" } else { "not shown" }
+            if shown {
+                "given to the queue to show"
+            } else {
+                "not shown: it has no host texture"
+            }
         );
     }
     S_OK

@@ -9,12 +9,15 @@
 use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_COMMAND_LIST_TYPE, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
-    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
-    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_TYPE_UAV,
-    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER,
-    D3D12_RESOURCE_UAV_BARRIER, ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12Resource,
+    D3D12_COMMAND_LIST_FLAG_NONE, D3D12_COMMAND_LIST_TYPE, D3D12_RESOURCE_BARRIER,
+    D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+    D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATES,
+    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER, ID3D12CommandAllocator,
+    ID3D12Device4, ID3D12GraphicsCommandList, ID3D12Resource,
 };
+
+use windows::core::Interface;
 
 use crate::device::Device;
 use crate::object::{self, Child, E_INVALIDARG, Hresult, Iid, Object, S_OK, guid};
@@ -116,11 +119,91 @@ pub(crate) struct List {
     /// Newer titles' lists are larger and their code writes past the fields above. How far
     /// is not known; this keeps what follows clear of it.
     newer: [u32; 256],
-    host: ID3D12GraphicsCommandList,
+    /// The host list this one records onto. It is swapped for another when a submission
+    /// takes it away to run later; only the thread that records the list touches it.
+    host: std::cell::UnsafeCell<ID3D12GraphicsCommandList>,
+    /// How many commands have gone to the host list since the last reset.
+    recorded: std::sync::atomic::AtomicU32,
+    /// A wait the GPU is to make before it runs the host list being recorded now.
+    gate: std::sync::Mutex<Option<Wait>>,
+    /// The pieces the list was cut into at waits before the one being recorded now, in
+    /// order, each with the wait the GPU makes before it.
+    earlier: std::sync::Mutex<Vec<(Option<Wait>, ID3D12GraphicsCommandList)>>,
+    /// The host allocator the list records into, for a piece started after a cut.
+    allocator: std::cell::UnsafeCell<Option<ID3D12CommandAllocator>>,
     /// The host textures this list has used since it was last reset, each with the state
     /// the list last put it in.
     textures:
         std::sync::Mutex<std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>>,
+}
+
+/// A wait on a value in memory: the GPU goes on when the value at `address` compares as
+/// asked with `reference`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Wait {
+    pub(crate) address: u64,
+    /// As the host numbers comparisons: 2 less, 3 equal, 4 less or equal, 5 greater, 6 not
+    /// equal, 7 greater or equal; 1 never and 8 always.
+    pub(crate) comparison: u32,
+    pub(crate) reference: u64,
+    /// Whether the value is 64 bits wide, or 32.
+    pub(crate) wide: bool,
+}
+
+impl Wait {
+    /// Whether `value` lets the GPU go on.
+    pub(crate) fn passes(&self, value: u64) -> bool {
+        match self.comparison {
+            1 => false,
+            2 => value < self.reference,
+            3 => value == self.reference,
+            4 => value <= self.reference,
+            5 => value > self.reference,
+            6 => value != self.reference,
+            7 => value >= self.reference,
+            _ => true,
+        }
+    }
+}
+
+/// Host lists that have run and can record again, by list type. A list whose host list
+/// was taken away to run later gets one of these in its place.
+static SPARES: std::sync::Mutex<Vec<(u32, ID3D12GraphicsCommandList)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Gives a host list that has been submitted back, to record again.
+pub(crate) fn recycle(kind: u32, list: ID3D12GraphicsCommandList) {
+    let mut spares = SPARES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if spares.len() < 256 {
+        spares.push((kind, list));
+    }
+}
+
+/// A closed host list of type `kind`: a spare, or a new one.
+fn closed_host_list(kind: u32) -> Option<ID3D12GraphicsCommandList> {
+    {
+        let mut spares = SPARES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(at) = spares.iter().position(|&(spare, _)| spare == kind) {
+            return Some(spares.swap_remove(at).1);
+        }
+    }
+    let host = crate::host::host().ok()?;
+    let device: ID3D12Device4 = host.device.cast().ok()?;
+    // SAFETY: a plain call on the host device. A list made this way is closed and has no
+    // allocator until it is reset.
+    unsafe {
+        device
+            .CreateCommandList1(
+                0,
+                D3D12_COMMAND_LIST_TYPE(kind as i32),
+                D3D12_COMMAND_LIST_FLAG_NONE,
+            )
+            .ok()
+    }
 }
 
 const _: () = assert!(std::mem::offset_of!(List, kind) == 0x10);
@@ -392,7 +475,11 @@ unsafe fn make_list(
         compute_root_headers: [0; 128],
         pipeline_shadow: [0; 8],
         newer: [0; 256],
-        host,
+        host: std::cell::UnsafeCell::new(host),
+        recorded: std::sync::atomic::AtomicU32::new(0),
+        gate: std::sync::Mutex::new(None),
+        earlier: std::sync::Mutex::new(Vec::new()),
+        allocator: std::cell::UnsafeCell::new(Some(allocator.host.clone())),
         textures: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     trace!("command list {:p} made: type {kind}", &raw const *list);
@@ -476,7 +563,7 @@ impl List {
         };
         // SAFETY: a plain call on the host list; the barrier names no resource, so nothing
         // in it needs dropping.
-        unsafe { self.host.ResourceBarrier(&[barrier]) };
+        unsafe { self.host().ResourceBarrier(&[barrier]) };
     }
 
     /// Moves a host texture to the state a command needs, if this list does not have it
@@ -524,7 +611,7 @@ impl List {
             },
         };
         // SAFETY: a plain call on the host list.
-        unsafe { self.host.ResourceBarrier(&[barrier]) };
+        unsafe { self.current().ResourceBarrier(&[barrier]) };
     }
 
     /// Puts every host texture this list used back in the common state, and forgets them.
@@ -546,9 +633,118 @@ impl List {
         }
     }
 
-    /// The host list this one records onto.
+    /// The host list this one records onto, without counting a command.
+    fn current(&self) -> &ID3D12GraphicsCommandList {
+        // SAFETY: a list is recorded, closed, reset and submitted by one thread at a time,
+        // which is the console's rule for a title and the host's own; so nothing swaps the
+        // host list while this reference is in use.
+        unsafe { &*self.host.get() }
+    }
+
+    /// The host list this one records onto, for a command that is recorded now.
     pub(crate) fn host(&self) -> &ID3D12GraphicsCommandList {
-        &self.host
+        self.recorded
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.current()
+    }
+
+    /// The host list, for a submission that runs it now and leaves it this list's own.
+    pub(crate) fn submitted(&self) -> &ID3D12GraphicsCommandList {
+        self.current()
+    }
+
+    /// Records a wait: the GPU is to go on with what follows only when a value in memory
+    /// allows.
+    ///
+    /// The host cannot wait inside a list. If nothing has been recorded yet, the wait is
+    /// made before the whole list. Otherwise the list is cut in two here: what was recorded
+    /// so far is closed and kept as a piece of its own, and recording goes on in another
+    /// host list, before which the wait is made. Returns whether the wait was taken.
+    ///
+    /// A host list starts with no state, so state set before a cut (viewports, render
+    /// targets and the like) is not there after it. Nothing carries it over yet.
+    pub(crate) fn wait_here(&self, wait: Wait) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.recorded.load(Ordering::Relaxed) == 0 {
+            *gate = Some(wait);
+            return true;
+        }
+        // SAFETY: as in `current`: only the thread recording this list touches these.
+        let Some(allocator) = (unsafe { &*self.allocator.get() }).clone() else {
+            return false;
+        };
+        let Some(next) = closed_host_list(self.kind) else {
+            return false;
+        };
+        // SAFETY: plain calls on host lists. The list recorded so far is closed before the
+        // next one starts recording into the same allocator, as the host requires.
+        unsafe {
+            self.settle_textures(false);
+            if self.current().Close().is_err() || next.Reset(&allocator, None).is_err() {
+                return false;
+            }
+            let before = std::mem::replace(&mut *self.host.get(), next);
+            self.earlier
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((gate.take(), before));
+        }
+        *gate = Some(wait);
+        self.recorded.store(0, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether the GPU has to wait before any part of this list.
+    pub(crate) fn has_waits(&self) -> bool {
+        self.gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+            || !self
+                .earlier
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+    }
+
+    /// The list type, as the host numbers them.
+    pub(crate) fn kind(&self) -> u32 {
+        self.kind
+    }
+
+    /// Takes the list's host lists away, to be run later than the title's submission
+    /// returns: every piece in order, each with the wait the GPU makes before it. A closed
+    /// host list is put in their place. The title may reset and record this list again at
+    /// once, which must not touch commands that have not run yet.
+    pub(crate) fn take_pieces(&self) -> Vec<(Option<Wait>, ID3D12GraphicsCommandList)> {
+        let mut pieces = std::mem::take(
+            &mut *self
+                .earlier
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        match closed_host_list(self.kind) {
+            Some(replacement) => {
+                // SAFETY: as in `current`: only the thread submitting this list uses it.
+                let last = unsafe { std::mem::replace(&mut *self.host.get(), replacement) };
+                pieces.push((gate, last));
+            }
+            None => {
+                trace!(
+                    "the last part of a command list is not submitted: the host gave no list in its place"
+                )
+            }
+        }
+        pieces
     }
 }
 
@@ -561,7 +757,7 @@ extern "system" fn list_type(this: &List) -> u32 {
 extern "system" fn close(this: &List) -> Hresult {
     this.settle_textures(false);
     // SAFETY: a plain call on the host list.
-    match unsafe { this.host.Close() } {
+    match unsafe { this.current().Close() } {
         Ok(()) => S_OK,
         Err(error) => {
             trace!("the host refused to close a command list: {error}");
@@ -589,7 +785,25 @@ unsafe extern "system" fn reset(
     // those commands are let go.
     this.settle_textures(true);
     // SAFETY: a plain call on the host list with a live host allocator.
-    match unsafe { this.host.Reset(&allocator.host, None) } {
+    this.recorded.store(0, std::sync::atomic::Ordering::Relaxed);
+    *this
+        .gate
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    // Pieces that were never submitted can record again.
+    let unsubmitted = std::mem::take(
+        &mut *this
+            .earlier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    for (_, piece) in unsubmitted {
+        recycle(this.kind, piece);
+    }
+    // SAFETY: as in `current`: only the thread resetting this list touches it.
+    unsafe { *this.allocator.get() = Some(allocator.host.clone()) };
+    // SAFETY: a plain call on the host list with a live host allocator.
+    match unsafe { this.current().Reset(&allocator.host, None) } {
         Ok(()) => S_OK,
         Err(error) => {
             trace!("the host refused to reset a command list: {error}");
@@ -632,6 +846,22 @@ extern "system" fn sync(this: &List, flags: u32, control: u32, address: u64, siz
 mod tests {
     use super::*;
     use crate::object::{E_NOINTERFACE, E_POINTER};
+
+    #[test]
+    fn a_wait_passes_when_the_value_compares_as_asked() {
+        let wait = |comparison| Wait {
+            address: 0,
+            comparison,
+            reference: 5,
+            wide: true,
+        };
+        assert!(wait(7).passes(5) && wait(7).passes(9) && !wait(7).passes(4));
+        assert!(wait(2).passes(4) && !wait(2).passes(5));
+        assert!(wait(3).passes(5) && !wait(3).passes(6));
+        assert!(wait(6).passes(6) && !wait(6).passes(5));
+        assert!(wait(4).passes(5) && wait(5).passes(6) && !wait(5).passes(5));
+        assert!(!wait(1).passes(5) && wait(8).passes(0));
+    }
 
     #[test]
     fn newer_layouts_have_two_more_methods_before_execute_indirect() {

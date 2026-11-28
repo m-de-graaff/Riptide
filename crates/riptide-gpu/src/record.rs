@@ -23,7 +23,7 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 use windows::core::Interface;
 
-use crate::list::List;
+use crate::list::{List, Wait};
 use crate::trace;
 
 /// `count` items at `items`, or none.
@@ -173,17 +173,53 @@ fn timestamp() -> u64 {
 /// console the GPU stops here until the value in memory at `address` compares as asked
 /// with `reference`.
 ///
-/// Not built: the host GPU cannot wait inside a list, so the wait has to be made between
-/// two host lists when they are submitted. Until submission is built the call is shown and
-/// nothing waits.
-extern "system" fn wait_on_value(this: &List, address: u64, comparison: u32, reference: u64) {
-    static SHOWN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if SHOWN.fetch_add(1, Ordering::Relaxed) < 8 {
+/// The host GPU cannot wait inside a list, so the list is cut in two at the wait and the
+/// queue makes the wait between the two parts when it submits them, in order, on a thread
+/// of its own (see `list.rs` and `ordered.rs`).
+fn wait_on_value(this: &List, wait: Wait) {
+    static SHOWN: [std::sync::atomic::AtomicU32; 2] =
+        [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+    let taken = this.wait_here(wait);
+    if SHOWN[usize::from(taken)].fetch_add(1, Ordering::Relaxed) < 2 {
         trace!(
-            "list {:p}: a GPU wait on the value at {address:#x} (comparison {comparison}, reference {reference:#x}) is not made",
-            std::ptr::from_ref(this)
+            "list {:p}: a GPU wait on the value at {:#x} (comparison {}, reference {:#x}) {}",
+            std::ptr::from_ref(this),
+            wait.address,
+            wait.comparison,
+            wait.reference,
+            if taken {
+                "is made by the queue at that point of the list"
+            } else {
+                "is not made: the list could not be cut there"
+            }
         );
     }
+}
+
+/// `WaitOnValue32X`.
+extern "system" fn wait_on_value_32(this: &List, address: u64, comparison: u32, reference: u64) {
+    wait_on_value(
+        this,
+        Wait {
+            address,
+            comparison,
+            reference: reference & 0xffff_ffff,
+            wide: false,
+        },
+    );
+}
+
+/// `WaitOnValue64X`.
+extern "system" fn wait_on_value_64(this: &List, address: u64, comparison: u32, reference: u64) {
+    wait_on_value(
+        this,
+        Wait {
+            address,
+            comparison,
+            reference,
+            wide: true,
+        },
+    );
 }
 
 /// `ResourceBarrier` `(count, barriers)` and the newer barrier groups `(group count,
@@ -400,8 +436,8 @@ pub(crate) fn methods() -> Vec<(usize, usize)> {
         (70, write_64 as *const () as usize),
         (124, shading_rate as *const () as usize),
         (68, depth_bounds as *const () as usize),
-        (71, wait_on_value as *const () as usize),
-        (72, wait_on_value as *const () as usize),
+        (71, wait_on_value_32 as *const () as usize),
+        (72, wait_on_value_64 as *const () as usize),
     ];
     // Draws and dispatches: instanced, indexed, dispatch, indirect, and the console's own
     // dispatch and mesh dispatches.

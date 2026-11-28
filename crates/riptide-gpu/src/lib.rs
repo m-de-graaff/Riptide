@@ -14,6 +14,7 @@ mod host;
 mod inplace;
 mod list;
 mod object;
+mod ordered;
 mod pagepool;
 mod pipeline;
 mod present;
