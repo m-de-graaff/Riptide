@@ -179,6 +179,7 @@ impl Ordered {
                 }
                 // What the lists read of title memory is what is mapped now.
                 crate::pagetable::sync();
+                crate::bindless::sync();
                 let host: Vec<Option<ID3D12CommandList>> = pieces
                     .iter()
                     .filter_map(|piece| piece.host.cast::<ID3D12CommandList>().ok())

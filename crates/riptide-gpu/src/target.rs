@@ -44,6 +44,20 @@ pub(crate) fn host_format(format: u32) -> Option<DXGI_FORMAT> {
     Some(DXGI_FORMAT(number as i32))
 }
 
+/// The format a host texture of depth `format` is made with: the format's family, with
+/// no type of its own. The host shows a depth texture to shaders only as a colour format of
+/// the same family, and allows that only on a texture made this way. Other formats are
+/// left as they are.
+fn without_type(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    DXGI_FORMAT(match format.0 {
+        40 => 39,
+        45 => 44,
+        55 => 53,
+        20 => 19,
+        other => other,
+    })
+}
+
 /// The host description of a title's texture.
 pub(crate) fn host_description(description: &Description) -> Option<D3D12_RESOURCE_DESC> {
     Some(D3D12_RESOURCE_DESC {
@@ -53,7 +67,7 @@ pub(crate) fn host_description(description: &Description) -> Option<D3D12_RESOUR
         Height: description.height.max(1),
         DepthOrArraySize: description.depth_or_array_size.max(1),
         MipLevels: description.mip_levels,
-        Format: host_format(description.format)?,
+        Format: without_type(host_format(description.format)?),
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: description.sample_count.max(1),
             Quality: 0,
@@ -229,11 +243,32 @@ unsafe fn target(handle: u64, kind: u8) -> Option<HostTarget> {
         // numbers in the layout of the host's view descriptions, and outlives the call.
         unsafe {
             if depth {
-                let description = record
-                    .described
-                    .then(|| (&raw const words).cast::<D3D12_DEPTH_STENCIL_VIEW_DESC>());
-                host.device
-                    .CreateDepthStencilView(&texture, description, view);
+                // A depth view always says its format: the host texture has none of its
+                // own (see `without_type`). Undescribed, it is the whole texture's first
+                // level, in the dimension the texture has.
+                let of = resource.description();
+                if !record.described {
+                    let layered = of.depth_or_array_size > 1;
+                    words = [0; 6];
+                    words[1] = match (of.sample_count > 1, layered) {
+                        (false, false) => 3,
+                        (false, true) => 4,
+                        (true, false) => 5,
+                        (true, true) => 6,
+                    };
+                    if layered {
+                        words[if of.sample_count > 1 { 4 } else { 5 }] =
+                            u32::from(of.depth_or_array_size);
+                    }
+                }
+                if words[0] == 0 {
+                    words[0] = host_format(of.format).map_or(0, |format| format.0 as u32);
+                }
+                host.device.CreateDepthStencilView(
+                    &texture,
+                    Some((&raw const words).cast::<D3D12_DEPTH_STENCIL_VIEW_DESC>()),
+                    view,
+                );
             } else {
                 let description = record
                     .described
@@ -302,6 +337,9 @@ mod tests {
         assert_eq!(host_format(120).unwrap().0, 47);
         assert_eq!(host_format(40).unwrap().0, 40);
         assert_eq!(host_format(116), None);
+        // A depth texture is made in its family's format, so that shaders can read it.
+        assert_eq!(host_description(&described(40, 2)).unwrap().Format.0, 39);
+        assert_eq!(host_description(&described(118, 2)).unwrap().Format.0, 44);
         assert!(host_description(&described(190, 0)).is_none());
         // A buffer has no host texture.
         let buffer = Description {

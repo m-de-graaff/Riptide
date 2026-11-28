@@ -5,6 +5,7 @@
 //! and each call the title makes becomes host calls at once, on the title's thread
 //! (decision D6). See README.md in this folder.
 
+mod bindless;
 mod census;
 mod descriptor;
 mod device;

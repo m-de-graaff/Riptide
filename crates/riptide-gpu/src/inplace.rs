@@ -28,6 +28,35 @@ pub(crate) struct InPlace {
     pub(crate) gpu_address: u64,
 }
 
+/// The buffer over bank `bank` of title memory, opened for the GPU if it was not yet.
+pub(crate) fn bank(bank: usize) -> Option<ID3D12Resource> {
+    let services = crate::services()?;
+    let mut banks = BANKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if banks.len() <= bank {
+        banks.resize_with(bank + 1, || None);
+    }
+    if banks[bank].is_none() {
+        let host = crate::host::host().ok()?;
+        match services.memory.open_heap(
+            bank,
+            &host.device,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ) {
+            Ok(heap) => {
+                trace!("bank {bank} of title memory opened for the GPU");
+                banks[bank] = Some(heap);
+            }
+            Err(error) => {
+                trace!("bank {bank} of title memory could not be opened for the GPU: {error}");
+                return None;
+            }
+        }
+    }
+    Some(banks[bank].as_ref()?.buffer.clone())
+}
+
 /// Where the host GPU finds `bytes` of title memory at `address`, if they are mapped and
 /// lie in one stretch of one bank. `None` otherwise, and then the range can only be reached
 /// through a copy.

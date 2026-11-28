@@ -4,12 +4,13 @@
 //! those bytes about by itself. So a record says everything about its view in its own
 //! bytes, and nothing about it is kept anywhere else: a copy of a record is the same view.
 //!
-//! Views for shaders take 32 bytes and samplers 16 (see `descriptor.rs`). Shaders are to
-//! read these records where they lie (decision D5), so they hold title addresses, not
-//! pointers to host objects, except for the resource a view was made of, which only this
-//! crate follows.
-
-use std::sync::Mutex;
+//! Views for shaders take 32 bytes and samplers 16 (see `descriptor.rs`). Shader programs
+//! read these records where they lie (decision D5, and T6 of the shader design), and the
+//! title's compiled code takes numbers out of what it read: a texture's size, a buffer's
+//! element count. So a record has the console GPU's own descriptor in the words code
+//! reads, and in the words the hardware keeps to itself it has what the host needs: the
+//! place of the texture's host view, or of the host sampler, in the heaps of
+//! `bindless.rs`. The layouts are [`encode`]'s to say.
 
 use crate::device::Device;
 use crate::resource::Resource;
@@ -56,9 +57,272 @@ pub(crate) struct View {
     pub(crate) shape: u32,
     /// The resource object the view was made of, or zero. Only this crate follows it.
     pub(crate) resource: u64,
+    /// A texture view's description as the title gave it, in the host's layout, or zeroes
+    /// if it gave none.
+    pub(crate) described: [u32; 10],
 }
 
-const _: () = assert!(size_of::<View>() == 32);
+/// The word of a record that says what it is: the kind in its lowest byte, then the
+/// dimension, the plane and the flags. It is the last word of a view's 32 bytes, which no
+/// descriptor of the console's uses.
+const TAG: usize = 7;
+
+/// In a buffer's flags word: its bounds are counted in bytes, not elements.
+const BOUNDS_IN_BYTES: u32 = 0x3000_0000;
+/// In a buffer's flags word: it is a ray-tracing structure.
+const STRUCTURE: u32 = 0x8000_0000;
+
+/// The record of `view`, as eight words.
+///
+/// A buffer, constants or a ray-tracing structure is the console's buffer descriptor in
+/// its first four words:
+///
+/// | Word | Holds |
+/// | --- | --- |
+/// | 0 | the low half of its first byte's title address |
+/// | 1 | bits 0 to 7: the rest of the address. Bits 16 to 29: the element size in bytes, zero for untyped words |
+/// | 2 | how many elements, or bytes for untyped words |
+/// | 3 | flags: [`BOUNDS_IN_BYTES`], [`STRUCTURE`] |
+/// | 4 | the format |
+/// | 7 | the tag |
+///
+/// A texture is the console's image descriptor in the words code reads:
+///
+/// | Word | Holds |
+/// | --- | --- |
+/// | 0 | nothing |
+/// | 1 | bits 30 and 31: the low two bits of the width less one. Below them, the format |
+/// | 2 | bits 0 to 13: the rest of the width less one. Bits 14 to 29: the height less one |
+/// | 3 | bits 0 to 11: which channel each of the four comes from. Bits 16 to 19: the last level. Bits 28 to 31: the kind of texture (8 one dimension, 9 two, 10 three, 11 cube, 12 and 13 arrays of one and two, 14 and 15 multisampled and its array) |
+/// | 4 | the depth less one, or the slices less one |
+/// | 5 | the place of the host view in the shaders' heap |
+/// | 6 | bit 0: the format is of whole numbers. Bit 1: they are signed |
+/// | 7 | the tag |
+///
+/// The size is that of the view's first level, and the levels are counted from it, as a
+/// shader sees them through the host view.
+pub(crate) fn encode(view: &View) -> [u32; 8] {
+    let mut words = [0u32; 8];
+    words[TAG] = u32::from(view.kind)
+        | (u32::from(view.dimension) << 8)
+        | (u32::from(view.plane) << 16)
+        | (u32::from(view.flags) << 24);
+    let buffer = view.kind == KIND_CONSTANTS
+        || u32::from(view.dimension) == DIMENSION_BUFFER
+        || view.dimension == 11;
+    if view.kind == 0 {
+        return words;
+    }
+    if buffer {
+        words[0] = view.address as u32;
+        words[1] = ((view.address >> 32) as u32) & 0xff;
+        words[4] = view.format;
+        if view.dimension == 11 {
+            words[3] = STRUCTURE;
+        } else if view.kind == KIND_CONSTANTS {
+            // Constants are read in rows of 16 bytes.
+            words[1] |= 16 << 16;
+            words[2] = view.extent.div_ceil(16);
+        } else if view.flags & 1 != 0 {
+            words[2] = view.extent.saturating_mul(view.shape.max(1));
+            words[3] = BOUNDS_IN_BYTES;
+        } else {
+            words[1] |= (view.shape & 0x3fff) << 16;
+            words[2] = view.extent;
+        }
+        return words;
+    }
+    // SAFETY: a view's resource is null or live when the view is made.
+    let resource = unsafe { (view.resource as *const Resource).as_ref() };
+    let unordered = view.kind == KIND_UNORDERED_ACCESS;
+    let description = resource.map(Resource::description);
+    let first_level = view.extent & 0xff;
+    let levels = match ((view.extent >> 8) & 0xff, description) {
+        (0xff, Some(d)) => u32::from(d.mip_levels).saturating_sub(first_level).max(1),
+        (0xff, None) => 1,
+        (levels, _) => levels.max(1),
+    };
+    let size = |whole: u64| ((whole >> first_level).max(1) - 1) as u32;
+    let (width, height, depth, array) = description.map_or((0, 0, 0, 1), |d| {
+        let three = d.dimension == 4;
+        (
+            size(d.width),
+            size(u64::from(d.height)),
+            if three {
+                size(u64::from(d.depth_or_array_size))
+            } else {
+                0
+            },
+            if three {
+                1
+            } else {
+                u32::from(d.depth_or_array_size).max(1)
+            },
+        )
+    });
+    let first_slice = view.extent >> 16;
+    let slices = match view.shape & 0xffff {
+        0xffff => array.saturating_sub(first_slice).max(1),
+        slices => slices.max(1),
+    };
+    let kind = texture_kind(u32::from(view.dimension), description);
+    words[1] = ((width & 3) << 30) | (view.format & 0x3fff_ffff);
+    words[2] = ((width >> 2) & 0x3fff) | ((height & 0xffff) << 14);
+    words[3] = channels(view.shape >> 16) | (((levels - 1) & 0xf) << 16) | (kind << 28);
+    words[4] = match kind {
+        10 => depth,
+        11..=13 | 15 => slices - 1,
+        _ => 0,
+    };
+    words[5] = crate::bindless::NOTHING + kind - 8;
+    words[6] = whole_numbers(view.format);
+    if let Some(texture) = resource.and_then(Resource::host) {
+        let mut described = view.described;
+        if described == [0; 10] {
+            if let Some(d) = description {
+                described = undescribed(d, unordered);
+            }
+        } else {
+            described[0] = readable(described[0], u32::from(view.plane));
+        }
+        match crate::bindless::view((view.resource as usize, unordered, described), texture) {
+            Some(place) => words[5] = place,
+            None => trace!("a texture view has no place in the shaders' heap: {view:x?}"),
+        }
+    }
+    words
+}
+
+/// The console's number for the kind of texture a view of host dimension `dimension`
+/// shows: the dimension numbers are those of the host's shader resource views, which its
+/// unordered access views share where they have them. Zero is "as the resource is".
+fn texture_kind(dimension: u32, resource: Option<&crate::resource::Description>) -> u32 {
+    match dimension {
+        2 => 8,
+        3 => 12,
+        4 => 9,
+        5 => 13,
+        6 => 14,
+        7 => 15,
+        8 => 10,
+        9 | 10 => 11,
+        _ => match resource {
+            Some(d) if d.dimension == 2 && d.depth_or_array_size > 1 => 12,
+            Some(d) if d.dimension == 2 => 8,
+            Some(d) if d.dimension == 4 => 10,
+            Some(d) if d.sample_count > 1 => 14,
+            Some(d) if d.depth_or_array_size > 1 => 13,
+            _ => 9,
+        },
+    }
+}
+
+/// The console's channel selection for the host's component mapping: three bits for each
+/// of the four channels, 0 and 1 for those numbers and 4 to 7 for the texture's own four.
+/// The host's mapping has three bits each too: 0 to 3 the texture's four, 4 zero, 5 one.
+/// A mapping of zero is none given, and means each channel is itself.
+fn channels(mapping: u32) -> u32 {
+    if mapping == 0 {
+        return 0xfac;
+    }
+    (0..4)
+        .map(|channel| {
+            let console = match (mapping >> (3 * channel)) & 7 {
+                4 => 0,
+                5 => 1,
+                own => 4 + (own & 3),
+            };
+            console << (3 * channel)
+        })
+        .sum()
+}
+
+/// Bit 0 if `format` holds whole numbers, and bit 1 as well if they are signed.
+fn whole_numbers(format: u32) -> u32 {
+    match format {
+        3 | 7 | 12 | 17 | 22 | 25 | 30 | 36 | 42 | 47 | 50 | 57 | 62 => 1,
+        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => 3,
+        _ => 0,
+    }
+}
+
+/// The format a shader reads a texture of `format` through: a depth format's plane as a
+/// colour, since the host shows depth to shaders only that way, and any other format as
+/// the host has it.
+pub(crate) fn readable(format: u32, plane: u32) -> u32 {
+    let host = crate::target::host_format(format).map_or(format, |host| host.0 as u32);
+    match (host, plane) {
+        (40 | 39, _) => 41,
+        (55 | 53, _) => 56,
+        (45 | 44, 0) => 46,
+        (45 | 44, _) => 47,
+        (20 | 19, 0) => 21,
+        (20 | 19, _) => 22,
+        (other, _) => other,
+    }
+}
+
+/// The host description of a view the title did not describe: the whole resource, as it
+/// is. The host takes "no description" too, except for a depth texture, whose host texture
+/// has no format of its own to read through; so one is always written.
+fn undescribed(resource: &crate::resource::Description, unordered: bool) -> [u32; 10] {
+    let mut words = [0u32; 10];
+    words[0] = readable(resource.format, 0);
+    let array = u32::from(resource.depth_or_array_size);
+    let layered = array > 1;
+    if unordered {
+        // Format, dimension, then: level; or level, first slice, slices.
+        words[1] = match (resource.dimension, layered) {
+            (2, false) => 2,
+            (2, true) => 3,
+            (4, _) => 8,
+            (_, false) => 4,
+            (_, true) => 5,
+        };
+        if resource.dimension == 4 || layered {
+            words[4] = if resource.dimension == 4 {
+                u32::MAX
+            } else {
+                array
+            };
+        }
+    } else {
+        // Format, dimension, mapping, then: first level, levels; and for an array the
+        // first slice and the slices.
+        words[1] = match (resource.dimension, layered, resource.sample_count > 1) {
+            (2, false, _) => 2,
+            (2, true, _) => 3,
+            (4, _, _) => 8,
+            (_, false, true) => 6,
+            (_, true, true) => 7,
+            (_, false, false) => 4,
+            (_, true, false) => 5,
+        };
+        words[2] = 0x1688;
+        match words[1] {
+            6 => {}
+            7 => words[4] = array,
+            _ => {
+                words[4] = u32::MAX;
+                if layered && resource.dimension != 4 {
+                    words[6] = array;
+                }
+            }
+        }
+    }
+    words
+}
+
+/// The view a record at `handle` was made from, as far as the record's tag says: its kind.
+/// Zero if nothing was written there.
+///
+/// # Safety
+/// `handle` is the address of a view descriptor.
+#[allow(dead_code)] // the first user is a draw that checks what it is given
+pub(crate) unsafe fn kind_at(handle: u64) -> u8 {
+    // SAFETY: as this function's contract says.
+    unsafe { (handle as *const [u32; 8]).read_unaligned()[TAG] as u8 }
+}
 
 /// A render or depth target: the resource and the title's description of the view, which
 /// only commands read.
@@ -75,47 +339,23 @@ pub(crate) struct Target {
 
 const _: () = assert!(size_of::<Target>() == 40);
 
-/// A sampler: which of the samplers the title has described so far.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SamplerRecord {
-    pub(crate) kind: u8,
-    pub(crate) index: u32,
-    reserved: u64,
-}
-
-const _: () = assert!(size_of::<SamplerRecord>() == 16);
+/// A sampler's record: four words. The first is [`KIND_SAMPLER`]; the last is the place of
+/// the host sampler in the shaders' sampler heap (`bindless.rs`), in its low 12 bits, where
+/// the console's own descriptor keeps something no shader program reads. Equal samplers
+/// have one place, so a copy of a record is the same sampler.
+pub(crate) type SamplerRecord = [u32; 4];
 
 /// `D3D12_SAMPLER_DESC`, as 13 words.
 pub(crate) type Sampler = [u32; 13];
 
-/// Every distinct sampler described so far. A record holds a place in this list, so that it
-/// fits its 16 bytes and equal samplers are one.
-static SAMPLERS: Mutex<Vec<Sampler>> = Mutex::new(Vec::new());
-
-/// The place of `sampler` in the list, added if it is new.
-fn sampler_index(sampler: &Sampler) -> u32 {
-    let mut samplers = SAMPLERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let index = match samplers.iter().position(|known| known == sampler) {
-        Some(index) => index,
-        None => {
-            samplers.push(*sampler);
-            samplers.len() - 1
-        }
-    };
-    index as u32
-}
-
-/// The sampler a record names.
-#[allow(dead_code)] // the first user is binding samplers for a draw
-pub(crate) fn sampler(index: u32) -> Option<Sampler> {
-    SAMPLERS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(index as usize)
-        .copied()
+/// The record of a sampler the host describes as `sampler`.
+fn sampler_record(sampler: &Sampler) -> SamplerRecord {
+    [
+        u32::from(KIND_SAMPLER),
+        0,
+        0,
+        crate::bindless::sampler(sampler),
+    ]
 }
 
 /// The bytes one element of `format` takes in a buffer, for the formats buffers are made
@@ -198,6 +438,7 @@ fn buffer_view(
         extent: count,
         shape: element,
         resource,
+        described: [0; 10],
     }
 }
 
@@ -216,6 +457,7 @@ fn texture_view(
     plane: u32,
     mapping: u32,
     resource: u64,
+    described: &[u32; 10],
 ) -> View {
     View {
         kind,
@@ -227,6 +469,7 @@ fn texture_view(
         extent: (first_level & 0xff) | (levels.min(0xff) << 8) | ((first_slice & 0xffff) << 16),
         shape: slices.min(0xffff) | ((mapping & 0xffff) << 16),
         resource,
+        described: *described,
     }
 }
 
@@ -260,7 +503,7 @@ pub(crate) unsafe extern "system" fn create_constants(
         format_args!("constants view at {handle:#x}: {view:x?}"),
     );
     // SAFETY: the title's descriptor.
-    unsafe { put(handle, view) };
+    unsafe { put(handle, encode(&view)) };
 }
 
 /// `ID3D12Device::CreateShaderResourceView`: `(resource, description, descriptor)`.
@@ -285,7 +528,7 @@ pub(crate) unsafe extern "system" fn create_shader_resource(
         format_args!("shader resource view at {handle:#x}: {view:x?}"),
     );
     // SAFETY: the title's descriptor.
-    unsafe { put(handle, view) };
+    unsafe { put(handle, encode(&view)) };
 }
 
 /// The shader resource view `description` asks for, of the resource `object` whose bytes
@@ -330,17 +573,20 @@ fn shader_resource(
                     let plane = if dimension == 5 { d[8] } else { 0 };
                     texture_view(
                         KIND, base, format, dimension, d[4], d[5], d[6], d[7], plane, mapping,
-                        object,
+                        object, d,
                     )
                 }
                 // Multisampled: no levels; the array has a first slice and a count.
-                6 => texture_view(KIND, base, format, 6, 0, 1, 0, 1, 0, mapping, object),
-                7 => texture_view(KIND, base, format, 7, 0, 1, d[4], d[5], 0, mapping, object),
+                6 => texture_view(KIND, base, format, 6, 0, 1, 0, 1, 0, mapping, object, d),
+                7 => texture_view(
+                    KIND, base, format, 7, 0, 1, d[4], d[5], 0, mapping, object, d,
+                ),
                 // One texture: levels only, and a plane for two dimensions.
                 _ => {
                     let plane = if dimension == 4 { d[6] } else { 0 };
                     texture_view(
                         KIND, base, format, dimension, d[4], d[5], 0, ALL, plane, mapping, object,
+                        d,
                     )
                 }
             }
@@ -399,7 +645,7 @@ pub(crate) unsafe extern "system" fn create_placed_shader_resource(
         format_args!("placed shader resource view at {handle:#x}: {view:x?}"),
     );
     // SAFETY: the title's descriptor.
-    unsafe { put(handle, view) };
+    unsafe { put(handle, encode(&view)) };
 }
 
 /// `ID3D12Device::CreatePlacedUnorderedAccessViewX`: as
@@ -423,7 +669,7 @@ pub(crate) unsafe extern "system" fn create_placed_unordered_access(
         format_args!("placed unordered access view at {handle:#x}: {view:x?}"),
     );
     // SAFETY: the title's descriptor.
-    unsafe { put(handle, view) };
+    unsafe { put(handle, encode(&view)) };
 }
 
 /// `ID3D12Device::CreateUnorderedAccessView`: `(resource, counter resource, description,
@@ -452,7 +698,7 @@ pub(crate) unsafe extern "system" fn create_unordered_access(
         format_args!("unordered access view at {handle:#x}: {view:x?}"),
     );
     // SAFETY: the title's descriptor.
-    unsafe { put(handle, view) };
+    unsafe { put(handle, encode(&view)) };
 }
 
 /// The unordered access view `description` asks for, of the resource `object` whose bytes
@@ -486,15 +732,15 @@ fn unordered_access(
                 dimension @ (3 | 5) => {
                     let plane = if dimension == 5 { d[5] } else { 0 };
                     texture_view(
-                        KIND, base, format, dimension, d[2], 1, d[3], d[4], plane, 0, object,
+                        KIND, base, format, dimension, d[2], 1, d[3], d[4], plane, 0, object, d,
                     )
                 }
                 // Three dimensions: one level, then first depth slice and count.
-                8 => texture_view(KIND, base, format, 8, d[2], 1, d[3], d[4], 0, 0, object),
+                8 => texture_view(KIND, base, format, 8, d[2], 1, d[3], d[4], 0, 0, object, d),
                 dimension => {
                     let plane = if dimension == 4 { d[3] } else { 0 };
                     texture_view(
-                        KIND, base, format, dimension, d[2], 1, 0, ALL, plane, 0, object,
+                        KIND, base, format, dimension, d[2], 1, 0, ALL, plane, 0, object, d,
                     )
                 }
             }
@@ -587,16 +833,12 @@ pub(crate) unsafe extern "system" fn create_sampler(
     let Some(description) = (unsafe { description.as_ref() }) else {
         return;
     };
-    let record = SamplerRecord {
-        kind: KIND_SAMPLER,
-        index: sampler_index(description),
-        reserved: 0,
-    };
+    let record = sampler_record(description);
     show(
         KIND_SAMPLER,
         format_args!(
-            "sampler at {handle:#x}: number {} of those described, {description:x?}",
-            record.index
+            "sampler at {handle:#x}: place {} in the shaders' heap, {description:x?}",
+            record[3]
         ),
     );
     // SAFETY: the title's descriptor.
@@ -795,9 +1037,18 @@ mod tests {
         words.as_mut_ptr() as u64
     }
 
+    /// The record at an address.
+    ///
+    /// # Safety
+    /// A view descriptor's worth of memory lies there.
+    unsafe fn words(at: u64) -> [u32; 8] {
+        // SAFETY: as this function's contract says.
+        unsafe { (at as *const [u32; 8]).read_unaligned() }
+    }
+
     #[test]
-    fn a_buffer_view_starts_at_its_first_element() {
-        let mut slots = [0u64; 8];
+    fn a_buffer_record_is_the_consoles_buffer_descriptor() {
+        let mut slots = [0u64; 12];
         let at = room(&mut slots);
         // Format unknown, buffer, mapping, pad, first element 3, 10 elements of 24 bytes.
         let structured = [0u32, 1, 0x1688, 0, 3, 0, 10, 24, 0, 0];
@@ -807,39 +1058,141 @@ mod tests {
         unsafe {
             create_shader_resource(device(), std::ptr::null(), &structured, at);
             create_shader_resource(device(), std::ptr::null(), &raw, at + 32);
-            let view = (at as *const View).read();
-            assert_eq!(
-                (view.kind, view.address, view.extent, view.shape, view.flags),
-                (KIND_SHADER_RESOURCE, 72, 10, 24, 0)
-            );
-            let view = ((at + 32) as *const View).read();
-            assert_eq!(
-                (view.address, view.extent, view.shape, view.flags),
-                (8, 16, 4, 1)
-            );
+            let record = words(at);
+            // The address of element 3, the element size, the count, counted in elements.
+            assert_eq!(record[..4], [72, 24 << 16, 10, 0]);
+            assert_eq!(kind_at(at), KIND_SHADER_RESOURCE);
+            // Untyped words: no element size, and bounds in bytes.
+            let record = words(at + 32);
+            assert_eq!(record[..4], [8, 0, 64, BOUNDS_IN_BYTES]);
+            assert_eq!(record[4], 39);
+            // A ray-tracing structure is its address and a mark.
+            let structure = [0u32, 11, 0x1688, 0, 0x4000, 0x12, 0, 0, 0, 0];
+            create_shader_resource(device(), std::ptr::null(), &structure, at + 64);
+            assert_eq!(words(at + 64)[..4], [0x4000, 0x12, 0, STRUCTURE]);
         }
     }
 
     #[test]
     fn a_texture_view_keeps_its_levels_slices_and_plane() {
-        let mut slots = [0u64; 8];
-        let at = room(&mut slots);
         // A 2D array: format 28, mapping, first level 1, 4 levels, slice 2, 6 slices, plane 1.
         let array = [28u32, 5, 0x1688, 0, 1, 4, 2, 6, 1, 0];
         // One 2D texture, all levels.
         let whole = [28u32, 4, 0x1688, 0, 0, u32::MAX, 0, 0, 0, 0];
-        // SAFETY: valid descriptions, and room for the records.
-        unsafe {
-            create_shader_resource(device(), std::ptr::null(), &array, at);
-            create_shader_resource(device(), std::ptr::null(), &whole, at + 32);
-            let view = (at as *const View).read();
-            assert_eq!((view.dimension, view.plane, view.format), (5, 1, 28));
-            assert_eq!(view.extent, 1 | (4 << 8) | (2 << 16));
-            assert_eq!(view.shape, 6 | (0x1688 << 16));
-            let view = ((at + 32) as *const View).read();
-            assert_eq!(view.extent, 0xff << 8);
-            assert_eq!(view.shape & 0xffff, 0xffff);
-        }
+        let view = shader_resource(0, 28, 0, Some(&array));
+        assert_eq!((view.dimension, view.plane, view.format), (5, 1, 28));
+        assert_eq!(view.extent, 1 | (4 << 8) | (2 << 16));
+        assert_eq!(view.shape, 6 | (0x1688 << 16));
+        assert_eq!(view.described, array);
+        let view = shader_resource(0, 28, 0, Some(&whole));
+        assert_eq!(view.extent, 0xff << 8);
+        assert_eq!(view.shape & 0xffff, 0xffff);
+    }
+
+    #[test]
+    fn a_texture_record_has_the_numbers_code_reads_where_the_console_has_them() {
+        // A view of no resource: an array of two dimensions, 4 levels, 6 slices.
+        let array = [28u32, 5, 0x1688, 0, 1, 4, 2, 6, 0, 0];
+        let record = encode(&shader_resource(0, 28, 0, Some(&array)));
+        // Kind 13 (an array of two dimensions), last level 3, each channel itself.
+        assert_eq!(record[3], 0xfac | (3 << 16) | (13 << 28));
+        assert_eq!(record[4], 5);
+        // With no texture behind it, the place is the view of nothing of its kind.
+        assert_eq!(record[5], crate::bindless::NOTHING + 5);
+        assert_eq!(
+            record[TAG] & 0xffff,
+            u32::from(KIND_SHADER_RESOURCE) | (5 << 8)
+        );
+        // A record nothing was written to is all zero, and so is not a view.
+        assert_eq!(encode(&View::default()), [0; 8]);
+    }
+
+    #[test]
+    fn a_textures_size_is_split_over_the_words_as_the_console_splits_it() {
+        let texture = crate::resource::Description {
+            dimension: 3,
+            alignment: 0,
+            width: 1920,
+            height: 1080,
+            depth_or_array_size: 1,
+            mip_levels: 11,
+            // A format the host has no texture for, so that no host texture is made.
+            format: 190,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        let object = crate::resource::placed(0x7_0000_0000, &texture) as u64;
+        let record = encode(&shader_resource(0x7_0000_0000, 190, object, None));
+        let width = (record[1] >> 30) | ((record[2] & 0x3fff) << 2);
+        let height = (record[2] >> 14) & 0xffff;
+        assert_eq!((width + 1, height + 1), (1920, 1080));
+        assert_eq!((record[3] >> 16) & 0xf, 10);
+        assert_eq!(record[3] >> 28, 9);
+        // From its second level on, the size is that level's.
+        let from_second = [190u32, 4, 0x1688, 0, 1, u32::MAX, 0, 0, 0, 0];
+        let record = encode(&shader_resource(
+            0x7_0000_0000,
+            190,
+            object,
+            Some(&from_second),
+        ));
+        let width = (record[1] >> 30) | ((record[2] & 0x3fff) << 2);
+        assert_eq!(width + 1, 960);
+        assert_eq!((record[3] >> 16) & 0xf, 9);
+    }
+
+    #[test]
+    fn channels_formats_and_undescribed_views_are_as_the_host_and_console_number_them() {
+        // The host's "each channel itself" is the console's.
+        assert_eq!(channels(0x1688), 0xfac);
+        assert_eq!(channels(0), 0xfac);
+        // Red everywhere but alpha, which is one.
+        assert_eq!(
+            channels(0x1000 | (5 << 9)),
+            4 | (4 << 3) | (4 << 6) | (1 << 9)
+        );
+        assert_eq!(
+            (whole_numbers(42), whole_numbers(43), whole_numbers(28)),
+            (1, 3, 0)
+        );
+        // Depth is read as a colour, and stencil as the other plane.
+        assert_eq!(
+            (readable(40, 0), readable(45, 0), readable(45, 1)),
+            (41, 46, 47)
+        );
+        assert_eq!(
+            (readable(118, 0), readable(55, 0), readable(28, 0)),
+            (46, 56, 28)
+        );
+        let depth = crate::resource::Description {
+            dimension: 3,
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 40,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 2,
+        };
+        assert_eq!(
+            undescribed(&depth, false)[..6],
+            [41, 4, 0x1688, 0, u32::MAX, 0]
+        );
+        let layered = crate::resource::Description {
+            depth_or_array_size: 6,
+            format: 28,
+            ..depth
+        };
+        assert_eq!(
+            undescribed(&layered, false)[..7],
+            [28, 5, 0x1688, 0, u32::MAX, 0, 6]
+        );
+        assert_eq!(undescribed(&layered, true)[..5], [28, 5, 0, 0, 6]);
     }
 
     #[test]
@@ -853,30 +1206,30 @@ mod tests {
             height: 128,
             depth_or_array_size: 1,
             mip_levels: 9,
-            format: 71,
+            format: 190,
             sample_count: 1,
             sample_quality: 0,
             layout: 0,
             flags: 0,
         };
         // A whole 2D texture at 0x1_2345_0000, format left to the resource.
-        let mut words = [0u32; 16];
-        words[..6].copy_from_slice(&[0, 4, 0x1688, 0, 0, u32::MAX]);
-        (words[10], words[11]) = (0x2345_0000, 1);
+        let mut description = [0u32; 16];
+        description[..6].copy_from_slice(&[0, 4, 0x1688, 0, 0, u32::MAX]);
+        (description[10], description[11]) = (0x2345_0000, 1);
         // SAFETY: valid descriptions, and room for the records.
         unsafe {
-            create_placed_shader_resource(device(), &texture, &words, at);
-            create_placed_shader_resource(device(), &texture, &words, at + 32);
-            create_placed_shader_resource(device(), std::ptr::null(), &words, at + 64);
-            let view = (at as *const View).read();
-            assert_eq!(
-                (view.kind, view.dimension, view.format, view.address),
-                (KIND_SHADER_RESOURCE, 4, 71, 0x1_2345_0000)
-            );
-            // The same memory described the same way is one resource.
-            assert_ne!(view.resource, 0);
-            assert_eq!(((at + 32) as *const View).read(), view);
-            let resource = &*(view.resource as *const Resource);
+            create_placed_shader_resource(device(), &texture, &description, at);
+            create_placed_shader_resource(device(), &texture, &description, at + 32);
+            create_placed_shader_resource(device(), std::ptr::null(), &description, at + 64);
+            let record = words(at);
+            assert_eq!(kind_at(at), KIND_SHADER_RESOURCE);
+            assert_eq!(record[1] & 0x3fff_ffff, 190);
+            assert_eq!((record[2] >> 14) + 1, 128);
+            // The same memory described the same way is the same record, and one resource.
+            assert_eq!(words(at + 32), record);
+            let (address, format, object, _) = placed(&texture, &description).unwrap();
+            assert_eq!((address, format), (0x1_2345_0000, 190));
+            let resource = &*(object as *const Resource);
             assert_eq!(resource.address(), 0x1_2345_0000);
             assert_eq!(resource.description(), &texture);
             // Without a resource description nothing is written.
@@ -885,17 +1238,14 @@ mod tests {
     }
 
     #[test]
-    fn constants_are_an_address_and_a_size() {
+    fn constants_are_an_address_and_rows_of_16_bytes() {
         let mut slots = [0u64; 4];
         let at = room(&mut slots);
         // SAFETY: a valid description, and room for the record.
         unsafe {
-            create_constants(device(), &[0x2000, 0x1, 256, 0], at);
-            let view = (at as *const View).read();
-            assert_eq!(
-                (view.kind, view.address, view.extent),
-                (KIND_CONSTANTS, 0x1_0000_2000, 256)
-            );
+            create_constants(device(), &[0x2000, 0x1, 250, 0], at);
+            assert_eq!(words(at)[..4], [0x2000, 1 | (16 << 16), 16, 0]);
+            assert_eq!(kind_at(at), KIND_CONSTANTS);
             // A null descriptor is not written to.
             create_constants(device(), &[0, 0, 0, 0], 0);
         }
@@ -931,9 +1281,13 @@ mod tests {
             create_sampler(device(), &point, at + 16);
             create_sampler(device(), &linear, at + 32);
             let record = |at: u64| (at as *const SamplerRecord).read();
-            assert_eq!(record(at).index, record(at + 32).index);
-            assert_ne!(record(at).index, record(at + 16).index);
-            assert_eq!(sampler(record(at + 16).index), Some(point));
+            assert_eq!(record(at), record(at + 32));
+            assert_eq!(record(at)[0], u32::from(KIND_SAMPLER));
+            // Where there is a host to make samplers, different ones have different places.
+            if crate::host::host().is_ok() {
+                assert_ne!(record(at)[3], record(at + 16)[3]);
+                assert!(record(at)[3] < crate::bindless::COMPARING);
+            }
 
             copy_simple(device(), 1, at + 48, at + 16, 1);
             assert_eq!(record(at + 48), record(at + 16));
@@ -985,7 +1339,7 @@ mod tests {
         unsafe {
             create_sampler_x(device(), &flat, at);
             let record = (at as *const SamplerRecord).read();
-            assert_eq!(super::sampler(record.index), Some(sampler));
+            assert_eq!(record, sampler_record(&sampler));
         }
     }
 

@@ -457,6 +457,10 @@ enum Owned {
 
 impl Drop for Resource {
     fn drop(&mut self) {
+        // Its views in the shaders' heap go with it.
+        if self.host.get().is_some_and(Option::is_some) {
+            crate::bindless::forget(std::ptr::from_ref(self) as usize);
+        }
         let Some(services) = crate::services() else {
             return;
         };
