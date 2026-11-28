@@ -147,3 +147,18 @@ The title reaches its page of legal terms, which asks the player to agree to the
 The BCPack decoder against the reference decoder, on 129 streams the title asked for in such a run (7 of BC1, 100 of BC5, 22 of BC7, written out with `RIPTIDE_BCPACK_DUMP`): all 129 come out the same byte for byte. Speed on one core, release build: about 70 MB of blocks a second for BC1, 65 for BC5 and 32 for BC7.
 
 A run of 420 s with one press, with the host checking every call (`RIPTIDE_GPU_CHECKS=1`) lost no device. It says three things: the known one about a clear value, and two about the state of a bank's buffer (see `riptide-gpu`'s README).
+
+### 2026-11-28 · a release build's start, streamed textures, and the keyboard · commit 7833fe5
+
+Driver 32.0.32029.2010, Windows 11 build 26200. `riptide run` on the real title in a 1280 by 720 window, BCPack tables supplied, without the host's checking. One run each; times are from the session log, counted from its first line.
+
+| Build | First frame presented | First screen drawn | A pressed (script) | Packs opened, store asked | Next pictures drawn |
+| --- | --- | --- | --- | --- | --- |
+| Release | 3.3 s | 15 s | 60 s | 61 s | 83 s |
+| Debug | about 5 s | about 85 s | 100 s | about 205 s | about 240 s |
+
+The release run presented more than 4,096 frames in 150 s and was stopped by the time limit after 240 s.
+
+With streamed textures filled (commit 7cc8ff8) the title shows its intro pictures and its publisher's logo, textured, where it showed black before; more than 512 textures are kept filled by then.
+
+The keyboard, debug build, no script: the window was brought to the front and a real Enter key pressed at 110 s. The title left its first screen as it does for the gamepad's A, and asked the store 106 s later.
