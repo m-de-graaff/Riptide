@@ -23,26 +23,28 @@ Setting `RIPTIDE_ADAPTER=software` makes the host device on Windows' software ad
 
 ## Status
 
-Started. The real title creates its device (on the RX 7900 XTX, from a 0x40-byte parameter block with interface version 2.4, as `ID3D12Device11`), sets up its renderer, and starts to record its first command list. It stops at the list's `SetDescriptorHeaps`: recording is not built.
+The real title creates its device (on the RX 7900 XTX, as `ID3D12Device11` with interface version 2.4), sets up its renderer, and presents frames into a window: over sixty before it stops at a save call that is not built. **The frames hold only what clears put there.** Nothing is drawn, because no host pipeline exists: a title's shader programs are the console GPU's code and `riptide-shader` cannot translate them yet.
 
 Built, and run under the real title:
 
 - **Device.** Creation, `GetNodeCount`, `GetCustomHeapProperties`, and the device's DXGI side: DXGI device, adapter, factory and one output with one mode, 3840 by 2160 at 60 Hz.
-- **Queues and fences.** `CreateCommandQueue`, `CreateCommandQueueX`, `Signal`, `Wait`, `GetTimestampFrequency`, `GetClockCalibration`; fences with `GetCompletedValue`, `SetEventOnCompletion`, `Signal`, `GetCreationFlags`. Each is a host object of the same kind.
-- **Allocators and lists.** `CreateCommandAllocator`, `CreateCommandList`, `CreateCommandListX`, allocator `Reset` and `SetAllocationCallbackX` (accepted and unused), list `GetType`, `Close`, `Reset`, `ResetX`, and the two pipeline syncs, which become a wait for unordered-access writes. A list keeps the console's layout with its put pointer and limits at zero, so the title's code calls every command instead of writing packets.
-- **Frame events.** `SetFrameIntervalX`, `ScheduleFrameEventX`, `WaitFrameEventX`, from a clock. The title asks for a frame every 33,333 us.
-- **Descriptor heaps.** A heap is title memory: the title's own if its description goes on with an address and the right size, else memory committed for it. A handle is an address. Views take 32 bytes, samplers 16, render and depth targets 48.
-- **Views and samplers.** Constants, shader resource, unordered access, render target and depth target views, the placed forms of the first two, `CreateSampler`, `CreateSamplerX`, and both descriptor copies. A view is a record that says everything about itself in its own bytes, so a title that copies descriptors as bytes copies views.
-- **Resources.** `CreateResourceAtAddressX`, `CreateCommittedResource`, `CreateCommittedResource3`, `GetResourceAllocationInfo` and its newer form, and the resource's `Map`, `Unmap`, `GetDesc`, `GetGPUVirtualAddress`, `GetHeapProperties`. A resource records where in title memory it lies, and its GPU address is that address. A committed resource's memory comes from the title's own allocator when it has one, as on the console.
-- **Smaller objects.** Query heaps (host objects), command signatures (a host signature at once when the arguments are only draws and dispatches), root signatures (packed and unpacked by the host's own functions), page pools.
-- **Pipelines.** `CreatePipelineState`, `CreateComputePipelineState` and `CreateComputePipelineStateX` keep the description, the programs and the root signature. Device positions 57 and 67, two console ways to make a pipeline whose descriptions are not understood, fail, and the title goes on without those pipelines. No host pipeline is made: the programs are the console GPU's code and `riptide-shader` cannot translate them yet, so nothing would be drawn with them.
+- **Queues.** `CreateCommandQueue`, `CreateCommandQueueX`, `ExecuteCommandLists`, `ExecuteCommandListsX`, `Signal`, `Signal2X`, `Wait`, `GetTimestampFrequency`, `GetClockCalibration`, `PresentX` and `CopyPageMappingsBatchX`. Lists go to the host queue at once. Page mappings map the same frames of title memory at the destination.
+- **Fences.** A fence lies in title memory with its value where a title reads it, and gives that address as its GPU address. A watcher thread carries the host fence's progress into the value and then sets the events waiting on it.
+- **Allocators and lists.** A list keeps the console's layout with its put pointer and limits at zero, so the title's code calls every command. Recorded on the host list at once: viewports, scissors, topology, blend factor, stencil reference, depth bounds, shading rate, render targets and both clears, and immediate GPU writes into title memory. A barrier and a pipeline sync become a wait for shader writes. A list puts every host texture it used back in the common state when it is closed.
+- **Presenting.** The presented texture is copied into a swap chain of its size in a window and shown as soon as it is ready, with tearing allowed. The window covers the screen without a border; `RIPTIDE_WINDOW=1280x720` makes it an ordinary window. Closing it ends the title.
+- **Frame events.** `SetFrameIntervalX`, `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX`, from a clock. The title asks for a frame every 33,333 us.
+- **Title memory for the GPU.** Each bank is opened as a host heap with one buffer the first time a command needs it.
+- **Descriptor heaps, views and samplers.** A heap is title memory and a handle is an address. A view is a record that says everything about itself in its own bytes, so a title that copies descriptors as bytes copies views. Render and depth target records become host views when a command names them.
+- **Resources.** At title addresses, committed (memory from the title's own allocator, as on the console), and their sizes. A texture gets a host texture in video memory the first time a command needs one.
+- **Smaller objects.** Query heaps, command signatures, root signatures (packed and unpacked by the host's own functions), page pools.
+- **Pipelines.** Stream and compute pipelines keep their description, programs and root signature. No host pipeline is made.
 
 Known to be wrong or missing:
 
-- `GetResourceAllocationInfo` sizes a texture as its levels packed one after another, not by the console's layouts, which `riptide-formats` now has.
-- No host object is made for a resource yet. Nothing has needed one, because no list method that uses a resource is built.
-- Every recording method of a list except the two syncs, and so submission (`ExecuteCommandLists`), presenting, reserved resources and page mappings.
-- An unordered access view's counter is not kept. The four words after a placed view's address are not understood.
-- Frame events follow a clock, not the screen.
+- **Nothing is drawn.** Draws and dispatches are counted and skipped, and the state only a pipeline can use (root arguments, descriptor heaps, vertex and index buffers) is accepted and dropped.
+- **A GPU wait on a value in memory is not made.** The host cannot wait inside a list, so the wait has to be made between two host lists at submission. The title uses one each frame, on a value the CPU sets.
+- Host textures hold only what is rendered into them: filling one from title memory (texture conversion) is not built. Copies, queries and indirect commands on a list are not built.
+- `GetResourceAllocationInfo` sizes a texture as its levels packed, not by the console's layouts, which `riptide-formats` has.
+- A GPU timestamp write is given the time of recording, not of running. An unordered access view's counter is not kept. Frame events follow a clock, not the screen. No high dynamic range, one plane only, and the window does not follow the launcher's display settings.
 
 No unit test makes a host object; the host side has only run under the real title. Piece 6 of the build order.

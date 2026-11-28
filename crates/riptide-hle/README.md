@@ -50,7 +50,7 @@ Still to come: the other console functions, the file path, runtime services.
 
 Import resolution, 1 ms timers and the core map are built. Whether the one-core budget holds (open question Q7) has to be measured on the target machine. Piece 4 of the build order, together with `riptide-pe`.
 
-Built since, against the real title: console memory calls on `riptide-mem`, the package drive, DirectStorage's file path (no BCPack, issue #33), and the parts of the runtime services (`xgameruntime.dll`) the title calls on its way to the graphics device: task queues, networking (offline), users (change events only), packages (fully installed), persistent local storage (`%LOCALAPPDATA%\Riptide	itles\<package identity>\local-storage`) and display (no HDR). Every method of those areas that is not built names itself and stops the title when called.
+Built since, against the real title: console memory calls on `riptide-mem`, the package drive, DirectStorage's file path (no BCPack, issue #33), and the parts of the runtime services (`xgameruntime.dll`) the title calls on its way to the graphics device: task queues, networking (offline), users (change events only), packages (fully installed), persistent local storage (`%LOCALAPPDATA%\Riptide\titles\<package identity>\local-storage`) and display (no HDR). Every method of those areas that is not built names itself and stops the title when called.
 
 With this the real title runs its start-up, opens its archives and calls `D3D12XboxCreateDevice`, which `riptide-gpu` answers. This crate binds the graphics module's two functions to it and gives it the title's memory and allocator.
 
@@ -60,3 +60,12 @@ Also built for the title's graphics set-up:
 - `XMemAllocDefault` hands out title memory, below 2^40, for the kinds of memory the GPU uses. The title's own allocator asks it for the memory of committed graphics resources.
 - `xg_xs.dll`, the console's texture-layout library, on `riptide-formats`: the suggested mode, and a texture computer's layout, element offsets and copies into and out of a layout. Its other methods name themselves when called.
 - `XboxBvhBuilder.dll`, the module a title builds ray-tracing structures with, as a stand-in: a builder can be made, dropped and given its options, and builds nothing. Its other methods name themselves when called. The real module ships in the title's package and needs its shader programs translated before it can be loaded.
+
+Built for the title's first frames and what it does next:
+
+- **Staying offline.** A title's sockets and HTTP calls are Windows' own, so the calls that start talking to another machine are refused with Windows' no-network errors and written to the session log: connecting a socket, sending a datagram, looking a host name up, opening an HTTP connection. A title reaches no server.
+- **Audio, silent.** `AcpHal.dll` (the audio hardware: its heap with two kinds of address, the context arrays, the processor object), `xapu.dll` (the decoder: a packet decodes to silence of the packet's own length) and `chad.dll` (effects: every block comes back silent). Nothing is decoded or mixed, so a title runs without sound.
+- **More runtime areas.** Asynchronous calls (`XAsync`) in the task queue area, with task queue ports and queues made of them. One local, offline user with a made-up id and the name "Player", who is an adult and holds no service privileges. The game area (the title id), the system area (the sandbox name), accessibility (a speech synthesizer that speaks nothing, high contrast off), and saves (see the module's own notes for what of it is built).
+- **The texture computer's 64 KiB tiling**, which a title maps streaming pages by.
+
+`riptide run` loads three modules from the title's own package beside it, as the title is loaded, and binds the title's imports to their functions: the video player (`Bink2Scarlett.dll`) and the two HTTP libraries (`libHttpClient.GDK.dll`, `XCurl.dll`). They need nothing of the console but what is answered here.
