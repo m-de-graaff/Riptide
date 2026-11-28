@@ -6,7 +6,6 @@
 
 mod accessibility;
 mod acphal;
-mod bvh;
 mod com;
 pub mod cores;
 mod display;

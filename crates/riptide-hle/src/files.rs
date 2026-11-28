@@ -5,6 +5,9 @@
 //! that would write to it, or create or delete anything in it, is refused, so a title can
 //! never change the game's files.
 //!
+//! `T:` is the title's scratch drive, which the console gives it to write what it likes.
+//! Here it is the folder `%LOCALAPPDATA%\Riptide\titles\<package identity>\scratch`.
+//!
 //! Each call that names a file is written to the session log with its result. Other drives
 //! are passed to Windows as they are until it is known what a title keeps on them.
 
@@ -56,26 +59,63 @@ unsafe fn narrow(text: *const c_char) -> String {
         .into_owned()
 }
 
-/// Where a path the title gave leads: the text to pass to Windows, and whether it lies in
-/// the title's package.
-fn lead(path: &str, package: Option<&Path>) -> (String, bool) {
+/// What follows the drive in `path`, if the path is on drive `letter`.
+fn on_drive(path: &str, letter: u8) -> Option<&str> {
     let bytes = path.as_bytes();
-    let on_g = bytes.len() >= 2
-        && bytes[0].eq_ignore_ascii_case(&b'g')
+    let on = bytes.len() >= 2
+        && bytes[0].eq_ignore_ascii_case(&letter)
         && bytes[1] == b':'
         && (bytes.len() == 2 || bytes[2] == b'\\' || bytes[2] == b'/');
-    match (on_g, package) {
-        (true, Some(package)) => {
-            let rest = path[2..].trim_start_matches(['\\', '/']);
-            (package.join(rest).to_string_lossy().into_owned(), true)
-        }
-        _ => (path.to_owned(), false),
+    on.then(|| path[2..].trim_start_matches(['\\', '/']))
+}
+
+/// Where a path the title gave leads: the text to pass to Windows, and whether it lies in
+/// the title's package. `package` is the game folder and `scratch` the folder that stands
+/// for the scratch drive; a drive whose folder is not known is left as it is.
+fn lead(path: &str, package: Option<&Path>, scratch: Option<&Path>) -> (String, bool) {
+    if let (Some(rest), Some(package)) = (on_drive(path, b'g'), package) {
+        return (package.join(rest).to_string_lossy().into_owned(), true);
     }
+    if let (Some(rest), Some(scratch)) = (on_drive(path, b't'), scratch) {
+        return (scratch.join(rest).to_string_lossy().into_owned(), false);
+    }
+    (path.to_owned(), false)
+}
+
+/// The folder that stands for the title's scratch drive, made the first time it is asked
+/// for. `None` if it cannot be made.
+fn scratch_folder() -> Option<&'static Path> {
+    static FOLDER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    FOLDER
+        .get_or_init(|| {
+            let base = std::env::var_os("LOCALAPPDATA")?;
+            let identity = crate::package::config()
+                .and_then(|config| crate::package::attribute(config, "Identity", "Name"));
+            let folder =
+                crate::localstorage::title_data(Path::new(&base), identity.unwrap_or("unknown"))
+                    .join("scratch");
+            match std::fs::create_dir_all(&folder) {
+                Ok(()) => {
+                    trace!("the scratch drive T: is {}", folder.display());
+                    Some(folder)
+                }
+                Err(error) => {
+                    trace!(
+                        "the scratch drive's folder {} cannot be made: {error}",
+                        folder.display()
+                    );
+                    None
+                }
+            }
+        })
+        .as_deref()
 }
 
 /// [`lead`] for the title that is running, as a null-terminated UTF-16 string.
 pub(crate) fn lead_wide(path: &str) -> (Vec<u16>, bool) {
-    let (led, in_package) = lead(path, crate::process::title_folder().as_deref());
+    // The scratch folder is only made once a title names its drive.
+    let scratch = on_drive(path, b't').and_then(|_| scratch_folder());
+    let (led, in_package) = lead(path, crate::process::title_folder().as_deref(), scratch);
     (led.encode_utf16().chain([0]).collect(), in_package)
 }
 
@@ -277,26 +317,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_scratch_drive_leads_into_its_folder() {
+        let scratch = Path::new(r"C:\data\scratch");
+        assert_eq!(
+            lead(r"t:\telemetrycache.dat", None, Some(scratch)),
+            (r"C:\data\scratch\telemetrycache.dat".to_owned(), false)
+        );
+        assert_eq!(
+            lead("T:/a/b.bin", None, Some(scratch)),
+            (r"C:\data\scratch\a/b.bin".to_owned(), false)
+        );
+        // A name that only starts like the drive is not on it.
+        assert_eq!(on_drive("tools/x", b't'), None);
+        assert_eq!(on_drive(r"T:\x", b't'), Some("x"));
+        assert_eq!(on_drive("T:", b't'), Some(""));
+    }
+
+    #[test]
     fn the_package_drive_leads_into_the_game_folder_and_nothing_else_does() {
         let game = Path::new(r"D:\games\title");
         assert_eq!(
-            lead(r"G:\appdata0.rpf", Some(game)),
+            lead(r"G:\appdata0.rpf", Some(game), None),
             (r"D:\games\title\appdata0.rpf".to_owned(), true)
         );
         assert_eq!(
-            lead("g:/data/x.bin", Some(game)),
+            lead("g:/data/x.bin", Some(game), None),
             (r"D:\games\title\data/x.bin".to_owned(), true)
         );
         assert_eq!(
-            lead("G:", Some(game)),
+            lead("G:", Some(game), None),
             (r"D:\games\title\".to_owned(), true)
         );
         assert_eq!(
-            lead(r"T:\save.bin", Some(game)),
+            lead(r"T:\save.bin", Some(game), None),
             (r"T:\save.bin".to_owned(), false)
         );
-        assert_eq!(lead(r"Game:\x", Some(game)), (r"Game:\x".to_owned(), false));
+        assert_eq!(
+            lead(r"Game:\x", Some(game), None),
+            (r"Game:\x".to_owned(), false)
+        );
         // With no title set, nothing is led anywhere.
-        assert_eq!(lead(r"G:\x", None), (r"G:\x".to_owned(), false));
+        assert_eq!(lead(r"G:\x", None, None), (r"G:\x".to_owned(), false));
     }
 }

@@ -130,6 +130,11 @@ impl Ordered {
     }
 
     fn run(&self, job: Job) {
+        self.run_one(job);
+        crate::host::report_problems();
+    }
+
+    fn run_one(&self, job: Job) {
         match job {
             Job::Gate(wait) => hold(&wait),
             Job::Lists(lists) => {

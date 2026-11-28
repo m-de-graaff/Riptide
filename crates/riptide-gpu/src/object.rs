@@ -229,9 +229,17 @@ pub(crate) unsafe extern "system" fn get_device<T: Child>(
     unsafe { crate::device::answer(iid, out) }
 }
 
-/// The four methods every device child's table starts with and has at position 7.
-pub(crate) fn child_methods<T: Child>() -> [(usize, usize); 4] {
+/// `SetName` for a device child: `(name)`. A name is for a debugger's lists, and nothing
+/// here shows one.
+pub(crate) extern "system" fn set_name<T: Child>(_this: &T, _name: *const u16) -> Hresult {
+    S_OK
+}
+
+/// The methods every device child has: the three every object starts with, its name, and
+/// its device at position 7.
+pub(crate) fn child_methods<T: Child>() -> [(usize, usize); 5] {
     [
+        (6, set_name::<T> as *const () as usize),
         (0, query_interface::<T> as *const () as usize),
         (1, add_ref::<T> as *const () as usize),
         (2, release::<T> as *const () as usize),

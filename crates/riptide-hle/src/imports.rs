@@ -131,7 +131,6 @@ impl Imports {
         crate::files::register(&mut imports);
         crate::cores::register(&mut imports);
         crate::graphics::register(&mut imports);
-        crate::bvh::register(&mut imports);
         crate::xg::register(&mut imports);
         crate::acphal::register(&mut imports);
         crate::xapu::register(&mut imports);

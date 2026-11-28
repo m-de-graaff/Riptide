@@ -27,6 +27,9 @@ const IID: Iid = guid(
     [0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14],
 );
 
+/// The root signature flags the host has: bits 0 to 11.
+const HOST_FLAGS: i32 = 0xfff;
+
 /// `d3d12_xs.dll!D3D12SerializeVersionedRootSignature`: `(description, blob out, error
 /// blob out)`. The host packs the description. The blobs are the host's own objects, whose
 /// methods are where a title expects them.
@@ -43,11 +46,31 @@ pub unsafe extern "system" fn serialize_versioned_root_signature(
         return E_INVALIDARG;
     }
     let mut problems: Option<ID3DBlob> = None;
-    // SAFETY: the title's description, and room for the two blobs. An `Option` of an
-    // interface is one pointer, which is what the title's out-pointer is.
+    // The console has root signature flags of its own, which the host's packer refuses. A
+    // copy of the description without them is packed. What they ask of the console's GPU is
+    // not known, and nothing here would act on it: the host's root signature is Riptide's
+    // own, and the title's is read only for what its parameters are.
+    // SAFETY: the title's description, read as the plain numbers and pointers it is.
+    let mut host = unsafe {
+        description
+            .cast::<D3D12_VERSIONED_ROOT_SIGNATURE_DESC>()
+            .read_unaligned()
+    };
+    // SAFETY: every version of the description has its flags in the same place.
+    let flags = unsafe { &mut host.Anonymous.Desc_1_1.Flags };
+    let console_only = flags.0 & !HOST_FLAGS;
+    if console_only != 0 {
+        flags.0 &= HOST_FLAGS;
+        show(format_args!(
+            "a root signature has console flags {console_only:#x}, which are left out"
+        ));
+    }
+    // SAFETY: the copied description, whose pointers are the title's, and room for the two
+    // blobs. An `Option` of an interface is one pointer, which is what the title's
+    // out-pointer is.
     let result = unsafe {
         D3D12SerializeVersionedRootSignature(
-            description.cast::<D3D12_VERSIONED_ROOT_SIGNATURE_DESC>(),
+            &raw const host,
             blob.cast::<Option<ID3DBlob>>(),
             Some(&raw mut problems),
         )
