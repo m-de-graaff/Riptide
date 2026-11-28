@@ -692,6 +692,80 @@ extern "system" fn dispatch(this: &List, x: u32, y: u32, z: u32) {
     }
 }
 
+/// `ExecuteIndirect`: `(signature, most commands, argument buffer, offset in it, count
+/// buffer or null, offset in it)`. The commands' arguments are records in title memory,
+/// which the host GPU reads where they lie, with the host's signature for them.
+///
+/// What a draw tells each stage (its first vertex and instance, its group counts) is in
+/// those records, which only the GPU reads: the stages are told zero. A program that
+/// counts its vertices from the draw's first is wrong by that much; none has been met.
+///
+/// # Safety
+/// `signature` and the buffers are null or live objects of their kinds.
+unsafe extern "system" fn execute_indirect(
+    this: &List,
+    signature: *const crate::signature::Signature,
+    most: u32,
+    arguments: *const crate::resource::Resource,
+    arguments_offset: u64,
+    count: *const crate::resource::Resource,
+    count_offset: u64,
+) {
+    show_first_use(this.drawing().state(), "an indirect draw");
+    // SAFETY: the title's objects, null or live.
+    let (Some(signature), Some(arguments)) =
+        (unsafe { signature.as_ref() }, unsafe { arguments.as_ref() })
+    else {
+        skipped("an indirect draw names no signature or no argument buffer");
+        return;
+    };
+    let (stride, layout) = signature.layout();
+    let Some(host_signature) = signature.host() else {
+        skipped(&format!(
+            "an indirect draw's signature {layout:?} has no host signature yet"
+        ));
+        return;
+    };
+    // What the signature's last argument is decides the kind of command.
+    let kind = layout.last().map_or(0, |argument| argument[0]);
+    let (compute, indexed) = (kind == 2, kind == 1);
+    let bytes = u64::from(stride) * u64::from(most.max(1));
+    let Some(records) = crate::inplace::find(arguments.address() + arguments_offset, bytes) else {
+        skipped("an indirect draw's arguments are not title memory in one stretch of one bank");
+        return;
+    };
+    // SAFETY: the title's count buffer, null or live.
+    let counted = match unsafe { count.as_ref() } {
+        None => None,
+        Some(count) => match crate::inplace::find(count.address() + count_offset, 4) {
+            Some(place) => Some(place),
+            None => {
+                skipped("an indirect draw's count is not in title memory");
+                return;
+            }
+        },
+    };
+    if let Err(why) = prepare(this, compute, indexed, &[]) {
+        skipped(&why);
+        return;
+    }
+    this.use_buffer(&records.buffer, crate::list::READ);
+    if let Some(counted) = &counted {
+        this.use_buffer(&counted.buffer, crate::list::READ);
+    }
+    // SAFETY: a plain call on the host list, with ranges inside the banks' buffers.
+    unsafe {
+        this.host().ExecuteIndirect(
+            host_signature,
+            most,
+            &records.buffer,
+            records.offset,
+            counted.as_ref().map(|counted| &counted.buffer),
+            counted.as_ref().map_or(0, |counted| counted.offset),
+        );
+    }
+}
+
 /// `DispatchMesh`: `(groups across, down and deep)`. A draw with a pipeline whose
 /// geometry a mesh program makes: the program is told the counts as a compute program is.
 extern "system" fn dispatch_mesh(this: &List, x: u32, y: u32, z: u32) {
@@ -719,11 +793,11 @@ extern "system" fn dispatch_mesh(this: &List, x: u32, y: u32, z: u32) {
     }
 }
 
-/// Indirect draws, the console's own mesh draw and its own dispatch: not built yet. The methods
+/// The console's own mesh draw and its own dispatch: not built yet. The methods
 /// bound to this take different arguments, none of which is read.
 extern "system" fn unbuilt_draw(this: &List) {
     show_first_use(this.drawing().state(), "a draw of a kind not built yet");
-    skipped("indirect draws and the console's own dispatches are not built yet");
+    skipped("the console's own dispatches are not built yet");
 }
 
 /// The methods here by their position in the older list layout.
@@ -750,7 +824,8 @@ pub(crate) fn methods() -> Vec<(usize, usize)> {
         (14, dispatch as *const () as usize),
     ]);
     // Indirect, the console's own dispatch, and the two mesh dispatches.
-    methods.extend([59, 78, 98].map(|slot| (slot, unbuilt_draw as *const () as usize)));
+    methods.extend([78, 98].map(|slot| (slot, unbuilt_draw as *const () as usize)));
+    methods.push((59, execute_indirect as *const () as usize));
     methods.push((127, dispatch_mesh as *const () as usize));
     methods
 }
