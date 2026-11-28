@@ -9,6 +9,7 @@ mod bindless;
 mod cache;
 mod census;
 mod compile;
+mod copy;
 mod descriptor;
 mod device;
 mod draw;

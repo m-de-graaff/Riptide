@@ -581,7 +581,7 @@ fn prepare(list: &List, compute: bool, indexed: bool, more: &[(usize, u32)]) -> 
                     D3D12_VERTEX_BUFFER_VIEW::default()
                 } else {
                     D3D12_VERTEX_BUFFER_VIEW {
-                        BufferLocation: in_place(buffer, "a vertex buffer")?,
+                        BufferLocation: in_place(list, buffer, "a vertex buffer")?,
                         SizeInBytes: buffer.bytes,
                         StrideInBytes: buffer.stride_or_format,
                     }
@@ -592,7 +592,7 @@ fn prepare(list: &List, compute: bool, indexed: bool, more: &[(usize, u32)]) -> 
             }
             if indexed {
                 let view = D3D12_INDEX_BUFFER_VIEW {
-                    BufferLocation: in_place(&state.index, "the index buffer")?,
+                    BufferLocation: in_place(list, &state.index, "the index buffer")?,
                     SizeInBytes: state.index.bytes,
                     Format: DXGI_FORMAT(state.index.stride_or_format as i32),
                 };
@@ -605,10 +605,14 @@ fn prepare(list: &List, compute: bool, indexed: bool, more: &[(usize, u32)]) -> 
     Ok(())
 }
 
-/// Where the host GPU finds a vertex or index buffer, which is title memory.
-fn in_place(buffer: &Buffer, what: &str) -> Result<u64, String> {
+/// Where the host GPU finds a vertex or index buffer, which is title memory. The list is
+/// told that the bank's buffer is read.
+fn in_place(list: &List, buffer: &Buffer, what: &str) -> Result<u64, String> {
     crate::inplace::find(buffer.address, u64::from(buffer.bytes))
-        .map(|place| place.gpu_address)
+        .map(|place| {
+            list.use_buffer(&place.buffer, crate::list::READ);
+            place.gpu_address
+        })
         .ok_or_else(|| {
             format!(
                 "{what} at {:#x}, {} bytes, is not title memory in one stretch of one bank",

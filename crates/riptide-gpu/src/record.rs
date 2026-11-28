@@ -139,6 +139,11 @@ fn write_when_reached(list: &List, address: u64, words: &[u32]) {
             Value: word,
         })
         .collect();
+    // The host takes the bank's buffer as a copy's destination for this.
+    list.use_buffer(
+        &place.buffer,
+        windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST,
+    );
     let modes = vec![D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT; writes.len()];
     // SAFETY: a plain call on the host list; both lists have `writes.len()` entries.
     unsafe {

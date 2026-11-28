@@ -12,7 +12,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_FLAG_NONE, D3D12_COMMAND_LIST_TYPE, D3D12_RESOURCE_BARRIER,
     D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
     D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-    D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER,
+    D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_STATE_COMMON,
+    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER,
     D3D12_RESOURCE_UAV_BARRIER, ID3D12CommandAllocator, ID3D12Device4, ID3D12GraphicsCommandList,
     ID3D12Resource,
 };
@@ -97,6 +98,7 @@ pub(crate) struct Allocator {
 impl Drop for Allocator {
     fn drop(&mut self) {
         crate::stage::give_back(windows::core::Interface::as_raw(&self.host) as usize);
+        crate::copy::give_back(windows::core::Interface::as_raw(&self.host) as usize, true);
     }
 }
 
@@ -109,6 +111,18 @@ unsafe impl Child for Allocator {
         &self.object
     }
 }
+
+/// A host texture or buffer a list has used, the state the list last put it in, and the
+/// state it is in between lists.
+struct Used {
+    resource: ID3D12Resource,
+    state: D3D12_RESOURCE_STATES,
+    rest: D3D12_RESOURCE_STATES,
+}
+
+/// The state a bank's buffer is read in: every way of reading at once, so that a list
+/// that binds vertices from it, copies out of it and reads it from shaders says so once.
+pub(crate) const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_GENERIC_READ;
 
 /// A list as a title's code sees it, then what is kept here.
 #[repr(C)]
@@ -143,10 +157,9 @@ pub(crate) struct List {
     run: std::sync::Mutex<std::sync::Arc<Run>>,
     /// The host allocator the list records into, for a piece started after a cut.
     allocator: std::cell::UnsafeCell<Option<ID3D12CommandAllocator>>,
-    /// The host textures this list has used since it was last reset, each with the state
-    /// the list last put it in.
-    textures:
-        std::sync::Mutex<std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>>,
+    /// The host textures and buffers this list has used since it was last reset, each
+    /// with the state the list last put it in.
+    textures: std::sync::Mutex<std::collections::HashMap<usize, Used>>,
     /// What the list has been told to draw with.
     drawing: crate::draw::Kept,
 }
@@ -401,6 +414,7 @@ fn list_table(newer: bool) -> &'static [usize] {
         ]);
         methods.extend(crate::record::methods());
         methods.extend(crate::draw::methods());
+        methods.extend(crate::copy::methods());
         let names: Vec<(usize, &str)> = LIST_NAMES
             .iter()
             .map(|&(slot, name)| (placed(slot, newer), name))
@@ -576,6 +590,7 @@ extern "system" fn allocator_callback(_this: &Allocator) {}
 extern "system" fn allocator_reset(this: &Allocator) -> Hresult {
     // The GPU is done with everything recorded here, the stage inputs of its draws too.
     crate::stage::give_back(windows::core::Interface::as_raw(&this.host) as usize);
+    crate::copy::give_back(windows::core::Interface::as_raw(&this.host) as usize, false);
     // SAFETY: a plain call on the host allocator.
     match unsafe { this.host.Reset() } {
         Ok(()) => S_OK,
@@ -620,17 +635,43 @@ impl List {
             .textures
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = textures
-            .entry(key)
-            .or_insert_with(|| (texture.clone(), REST));
-        if entry.1 != wanted {
-            self.transition(texture, entry.1, wanted);
-            entry.1 = wanted;
+        let entry = textures.entry(key).or_insert_with(|| Used {
+            resource: texture.clone(),
+            state: REST,
+            rest: REST,
+        });
+        if entry.state != wanted {
+            self.transition(texture, entry.state, wanted);
+            entry.state = wanted;
         }
     }
 
-    /// Records a change of state of all of a host texture.
-    fn transition(
+    /// Has a buffer of title memory in the state a command needs.
+    ///
+    /// The host lets a buffer be read in several ways at once without being told, but not
+    /// written by a copy after it was read. So a list that names a bank's buffer in a
+    /// command says what it is doing with it: the buffer is taken as in no state when the
+    /// list starts, as the host leaves every buffer between submissions, is read
+    /// ([`READ`]) or is a copy's destination, and is put back when the list is closed.
+    pub(crate) fn use_buffer(&self, buffer: &ID3D12Resource, wanted: D3D12_RESOURCE_STATES) {
+        let key = windows::core::Interface::as_raw(buffer) as usize;
+        let mut textures = self
+            .textures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = textures.entry(key).or_insert_with(|| Used {
+            resource: buffer.clone(),
+            state: D3D12_RESOURCE_STATE_COMMON,
+            rest: D3D12_RESOURCE_STATE_COMMON,
+        });
+        if entry.state != wanted {
+            self.transition(buffer, entry.state, wanted);
+            entry.state = wanted;
+        }
+    }
+
+    /// Records a change of state of all of a host texture or buffer.
+    pub(crate) fn transition(
         &self,
         texture: &ID3D12Resource,
         before: D3D12_RESOURCE_STATES,
@@ -663,10 +704,13 @@ impl List {
             .textures
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (key, (texture, state)) in textures.iter_mut() {
-            if *state != REST && !keep.contains(key) {
-                self.transition(texture, *state, REST);
-                *state = REST;
+        for (key, used) in textures.iter_mut() {
+            // A texture goes back to rest; a buffer that a copy wrote is read again.
+            let wanted = if used.rest == REST { REST } else { READ };
+            let untouched = used.state == used.rest;
+            if used.state != wanted && !untouched && !keep.contains(key) {
+                self.transition(&used.resource, used.state, wanted);
+                used.state = wanted;
             }
         }
     }
@@ -679,10 +723,10 @@ impl List {
             .textures
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (texture, state) in textures.values_mut() {
-            if *state != REST {
-                self.transition(texture, *state, REST);
-                *state = REST;
+        for used in textures.values_mut() {
+            if used.state != used.rest {
+                self.transition(&used.resource, used.state, used.rest);
+                used.state = used.rest;
             }
         }
         if forget {
