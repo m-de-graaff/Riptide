@@ -123,6 +123,7 @@ fn table(newer: bool) -> &'static [usize] {
             (12, marker as *const () as usize),
             (13, marker as *const () as usize),
             (16, timestamp_frequency as *const () as usize),
+            (29, copy_page_mappings as *const () as usize),
             (30, present as *const () as usize),
             (32, signal_2 as *const () as usize),
             (33, execute_x as *const () as usize),
@@ -332,6 +333,105 @@ unsafe extern "system" fn signal_2(
     // SAFETY: as received.
     unsafe { signal(this, fence, value) }
 }
+
+/// A run of destination pages and how they are mapped: kind 0 takes that many pool pages
+/// from `start` on, kind 1 the one pool page `start` for each, kind 2 unmaps them, and
+/// kind 3 leaves them as they are.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PageRange {
+    kind: u32,
+    start: u32,
+    count: u32,
+}
+
+/// The ranges mapped from a destination address on, one after another.
+#[repr(C)]
+pub(crate) struct PageBatch {
+    destination: u64,
+    count: u32,
+    ranges: *const PageRange,
+}
+
+/// A page of a pool, and of what is mapped from it.
+const PAGE: u64 = 64 << 10;
+
+/// `CopyPageMappingsBatchX`: `(batch count, batches, pool address, pool pages, flags)`.
+/// Pages of a pool (memory the title filled) are mapped at other addresses, which is how a
+/// title gives streamed pages to its textures. On the console the GPU's page table
+/// changes. Here the title's addresses are the GPU's, so the same frames of title memory
+/// are mapped at the destination too, at once.
+///
+/// # Safety
+/// `batches` is null or `count` batches, each with as many ranges as it says.
+unsafe extern "system" fn copy_page_mappings(
+    _this: &Queue,
+    count: u32,
+    batches: *const PageBatch,
+    pool: u64,
+    pool_pages: u32,
+    _flags: u32,
+) -> Hresult {
+    if batches.is_null() && count > 0 {
+        return E_INVALIDARG;
+    }
+    let Some(services) = crate::services() else {
+        return E_INVALIDARG;
+    };
+    let memory = services.memory;
+    let batches = if count == 0 {
+        &[][..]
+    } else {
+        // SAFETY: the title passes `count` batches.
+        unsafe { std::slice::from_raw_parts(batches, count as usize) }
+    };
+    let mut failures = 0u32;
+    let mut pages = 0u64;
+    for batch in batches {
+        if batch.ranges.is_null() {
+            continue;
+        }
+        // SAFETY: each batch holds `count` ranges.
+        let ranges = unsafe { std::slice::from_raw_parts(batch.ranges, batch.count as usize) };
+        let mut at = batch.destination;
+        for range in ranges {
+            let bytes = u64::from(range.count) * PAGE;
+            let inside = |pages: u32| {
+                range
+                    .start
+                    .checked_add(pages)
+                    .is_some_and(|end| end <= pool_pages)
+            };
+            let source = pool + u64::from(range.start) * PAGE;
+            let done = match range.kind {
+                0 if inside(range.count) => memory.alias(at, source, bytes).is_ok(),
+                1 if inside(1) => (0..u64::from(range.count))
+                    .all(|page| memory.alias(at + page * PAGE, source, PAGE).is_ok()),
+                2 => memory.unmap(at, bytes).is_ok(),
+                3 => true,
+                _ => false,
+            };
+            if !done {
+                failures += 1;
+                if MAPPING_FAILURES.fetch_add(1, Ordering::Relaxed) < 4 {
+                    trace!(
+                        "a page mapping failed: {range:?} at {at:#x} from the pool at {pool:#x} \
+                         of {pool_pages} pages"
+                    );
+                }
+            }
+            pages += u64::from(range.count);
+            at += bytes;
+        }
+    }
+    if MAPPINGS.fetch_add(1, Ordering::Relaxed) < 4 {
+        trace!("page mappings copied: {count} batches, {pages} pages, {failures} ranges failed");
+    }
+    S_OK
+}
+
+static MAPPINGS: AtomicU64 = AtomicU64::new(0);
+static MAPPING_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// One plane of a present: the frame's token, then the textures of the plane. The console
 /// goes on with rectangles, a colour space and options, which are not read here.

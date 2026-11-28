@@ -87,6 +87,8 @@ const HOST_MODULES: &[&str] = &[
     "gameinput.dll",
     // So is the audio library, by the same name.
     "xaudio2_9.dll",
+    // Certificates, for the HTTP libraries a title brings in its package.
+    "crypt32.dll",
 ];
 
 /// The table of what every import is bound to. It is the [`Resolver`] `riptide-pe` binds a
@@ -133,6 +135,8 @@ impl Imports {
         crate::xg::register(&mut imports);
         crate::acphal::register(&mut imports);
         crate::xapu::register(&mut imports);
+        crate::xdsp::register(&mut imports);
+        crate::offline::register(&mut imports);
         imports
     }
 

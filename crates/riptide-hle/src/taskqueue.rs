@@ -101,7 +101,9 @@ impl Port {
 
 /// A task queue. A handle is a counted reference to one.
 pub(crate) struct Queue {
-    ports: [Port; 2],
+    /// The work port and the completion port. A queue made of other queues' ports shares
+    /// them, so what is submitted through either queue waits in the same place.
+    ports: [Arc<Port>; 2],
     ended: AtomicBool,
     monitors: Mutex<Vec<(u64, usize, usize)>>,
 }
@@ -109,7 +111,7 @@ pub(crate) struct Queue {
 impl Queue {
     fn new(work: Mode, completion: Mode) -> Arc<Queue> {
         Arc::new(Queue {
-            ports: [Port::new(work), Port::new(completion)],
+            ports: [Arc::new(Port::new(work)), Arc::new(Port::new(completion))],
             ended: AtomicBool::new(false),
             monitors: Mutex::new(Vec::new()),
         })
@@ -278,6 +280,61 @@ unsafe extern "system" fn create(
     trace!("XTaskQueueCreate(work {work:?}, completion {completion:?}) = {handle:p}");
     // SAFETY: checked non-null; the title's own out-pointer.
     unsafe { out.write(handle) };
+    S_OK
+}
+
+/// +0x70 `XTaskQueueGetPort`: `(queue, which port, port handle out)`. The handle names one
+/// of the queue's two ports, to make another queue of. It is not a reference of its own:
+/// it is good for as long as the queue is.
+///
+/// # Safety
+/// `handle` is a live handle; `out` is null or where the port handle goes.
+unsafe extern "system" fn get_port(
+    _this: *mut c_void,
+    handle: *const Queue,
+    port: u32,
+    out: *mut *const Port,
+) -> i32 {
+    if out.is_null() || handle.is_null() || port > 1 {
+        return E_INVALIDARG;
+    }
+    // SAFETY: a live queue, as the contract says; the out-pointer was checked.
+    unsafe { out.write(Arc::as_ptr(&(*handle).ports[port as usize])) };
+    S_OK
+}
+
+/// +0x68 `XTaskQueueCreateComposite`: `(work port, completion port, queue out)`. A queue
+/// whose two ports are ports of other queues.
+///
+/// A monitor registered on one of those other queues is not told of what is submitted
+/// through the new one.
+///
+/// # Safety
+/// Each port handle came from [`get_port`] on a queue that is still live; `out` is null or
+/// where the queue goes.
+unsafe extern "system" fn create_composite(
+    _this: *mut c_void,
+    work: *const Port,
+    completion: *const Port,
+    out: *mut *const Queue,
+) -> i32 {
+    if out.is_null() || work.is_null() || completion.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: each handle is the address of a port some live queue holds in an `Arc`, so
+    // another reference to it can be taken.
+    let ports = unsafe {
+        Arc::increment_strong_count(work);
+        Arc::increment_strong_count(completion);
+        [Arc::from_raw(work), Arc::from_raw(completion)]
+    };
+    let queue = Arc::new(Queue {
+        ports,
+        ended: AtomicBool::new(false),
+        monitors: Mutex::new(Vec::new()),
+    });
+    // SAFETY: checked non-null.
+    unsafe { out.write(Arc::into_raw(queue)) };
     S_OK
 }
 
@@ -486,6 +543,8 @@ extern "system" fn check_thread(_this: *mut c_void) {}
 pub(crate) fn methods() -> Vec<(usize, usize)> {
     vec![
         (12, create as *const () as usize),
+        (13, create_composite as *const () as usize),
+        (14, get_port as *const () as usize),
         (15, duplicate as *const () as usize),
         (16, dispatch as *const () as usize),
         (17, close as *const () as usize),
@@ -518,6 +577,39 @@ mod tests {
         let made = unsafe { create(std::ptr::null_mut(), work, completion, &mut handle) };
         assert_eq!(made, S_OK);
         handle
+    }
+
+    #[test]
+    fn a_queue_made_of_another_queues_ports_shares_what_waits_in_them() {
+        // Manual work and completion ports.
+        let source = make(0, 0);
+        let counter = AtomicU32::new(0);
+        let context = (&raw const counter).cast_mut().cast::<c_void>();
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        let mut composite = std::ptr::null();
+        let none = std::ptr::null_mut();
+        // SAFETY: live handles and valid out-pointers, and the bad ones under test.
+        unsafe {
+            assert_eq!(get_port(none, source, 0, &mut work), S_OK);
+            assert_eq!(get_port(none, source, 1, &mut completion), S_OK);
+            assert_eq!(get_port(none, source, 2, &mut work), E_INVALIDARG);
+            // The new queue works through the first one's completion port, both ways.
+            assert_eq!(
+                create_composite(none, completion, completion, &mut composite),
+                S_OK
+            );
+            assert_eq!(
+                create_composite(none, std::ptr::null(), completion, &mut composite),
+                E_INVALIDARG
+            );
+            assert_eq!(submit(none, composite, 0, context, Some(add)), S_OK);
+            // It waits where the first queue's completion callbacks wait.
+            assert!(!dispatch(none, source, 0, 0));
+            assert!(dispatch(none, source, 1, 0));
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+            close(none, composite);
+            close(none, source);
+        }
     }
 
     #[test]

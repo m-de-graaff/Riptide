@@ -156,13 +156,14 @@ const NAMES: [&str; SLOTS] = [
 fn table() -> &'static [usize; SLOTS] {
     static TABLE: OnceLock<[usize; SLOTS]> = OnceLock::new();
     TABLE.get_or_init(|| {
-        let built: [(usize, usize); 6] = [
+        let built: [(usize, usize); 7] = [
             (0, add_ref as *const () as usize),
             (1, release as *const () as usize),
             (2, layout as *const () as usize),
             (6, element_offset as *const () as usize),
             (8, copy_into as *const () as usize),
             (9, copy_from as *const () as usize),
+            (10, tiling as *const () as usize),
         ];
         std::array::from_fn(|slot| {
             built.iter().find(|&&(at, _)| at == slot).map_or_else(
@@ -542,6 +543,93 @@ unsafe extern "system" fn copy_from(
     code(result)
 }
 
+/// The levels of a texture that share tiles: how many levels have tiles of their own, how
+/// many are packed together, how many tiles the packed ones take and where they start.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PackedLevels {
+    standard: u8,
+    packed: u8,
+    tiles: u32,
+    start: u32,
+}
+
+/// The tiles of one level of one slice: its size in tiles and its first tile.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LevelTiles {
+    width: u32,
+    height: u16,
+    depth: u16,
+    start: u32,
+}
+
+const E_FAIL: i32 = 0x8000_4005_u32 as i32;
+
+/// The computer's 64 KiB tiling: `(total tiles out, packed levels out, tile shape in texels
+/// out, count in and out, first entry wanted, level tiles out)`. How the first plane
+/// divides into 64 KiB tiles, which is what a title maps pool pages by. Only textures in a
+/// 64 KiB mode have one, as on the console.
+///
+/// # Safety
+/// Each out-pointer is null or room for its value; `out` has room for `*count` entries.
+unsafe extern "system" fn tiling(
+    this: &Computer,
+    tiles: *mut u32,
+    packed: *mut PackedLevels,
+    shape: *mut [u32; 3],
+    count: *mut u32,
+    first: u32,
+    out: *mut LevelTiles,
+) -> i32 {
+    let map = match this
+        .texture
+        .plane(0)
+        .and_then(|plane| plane.layout.tile_map())
+    {
+        Ok(map) => map,
+        Err(Error::Unsupported) => return E_NOTIMPL,
+        Err(_) => return E_FAIL,
+    };
+    // SAFETY: the title's out-pointers, each null or valid as the contract says.
+    unsafe {
+        if let Some(tiles) = tiles.as_mut() {
+            *tiles = map.total_tiles;
+        }
+        if let Some(packed) = packed.as_mut() {
+            *packed = PackedLevels {
+                standard: map.standard_mips as u8,
+                packed: map.packed_mips as u8,
+                tiles: map.packed_tiles,
+                start: map.packed_start,
+            };
+        }
+        if let Some(shape) = shape.as_mut() {
+            *shape = map.tile_texels;
+        }
+        if let Some(count) = count.as_mut() {
+            let wanted: Vec<_> = map
+                .regions
+                .iter()
+                .skip(first as usize)
+                .take(*count as usize)
+                .collect();
+            if !out.is_null() {
+                for (index, region) in wanted.iter().enumerate() {
+                    out.add(index).write_unaligned(LevelTiles {
+                        width: region.width,
+                        height: region.height as u16,
+                        depth: region.depth as u16,
+                        start: region.start,
+                    });
+                }
+            }
+            *count = wanted.len() as u32;
+        }
+    }
+    S_OK
+}
+
 pub(crate) fn register(imports: &mut Imports) {
     let functions: [(&str, usize); 2] = [
         (
@@ -676,6 +764,83 @@ mod tests {
             assert_eq!(add_ref(this), 2);
             assert_eq!(release(computer), 1);
             assert_eq!(release(computer), 0);
+        }
+    }
+
+    #[test]
+    fn a_64_kib_texture_divides_into_tiles_and_others_do_not() {
+        let tiled = described(1024, 1024, 0, 28, HAS_MODE | Mode::Standard64K.number());
+        let untiled = described(1024, 1024, 0, 28, HAS_MODE | Mode::Standard4K.number());
+        let mut computer = std::ptr::null_mut();
+        // SAFETY: valid descriptions; each computer is used as made and released once.
+        unsafe {
+            assert_eq!(create_texture_computer(&tiled, &mut computer), S_OK);
+            let this = &*computer;
+            let expected = this.texture.plane(0).unwrap().layout.tile_map().unwrap();
+            let mut total = 0;
+            let mut packed = PackedLevels {
+                standard: 0,
+                packed: 0,
+                tiles: 0,
+                start: 9,
+            };
+            let mut shape = [0u32; 3];
+            let mut count = 2;
+            let mut levels = [LevelTiles {
+                width: 0,
+                height: 0,
+                depth: 0,
+                start: 0,
+            }; 2];
+            assert_eq!(
+                tiling(
+                    this,
+                    &mut total,
+                    &mut packed,
+                    &mut shape,
+                    &mut count,
+                    1,
+                    levels.as_mut_ptr()
+                ),
+                S_OK
+            );
+            assert_eq!(total, expected.total_tiles);
+            assert_eq!(u32::from(packed.standard), expected.standard_mips);
+            assert_eq!(u32::from(packed.standard) + u32::from(packed.packed), 11);
+            assert_eq!(shape, expected.tile_texels);
+            // Two entries from the second on.
+            assert_eq!(count, 2);
+            assert_eq!(levels[0].width, expected.regions[1].width);
+            assert_eq!(levels[1].start, expected.regions[2].start);
+            // Asking only how many tiles there are is allowed.
+            assert_eq!(
+                tiling(
+                    this,
+                    &mut total,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut()
+                ),
+                S_OK
+            );
+            release(computer);
+
+            assert_eq!(create_texture_computer(&untiled, &mut computer), S_OK);
+            assert_eq!(
+                tiling(
+                    &*computer,
+                    &mut total,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut()
+                ),
+                E_FAIL
+            );
+            release(computer);
         }
     }
 

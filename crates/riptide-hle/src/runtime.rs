@@ -259,6 +259,10 @@ unsafe extern "system" fn query_api_impl(
             Some((crate::localstorage::NAME, crate::localstorage::methods()))
         } else if interface == crate::display::INTERFACE {
             Some((crate::display::NAME, crate::display::methods()))
+        } else if interface == crate::system::INTERFACE {
+            Some((crate::system::NAME, crate::system::methods()))
+        } else if interface == crate::game::INTERFACE {
+            Some((crate::game::NAME, crate::game::methods()))
         } else if interface == crate::accessibility::INTERFACE {
             Some((crate::accessibility::NAME, crate::accessibility::methods()))
         } else {

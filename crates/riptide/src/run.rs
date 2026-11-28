@@ -22,9 +22,11 @@ pub const EXIT_NO_TITLE: i32 = 5;
 /// the console but what Riptide already answers: they are loaded as the title is, and the
 /// title's imports from them are bound to their own functions.
 ///
-/// Only modules named here are loaded. The others in a package call the console's
-/// graphics or network interfaces, which they would reach parts of that are not built.
-const PACKAGE_MODULES: &[&str] = &["Bink2Scarlett.dll"];
+/// Only modules named here are loaded: the video player and the two HTTP libraries, which
+/// are built on Windows' own HTTP and so reach nothing while Riptide keeps the title
+/// offline. The others in a package call the console's graphics interfaces, of which they
+/// would reach parts that are not built.
+const PACKAGE_MODULES: &[&str] = &["Bink2Scarlett.dll", "libHttpClient.GDK.dll", "XCurl.dll"];
 
 /// Loads the package modules found in `folder`, starts each as a library, and binds the
 /// title's imports from it to its exports. One that cannot be loaded is said in the log

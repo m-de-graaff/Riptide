@@ -434,6 +434,36 @@ impl TitleMemory {
         Ok(())
     }
 
+    /// Maps at `to` the same memory that is mapped in `bytes` at `from`, in place of what is
+    /// mapped at `to`: afterwards both addresses reach the same frames. This is how a title
+    /// gives pages of a pool it filled to a texture's addresses. Whole frames only, and all
+    /// of the source must be mapped.
+    pub fn alias(&self, to: u64, from: u64, bytes: u64) -> Result<(), MemError> {
+        if !to.is_multiple_of(FRAME) || !from.is_multiple_of(FRAME) || !bytes.is_multiple_of(FRAME)
+        {
+            return Err(MemError::InvalidAddress);
+        }
+        let mut state = self.state();
+        let parts = state
+            .space
+            .locate(from, bytes)
+            .ok_or(MemError::InvalidAddress)?;
+        let mut at = to;
+        for part in parts {
+            let run = FrameRun {
+                first: (part.bank as u64 * u64::from(BANK_FRAMES) + part.offset / FRAME) as u32,
+                count: (part.bytes / FRAME) as u32,
+            };
+            let State {
+                space, sections, ..
+            } = &mut *state;
+            let displaced = space.map(at, run, sections, os::PAGE_READWRITE)?;
+            self.unmapped(&mut state, at..at + part.bytes, displaced);
+            at += part.bytes;
+        }
+        Ok(())
+    }
+
     /// Where in the banks `bytes` at `address` lie (decision M4), or `None` if any of it is
     /// not mapped. One part means the range can be used by the GPU where it is; several
     /// mean it has to be copied (decision M5).
@@ -748,6 +778,53 @@ mod tests {
         assert_eq!(memory.locate(base + 8 * FRAME, FRAME), None);
         assert_eq!((read(base + 7 * FRAME), read(base + 9 * FRAME)), (7, 9));
         memory.release(base).unwrap();
+    }
+
+    #[test]
+    fn memory_aliased_at_a_second_address_is_the_same_memory() {
+        let memory = TitleMemory::new(BANK_BYTES);
+        let pool = memory
+            .commit(None, 8 * FRAME, ANYWHERE, Access::ReadWrite)
+            .unwrap();
+        let texture = memory.reserve(16 * FRAME, ANYWHERE).unwrap();
+        write(pool + 3 * FRAME + 9, 0x5A);
+
+        // Two pool pages, from the fourth on, at the texture's sixth page.
+        memory
+            .alias(texture + 5 * FRAME, pool + 3 * FRAME, 2 * FRAME)
+            .unwrap();
+        assert_eq!(read(texture + 5 * FRAME + 9), 0x5A);
+        write(texture + 6 * FRAME, 0x33);
+        assert_eq!(read(pool + 4 * FRAME), 0x33);
+        assert_eq!(
+            memory.locate(texture + 5 * FRAME, FRAME),
+            memory.locate(pool + 3 * FRAME, FRAME).map(|mut parts| {
+                parts[0].address = texture + 5 * FRAME;
+                parts
+            })
+        );
+
+        // The same page at every one of three addresses.
+        for page in 0..3 {
+            memory.alias(texture + page * FRAME, pool, FRAME).unwrap();
+        }
+        write(pool + 1, 0x77);
+        assert_eq!(read(texture + 2 * FRAME + 1), 0x77);
+
+        // Taking the alias away leaves the pool as it was.
+        memory.unmap(texture, 16 * FRAME).unwrap();
+        assert_eq!(read(pool + 3 * FRAME + 9), 0x5A);
+        // What is not mapped cannot be aliased, nor can part of a frame.
+        assert_eq!(
+            memory.alias(texture, texture + 8 * FRAME, FRAME),
+            Err(MemError::InvalidAddress)
+        );
+        assert_eq!(
+            memory.alias(texture, pool + 1, FRAME),
+            Err(MemError::InvalidAddress)
+        );
+        memory.release(texture).unwrap();
+        memory.release(pool).unwrap();
     }
 
     #[test]

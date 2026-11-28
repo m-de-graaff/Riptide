@@ -102,6 +102,16 @@ fn bytes_in(folder: &Path) -> u64 {
         .sum()
 }
 
+/// The folder's path as a title is given it: ending in a backslash, as the console's
+/// does. A title puts names straight after it.
+fn path_text() -> Option<String> {
+    let mut text = folder()?.to_string_lossy().into_owned();
+    if !text.ends_with('\\') {
+        text.push('\\');
+    }
+    Some(text)
+}
+
 /// `XPersistentLocalStorageGetPathSize`: the bytes the path needs, with its terminator.
 ///
 /// # Safety
@@ -110,11 +120,11 @@ unsafe extern "system" fn path_size(_this: usize, size: *mut usize) -> i32 {
     if size.is_null() {
         return E_INVALIDARG;
     }
-    let Some(folder) = folder() else {
+    let Some(text) = path_text() else {
         return E_PATH_NOT_FOUND;
     };
     // SAFETY: checked non-null.
-    unsafe { size.write(folder.to_string_lossy().len() + 1) };
+    unsafe { size.write(text.len() + 1) };
     S_OK
 }
 
@@ -124,10 +134,9 @@ unsafe extern "system" fn path_size(_this: usize, size: *mut usize) -> i32 {
 /// # Safety
 /// `path` is null or has room for `size` bytes; `used` is null or where the count goes.
 unsafe extern "system" fn path(_this: usize, size: usize, path: *mut u8, used: *mut usize) -> i32 {
-    let Some(folder) = folder() else {
+    let Some(text) = path_text() else {
         return E_PATH_NOT_FOUND;
     };
-    let text = folder.to_string_lossy();
     if !used.is_null() {
         // SAFETY: checked non-null.
         unsafe { used.write(text.len() + 1) };
