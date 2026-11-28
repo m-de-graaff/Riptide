@@ -275,14 +275,18 @@ fn list_table(newer: bool) -> &'static [usize] {
             (130, sync as *const () as usize),
             (137, reset_x as *const () as usize),
         ]);
+        methods.extend(crate::record::methods());
         let names: Vec<(usize, &str)> = LIST_NAMES
             .iter()
             .map(|&(slot, name)| (placed(slot, newer), name))
             .collect();
-        let methods: Vec<(usize, usize)> = methods
+        let mut methods: Vec<(usize, usize)> = methods
             .iter()
             .map(|&(slot, method)| (placed(slot, newer), method))
             .collect();
+        if newer {
+            methods.extend(crate::record::newer_methods());
+        }
         object::table("ID3D12GraphicsCommandList", LIST_SLOTS, &names, &methods)
     })
 }
@@ -450,6 +454,30 @@ extern "system" fn allocator_reset(this: &Allocator) -> Hresult {
     }
 }
 
+impl List {
+    /// Has the host GPU finish every write shaders made through unordered access before it
+    /// goes on. The host orders everything else in a list by itself.
+    pub(crate) fn wait_for_shader_writes(&self) {
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        // SAFETY: a plain call on the host list; the barrier names no resource, so nothing
+        // in it needs dropping.
+        unsafe { self.host.ResourceBarrier(&[barrier]) };
+    }
+
+    /// The host list this one records onto.
+    pub(crate) fn host(&self) -> &ID3D12GraphicsCommandList {
+        &self.host
+    }
+}
+
 /// `GetType`.
 extern "system" fn list_type(this: &List) -> u32 {
     this.kind
@@ -520,18 +548,7 @@ extern "system" fn sync(this: &List, flags: u32, control: u32, address: u64, siz
             &raw const *this
         );
     }
-    let barrier = D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                pResource: std::mem::ManuallyDrop::new(None),
-            }),
-        },
-    };
-    // SAFETY: a plain call on the host list; the barrier names no resource, so nothing in
-    // it needs dropping.
-    unsafe { this.host.ResourceBarrier(&[barrier]) };
+    this.wait_for_shader_writes();
 }
 
 #[cfg(test)]
