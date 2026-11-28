@@ -32,6 +32,7 @@
 
 pub mod psv;
 pub mod signature;
+pub mod stage;
 pub mod xbox;
 
 use crate::Error;

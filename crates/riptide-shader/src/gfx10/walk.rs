@@ -143,7 +143,7 @@ pub fn walk(code: &[u32], wave: WaveSize) -> Walk {
 /// Recognises the far-jump sequence that ends in the register jump `jump`
 /// and returns the byte offset it goes to. `found` holds the instructions
 /// decoded so far by word index.
-fn far_jump(found: &BTreeMap<usize, Instruction>, jump: &Instruction) -> Option<i64> {
+pub(crate) fn far_jump(found: &BTreeMap<usize, Instruction>, jump: &Instruction) -> Option<i64> {
     let Some(Operand::Scalar {
         first: register, ..
     }) = jump.arg(Role::Source)

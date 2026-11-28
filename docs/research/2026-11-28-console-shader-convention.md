@@ -496,3 +496,23 @@ Draws are dropped while a pipeline is still compiling or a table found no free s
 **Structure builder**
 - The ray-tracing structure builder's compute stages must run all or none: they feed each other through plain title memory, and a dropped stage made later ones store through garbage offsets into the title's own objects (`vg/pipeline.rs` 246–263).
 - Its 1D programs are dispatched by thread count with a partial last group; lanes past the count must not run (`lower.rs` 93–99).
+
+## Checked against the real title's programs (2026-11-28)
+
+`riptide-shader`'s lift was built against 8,634 programs of the real title. What that confirmed and corrected, by counts over those programs:
+
+**Confirmed**
+
+- The stage data offsets for pixel, vertex, compute and mesh programs. The tables agree with the input and output signatures, and the number of colour-export patch sites equals the number of render target rows in all 3,297 pixel programs.
+- A vertex program has inputs exactly when it calls the fetch routine (332 of 1,034). Attribute registers are 4, 8, 12 and 16, and the routine's address arrives in s[4:5].
+- A table register is 32 bits and the code zeroes the high half itself. A root view is a 64-bit address in two registers with a descriptor built around it by the code. A sampler fixed by the root signature is four constant words in the code.
+- Export patch variant 9 is four `s_nop` and an `exp` of the raw registers. The patch size is 6 words in every program.
+
+**Corrected**
+
+- The stored pixel code is not unpatched: every patch site holds variant 4, a conversion to half floats and a packed export.
+- User data is not in s(N) counted from 0. A root parameter's user-data number is the scalar register number itself: parameters start at s8 in vertex, pixel and mesh programs and at s4 in compute programs. A spilled compute program's start at 16.
+- Pixel-input flag bit 1 is set on 5,607 of 6,281 entries, so it reads as "interpolated", not "linear".
+- The "row again" byte of an output entry differs from the row in most entries; what it means is not known.
+
+**Still on trust**: that per-lane branching is sound, the vertex and instance id registers, the buffer bound-check modes, the packed format numbering, and every float edge rule. Nothing was measured on console hardware.

@@ -72,8 +72,8 @@
 //! After each record comes data particular to the stage: the pixel shader's
 //! interpolated inputs and the code patches for its colour outputs, the
 //! vertex shader's attributes and outputs, the compute shader's thread group
-//! size. That stage data is not read here. [`MachineCode::payload`] and
-//! [`Program::record_offset`] are kept so that a later stage can read it.
+//! size. [`super::stage`] reads it, from [`MachineCode::payload`] at
+//! [`Program::record_offset`].
 //!
 //! A structure whose version is not the one listed is rejected with
 //! [`Error::UnknownVersion`], so that a change of format shows up as an error
@@ -466,7 +466,7 @@ pub struct Program {
     /// Bytes of group-shared memory, as the record states them.
     pub group_shared_bytes: u32,
     /// Where the stage's record starts in the payload. The stage data, which
-    /// this module does not read, follows the record.
+    /// [`MachineCode::stage_data`] reads, follows the record.
     pub record_offset: u64,
     /// Where the code starts in the payload.
     pub code_offset: u64,

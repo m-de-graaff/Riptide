@@ -62,8 +62,11 @@ mod walk;
 mod tests;
 
 pub use decode::decode_at;
+#[cfg(test)]
+pub(crate) use opcodes::number_of;
 pub use operand::{FloatConstant, Half, Operand};
 pub use text::listing;
+pub(crate) use walk::far_jump as far_jump_target;
 pub use walk::{Walk, decode_linear, walk};
 
 /// How many lanes (shader invocations) one wave of a program runs.

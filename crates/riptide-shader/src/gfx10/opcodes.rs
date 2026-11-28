@@ -1382,3 +1382,43 @@ pub(super) const SCRATCH: &[Op] = &[
     op(0x024, "scratch_load_short_d16"),
     op(0x025, "scratch_load_short_d16_hi"),
 ];
+
+/// The opcode number of a mnemonic within a format, for tests that assemble
+/// instructions. For the three-source vector format this is the number in
+/// that format: its own operations, or the bases plus the number of a
+/// shorter format's operation.
+#[cfg(test)]
+pub(crate) fn number_of(format: super::Format, name: &str) -> Option<u16> {
+    use super::Format;
+    let search = |table: &[Op]| {
+        table
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.code)
+    };
+    match format {
+        Format::Sop2 => search(SOP2),
+        Format::Sopk => search(SOPK),
+        Format::Sop1 => search(SOP1),
+        Format::Sopc => search(SOPC),
+        Format::Sopp => search(SOPP),
+        Format::Smem => search(SMEM),
+        Format::Vop2 => search(VOP2),
+        Format::Vop1 => search(VOP1),
+        Format::Vopc => search(VOPC),
+        Format::Vop3a | Format::Vop3b => search(VOP3)
+            .or_else(|| search(VOPC))
+            .or_else(|| search(VOP2).map(|code| code + VOP3_VOP2_BASE))
+            .or_else(|| search(VOP1).map(|code| code + VOP3_VOP1_BASE)),
+        Format::Vop3p => search(VOP3P),
+        Format::Vintrp => search(VINTRP),
+        Format::Ds => search(DS),
+        Format::Mubuf => search(MUBUF),
+        Format::Mtbuf => search(MTBUF),
+        Format::Mimg => search(MIMG),
+        Format::Flat => search(FLAT),
+        Format::Global => search(GLOBAL),
+        Format::Scratch => search(SCRATCH),
+        Format::Exp | Format::Unknown => None,
+    }
+}

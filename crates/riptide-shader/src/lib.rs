@@ -1,24 +1,32 @@
-//! Console shader programs (RDNA 2): reading their containers and decoding
-//! their machine code.
+//! Console shader programs (RDNA 2): reading their containers, decoding
+//! their machine code, and lifting it into a form a host shader can be
+//! written from.
 //!
 //! A shader of an Xbox Series title is a DXBC container. On a PC the `DXIL`
 //! part of such a container holds LLVM bitcode. On the console that part holds
 //! the console compiler's additions instead, among them the program compiled
 //! to the machine code of the console's GPU. A PC GPU cannot run that code, so
-//! it has to be read and translated. This crate is the first stage of that
-//! work:
+//! it has to be read and translated. This crate holds the first three of the
+//! four stages of that work (`docs/design/2026-11-28-shader-translation.md`):
 //!
 //! - [`container`] reads the container: its parts, the input and output
 //!   signatures, the pipeline state validation part, and the console's `DXIL`
-//!   part down to each program's code words.
+//!   part down to each program's code words and the data of its stage.
 //! - [`inflate`] unpacks the zlib stream the machine code is stored in.
 //! - [`gfx10`] decodes the code words into instructions of the GPU generation
 //!   called GFX10 (the generation of RDNA 2) and prints them as text.
-//! - [`summarize`] does all of that for one container and returns counts, so
+//! - [`ir`] is the intermediate form: a program as one lane of a wave sees
+//!   it, as a control-flow graph of simple operations.
+//! - [`lift`] turns a decoded program into that form, or says which
+//!   instruction it cannot lift and why.
+//! - [`interp`] runs the intermediate form on the CPU, as the reference
+//!   every later translation is checked against, and runs the machine code
+//!   itself a wave at a time, as the reference the lift is checked against.
+//! - [`summarize`] reads and decodes one container and returns counts, so
 //!   that the decoder can be checked against a real title without any of the
 //!   title's data leaving the machine it runs on.
 //!
-//! Translating the decoded instructions to host shaders is not built. See
+//! Writing host shaders from the intermediate form is not built. See
 //! README.md in this folder.
 //!
 //! Everything here is a pure function of its input bytes. Nothing touches the
@@ -29,6 +37,9 @@ mod bytes;
 pub mod container;
 pub mod gfx10;
 pub mod inflate;
+pub mod interp;
+pub mod ir;
+pub mod lift;
 mod summary;
 
 pub use summary::{

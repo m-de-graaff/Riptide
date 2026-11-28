@@ -129,6 +129,8 @@ pub(crate) struct TestProgram {
     pub scalar_registers: u32,
     pub root_parameters: Vec<[u8; 20]>,
     pub used_resources: Vec<[u8; 20]>,
+    /// The stage data, which follows the record directly.
+    pub stage_data: Vec<u8>,
     pub code: Vec<u32>,
 }
 
@@ -142,6 +144,7 @@ impl TestProgram {
             scalar_registers: 16,
             root_parameters: Vec::new(),
             used_resources: Vec::new(),
+            stage_data: Vec::new(),
             code: code.to_vec(),
         }
     }
@@ -160,7 +163,7 @@ pub(crate) fn machine_code(programs: &[TestProgram]) -> Vec<u8> {
     for program in programs {
         let record_at = payload.len();
         payload[program.slot..program.slot + 8].copy_from_slice(&(record_at as u64).to_le_bytes());
-        let roots_at = record_at + 0x54;
+        let roots_at = record_at + 0x54 + program.stage_data.len();
         let used_at = roots_at + 20 * program.root_parameters.len();
         let code_at = used_at + 20 * program.used_resources.len();
         let mut record = vec![0u8; 0x54];
@@ -176,6 +179,7 @@ pub(crate) fn machine_code(programs: &[TestProgram]) -> Vec<u8> {
         let registers = program.vector_registers | program.scalar_registers << 20;
         record[0x50..0x54].copy_from_slice(&registers.to_le_bytes());
         payload.extend_from_slice(&record);
+        payload.extend_from_slice(&program.stage_data);
         for entry in program
             .root_parameters
             .iter()
