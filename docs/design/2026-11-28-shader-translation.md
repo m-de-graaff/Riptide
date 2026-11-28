@@ -52,7 +52,17 @@ A texture's record names its place in word 5 of its eight words, and says in wor
 
 Reading title memory at an address is: the page table's word for the address's page; nothing mapped reads as zero; else the bank and the offset in it; then a load from that bank's buffer. A write is the same through the unordered-access view, and a write where nothing is mapped is dropped.
 
-A vertex program's attributes come from the host's own input assembler: the pipeline is made with the title's input layout, and the shader declares its inputs by the names and indices in the program's input signature. Values pass from one stage to the next by the rows of the two programs' signatures. A pixel program's colours go out as four raw 32-bit words per render target, declared as floats, unsigned or signed integers by the target's format, which the pipeline knows when it is made.
+### What passes between stages
+
+- **Into a vertex shader.** A vertex program's attributes come from the host's own input assembler: the pipeline is made with the title's vertex layout, and the shader declares its inputs by the names and indices in the program's input signature, each of the type the signature gives it.
+- **From a vertex shader to a pixel shader.** The console passes values in numbered *parameters* of four words: a vertex program exports parameter n, and a pixel program interpolates attribute n. The host shaders pass them the same way and do not use the title's semantic names: parameter n is `float4 ROWn : ROWn`. A vertex shader declares rows 0 to its highest exported parameter, in order; a pixel shader declares rows 0 to the highest attribute it reads, in order, so that row n is the same host register in both. A row is always declared as four floats. Whole numbers pass through as their bits (`asfloat`), which is exact because a pixel shader declares a row it does not interpolate as `nointerpolation`. The position is `SV_Position`, declared after the rows.
+- **Out of a pixel shader.** Each render target gets four raw 32-bit words, declared as floats, unsigned or signed integers by the target's format. The pipeline knows the formats when it is made, so they are part of what a pixel program is translated for.
+
+### Rectangles
+
+The console draws a list of rectangles (list topology 17, pipeline topology type 19) from three vertices each: three corners of a screen-aligned rectangle. The hardware draws the whole rectangle and continues every output linearly into the fourth corner. The host has no such topology. The draw goes out as a triangle list, so that vertex counts and indices stay the title's, with a geometry shader of Riptide's own behind the vertex shader that makes each triangle the rectangle.
+
+Which of the three is the corner between the other two varies from draw to draw. It is the vertex that shares x with one of the others and y with the other. The fourth vertex lies opposite it: `a + b - corner`, for the position and for every row. Three vertices that are not such corners stay the triangle they make. The geometry shader needs to know only how many rows the vertex shader has, so `riptide-shader` writes it from that number.
 
 ## Order of work
 
