@@ -5,6 +5,7 @@
 //! See README.md in this folder.
 
 mod accessibility;
+mod acphal;
 mod bvh;
 mod com;
 pub mod cores;
@@ -26,6 +27,7 @@ mod taskqueue;
 pub mod timers;
 mod trace;
 mod user;
+mod xapu;
 mod xg;
 pub mod xmem;
 
