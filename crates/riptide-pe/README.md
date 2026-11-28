@@ -13,6 +13,7 @@ Loading, mapping and binding the title image.
 ## Decisions made without a design document
 
 - **The image is mapped with `VirtualAlloc`, not into `riptide-mem`'s block.** The block exists so the GPU can read title data in place (D1). The GPU does not read the title's code. If the image has to live in the block after all, `Mapping::new` is the one place that changes.
+- **A title's own breakpoint is stepped over.** A title's checks of its own state end in a one-byte breakpoint with the code to go on after it. Nothing handles it here, so the reporter moves the thread past it, as a debugger told to go on would, and says where in the session log (the first few times, then as the count doubles). After 4,096 of them the next one ends the title like any other fault.
 - **Only unhandled faults are reported.** The reporter is an unhandled-exception filter, not a first-chance handler, so faults the title's own handlers or the write guards (D3, D4) deal with never reach it.
 - **Every missing import is an error at load.** Stubs that fail by name when called are `riptide-hle`'s to supply through the resolver (issue #10); the loader itself never invents an address.
 - **Declared Windows functions, no dependency.** The loader calls eight kernel32 functions and declares them itself in `sys.rs`.

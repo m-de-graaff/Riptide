@@ -103,11 +103,20 @@ unsafe extern "system" fn unhandled(pointers: *mut sys::EXCEPTION_POINTERS) -> i
     .filter(|_| record.NumberParameters >= 2);
 
     // The fault may have come while this thread held the lock; do not wait for it then.
-    let place = match MODULES.try_lock() {
+    let in_title = match MODULES.try_lock() {
         Ok(modules) => describe_in(&modules, address),
         Err(_) => None,
+    };
+    if record.ExceptionCode == sys::EXCEPTION_BREAKPOINT
+        && let Some(place) = &in_title
+    {
+        // SAFETY: Windows passes the faulting thread's context with the exception, and
+        // the address is the title's code, which is readable.
+        if unsafe { step_over_breakpoint(address, (*pointers).ContextRecord.cast::<u8>(), place) } {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
-    .or_else(|| host_place(address));
+    let place = in_title.or_else(|| host_place(address));
     let line = fault_line(record.ExceptionCode, address, access, place);
     // SAFETY: Windows passes the faulting thread's context with the exception.
     let more = unsafe { registers_and_callers((*pointers).ContextRecord.cast::<u8>()) };
@@ -122,8 +131,60 @@ unsafe extern "system" fn unhandled(pointers: *mut sys::EXCEPTION_POINTERS) -> i
     sys::EXCEPTION_EXECUTE_HANDLER
 }
 
-/// Two more lines for a fault: the registers a call passes its first arguments in, and the
-/// addresses on the faulting thread's stack that lie in a loaded image. Those are mostly
+/// What a filter answers to have the thread go on from its context.
+const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+
+/// How many of a title's breakpoints are stepped over before one stops it: a title that
+/// breaks without end is not running.
+const BREAKPOINTS: u32 = 4096;
+
+/// Steps over a breakpoint in a title's own code, if that is what is at `address`: the
+/// thread's context is moved past the one-byte instruction, and the place is said in the
+/// session log the first few times.
+///
+/// A title's checks of its own state end in a breakpoint with the code to go on after it.
+/// On the console a debugger, or nothing at all, takes the thread past it; here nothing
+/// handles it and the title would end. So it is stepped over, as a debugger told to go on
+/// would.
+///
+/// # Safety
+/// `address` is readable, and `context` is null or the x64 `CONTEXT` of the stopped thread.
+unsafe fn step_over_breakpoint(address: usize, context: *mut u8, place: &str) -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static STEPPED: AtomicU32 = AtomicU32::new(0);
+    /// The one-byte breakpoint instruction.
+    const INT3: u8 = 0xCC;
+    /// Where the instruction pointer is in the context.
+    const RIP: usize = 0xF8;
+    // SAFETY: readable, as the caller says.
+    if context.is_null() || unsafe { (address as *const u8).read() } != INT3 {
+        return false;
+    }
+    let stepped = STEPPED.fetch_add(1, Ordering::Relaxed) + 1;
+    if stepped > BREAKPOINTS {
+        return false;
+    }
+    if stepped <= 16 || stepped.is_power_of_two() {
+        let line =
+            format!("the title's own breakpoint at {place} is stepped over ({stepped} so far)");
+        eprintln!("riptide: {line}");
+        if let Some(sink) = SINK.get() {
+            sink(&line);
+        }
+    }
+    // SAFETY: the context is the stopped thread's; the instruction pointer goes past the
+    // one byte of the breakpoint.
+    unsafe {
+        context
+            .add(RIP)
+            .cast::<u64>()
+            .write_unaligned(address as u64 + 1);
+    }
+    true
+}
+
+/// More lines for a fault: the registers a call passes its first arguments in, the other
+/// general registers, and the addresses on the faulting thread's stack that lie in a loaded image. Those are mostly
 /// return addresses, nearest caller first, though a stale one can be among them.
 ///
 /// # Safety
@@ -145,6 +206,20 @@ unsafe fn registers_and_callers(context: *const u8) -> Vec<String> {
     let mut lines = vec![format!(
         "riptide: rax {rax:#x} rcx {rcx:#x} rdx {rdx:#x} r8 {r8:#x} r9 {r9:#x} rsp {rsp:#x}"
     )];
+    // The registers a function keeps across calls: what it was working on when it faulted.
+    lines.push(format!(
+        "riptide: rbx {:#x} rbp {:#x} rsi {:#x} rdi {:#x} r10 {:#x} r11 {:#x} r12 {:#x} r13 {:#x}          r14 {:#x} r15 {:#x}",
+        register(0x90),
+        register(0xA0),
+        register(0xA8),
+        register(0xB0),
+        register(0xC8),
+        register(0xD0),
+        register(0xD8),
+        register(0xE0),
+        register(0xE8),
+        register(0xF0),
+    ));
     // A register that points into one of Windows' modules is named: it is often what tells
     // an argument of the wrong kind from a wrong value.
     for (name, value) in [
