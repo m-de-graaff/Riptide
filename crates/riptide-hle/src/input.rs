@@ -12,7 +12,8 @@
 //! - the keyboard, while a window of this process is in front ([`from_keys`]);
 //! - `RIPTIDE_INPUT_SCRIPT`, a list of buttons to hold at times counted in seconds from
 //!   the start of the run: `95:A,100-101.5:Down` presses A for 0.2 s at 95 s and holds
-//!   Down from 100 s to 101.5 s.
+//!   Down from 100 s to 101.5 s. Besides buttons it can pull a trigger (`LT`, `RT`) and
+//!   push a stick (`LeftUp`, `RightDown` and the like).
 //!
 //! A reading is taken when the title asks for one, and a new one is kept whenever what is
 //! held has changed, so a title that walks from one reading to the next sees every change
@@ -192,17 +193,64 @@ fn from_keys(held: impl Fn(u8) -> bool) -> Gamepad {
     }
 }
 
-/// One entry of a script: buttons held from one time to another, in seconds.
+/// One entry of a script: what is held from one time to another, in seconds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Held {
     from: f32,
     to: f32,
-    buttons: u32,
+    held: Gamepad,
 }
 
-/// The button a script names, without regard to case.
-fn named(name: &str) -> Option<u32> {
-    Some(match name.to_ascii_lowercase().as_str() {
+/// What a script names, without regard to case: a button, a trigger pulled all the way
+/// (`LT`, `RT`), or a stick pushed all the way one way (`LeftUp`, `RightDown` and so on).
+fn named(name: &str) -> Option<Gamepad> {
+    let name = name.to_ascii_lowercase();
+    let rest = Gamepad::default();
+    let pushed = |way: &str| match way {
+        "up" => Some((0.0, 1.0)),
+        "down" => Some((0.0, -1.0)),
+        "left" => Some((-1.0, 0.0)),
+        "right" => Some((1.0, 0.0)),
+        _ => None,
+    };
+    if let Some((x, y)) = name.strip_prefix("left").and_then(pushed) {
+        return Some(Gamepad {
+            left_x: x,
+            left_y: y,
+            ..rest
+        });
+    }
+    if let Some((x, y)) = name.strip_prefix("right").and_then(pushed) {
+        return Some(Gamepad {
+            right_x: x,
+            right_y: y,
+            ..rest
+        });
+    }
+    match name.as_str() {
+        "lt" => {
+            return Some(Gamepad {
+                left_trigger: 1.0,
+                ..rest
+            });
+        }
+        "rt" => {
+            return Some(Gamepad {
+                right_trigger: 1.0,
+                ..rest
+            });
+        }
+        _ => {}
+    }
+    Some(Gamepad {
+        buttons: button_named(&name)?,
+        ..rest
+    })
+}
+
+/// The button of a name in lower case.
+fn button_named(name: &str) -> Option<u32> {
+    Some(match name {
         "a" => button::A,
         "b" => button::B,
         "x" => button::X,
@@ -224,8 +272,8 @@ fn named(name: &str) -> Option<u32> {
 /// How long a script holds a button it gives one time for.
 const TAP: f32 = 0.2;
 
-/// Reads a script: entries separated by commas, each `<time>:<button>` or
-/// `<from>-<to>:<button>`. An entry that cannot be read is an error naming it.
+/// Reads a script: entries separated by commas, each `<time>:<what>` or
+/// `<from>-<to>:<what>`, where what is held is one of the names [`named`] knows. An entry that cannot be read is an error naming it.
 fn script(text: &str) -> Result<Vec<Held>, String> {
     text.split(',')
         .map(str::trim)
@@ -233,26 +281,23 @@ fn script(text: &str) -> Result<Vec<Held>, String> {
         .map(|entry| {
             let wrong = || format!("`{entry}` is not `<time>:<button>` or `<from>-<to>:<button>`");
             let (when, name) = entry.split_once(':').ok_or_else(wrong)?;
-            let buttons = named(name.trim()).ok_or_else(wrong)?;
+            let held = named(name.trim()).ok_or_else(wrong)?;
             let time = |text: &str| text.trim().parse::<f32>().map_err(|_| wrong());
             let (from, to) = match when.split_once('-') {
                 Some((from, to)) => (time(from)?, time(to)?),
                 None => (time(when)?, time(when)? + TAP),
             };
-            Ok(Held { from, to, buttons })
+            Ok(Held { from, to, held })
         })
         .collect()
 }
 
 /// What a script holds at `seconds` from the start.
 fn scripted(script: &[Held], seconds: f32) -> Gamepad {
-    Gamepad {
-        buttons: script
-            .iter()
-            .filter(|held| held.from <= seconds && seconds < held.to)
-            .fold(0, |all, held| all | held.buttons),
-        ..Gamepad::default()
-    }
+    script
+        .iter()
+        .filter(|held| held.from <= seconds && seconds < held.to)
+        .fold(Gamepad::default(), |all, held| all.with(held.held))
 }
 
 /// One reading: what the gamepad held, when, and which reading of the run it is.
@@ -1081,12 +1126,18 @@ mod tests {
                 Held {
                     from: 95.0,
                     to: 95.0 + TAP,
-                    buttons: button::A
+                    held: Gamepad {
+                        buttons: button::A,
+                        ..Gamepad::default()
+                    }
                 },
                 Held {
                     from: 100.0,
                     to: 101.5,
-                    buttons: button::DOWN
+                    held: Gamepad {
+                        buttons: button::DOWN,
+                        ..Gamepad::default()
+                    }
                 },
             ]
         );
@@ -1095,6 +1146,12 @@ mod tests {
         assert_eq!(scripted(&played, 95.3).buttons, 0);
         assert_eq!(scripted(&played, 101.0).buttons, button::DOWN);
         assert_eq!(scripted(&played, 101.5).buttons, 0);
+        // Sticks and triggers are held all the way, with whatever else is held then.
+        let more = script("1-2:RightDown,1-2:lt,1-2:leftleft,1.5-2:B").unwrap();
+        let held = scripted(&more, 1.6);
+        assert_eq!((held.right_x, held.right_y), (0.0, -1.0));
+        assert_eq!((held.left_x, held.left_trigger), (-1.0, 1.0));
+        assert_eq!(held.buttons, button::B);
         // What cannot be read is named.
         assert!(script("95:jump").unwrap_err().contains("95:jump"));
         assert!(script("soon:A").is_err());
