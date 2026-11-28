@@ -133,8 +133,9 @@ pub(crate) struct List {
     recorded: std::sync::atomic::AtomicU32,
     /// How many times the list has been submitted since it was last reset.
     submissions: std::sync::atomic::AtomicU32,
-    /// A wait the GPU is to make before it runs the host list being recorded now.
-    gate: std::sync::Mutex<Option<Wait>>,
+    /// The waits the GPU is to make, in order, before it runs the host list being recorded
+    /// now. More than one when the title records waits one after another.
+    gate: std::sync::Mutex<Vec<Wait>>,
     /// The pieces the list was cut into at waits before the one being recorded now, in
     /// order, each with the wait the GPU makes before it.
     earlier: std::sync::Mutex<Vec<Piece>>,
@@ -189,11 +190,11 @@ pub(crate) struct Run {
     pub(crate) ran_at: std::sync::atomic::AtomicU64,
 }
 
-/// One part of a title's list as it is submitted: a host list, and the wait the GPU makes
-/// before it.
+/// One part of a title's list as it is submitted: a host list, and the waits the GPU makes
+/// before it, in order.
 #[derive(Clone)]
 pub(crate) struct Piece {
-    pub(crate) wait: Option<Wait>,
+    pub(crate) waits: Vec<Wait>,
     pub(crate) host: ID3D12GraphicsCommandList,
     pub(crate) run: std::sync::Arc<Run>,
     /// The list type, as the host numbers them.
@@ -513,7 +514,7 @@ unsafe fn make_list(
         host: std::cell::UnsafeCell::new(host),
         recorded: std::sync::atomic::AtomicU32::new(0),
         submissions: std::sync::atomic::AtomicU32::new(0),
-        gate: std::sync::Mutex::new(None),
+        gate: std::sync::Mutex::new(Vec::new()),
         earlier: std::sync::Mutex::new(Vec::new()),
         run: std::sync::Mutex::new(std::sync::Arc::new(Run::default())),
         allocator: std::cell::UnsafeCell::new(Some(allocator.host.clone())),
@@ -744,7 +745,9 @@ impl List {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.recorded.load(Ordering::Relaxed) == 0 {
-            *gate = Some(wait);
+            // Nothing is recorded since the list started or was last cut: this wait joins
+            // those already before this part.
+            gate.push(wait);
             return true;
         }
         // SAFETY: as in `current`: only the thread recording this list touches these.
@@ -772,13 +775,13 @@ impl List {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(Piece {
-                    wait: gate.take(),
+                    waits: std::mem::take(&mut *gate),
                     host: before,
                     run,
                     kind: self.kind,
                 });
         }
-        *gate = Some(wait);
+        gate.push(wait);
         self.recorded.store(0, Ordering::Relaxed);
         // The new host list has nothing bound yet, and none of what was set before.
         self.drawing.state().on_new_host_list();
@@ -803,10 +806,11 @@ impl List {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         pieces.push(Piece {
-            wait: *self
+            waits: self
                 .gate
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             host: self.current().clone(),
             run: self
                 .run
@@ -866,10 +870,10 @@ unsafe extern "system" fn reset(
     this.recorded.store(0, std::sync::atomic::Ordering::Relaxed);
     this.submissions
         .store(0, std::sync::atomic::Ordering::Relaxed);
-    *this
-        .gate
+    this.gate
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
     // The pieces of what was recorded before are let go. One that no submission still
     // holds can record again; the others are given back when their submission has run.
     let before = std::mem::take(

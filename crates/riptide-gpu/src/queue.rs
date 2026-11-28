@@ -308,12 +308,12 @@ unsafe extern "system" fn execute(this: &Queue, count: u32, lists: *const *const
     let mut run: Vec<Piece> = Vec::new();
     for list in lists {
         for piece in list.pieces() {
-            if let Some(wait) = piece.wait {
+            if !piece.waits.is_empty() {
                 waits = true;
                 if !run.is_empty() {
                     jobs.push(Job::Lists(std::mem::take(&mut run)));
                 }
-                jobs.push(Job::Gate(wait));
+                jobs.extend(piece.waits.iter().map(|&wait| Job::Gate(wait)));
             }
             run.push(piece);
         }
