@@ -108,7 +108,7 @@ With the host checking every call (`RIPTIDE_GPU_CHECKS=1`), 60 s gave more than 
 
 Not measured: frame times, and what any of this costs in CPU time. Nothing is drawn yet, so neither would say much.
 
-### 2026-11-28 · translating the real title's shader programs, and its first picture · commit COMMIT
+### 2026-11-28 · translating the real title's shader programs, and its first picture · commit f6ff6b5
 
 Driver 32.0.32029.2010, Windows 11 build 26200. DirectX shader compiler 1.8.2502, from the Windows SDK 10.0.26100.0.
 
