@@ -14,9 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
+use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList1;
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_VIEWPORT, D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
-    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, ID3D12GraphicsCommandList2,
+    D3D12_CLEAR_FLAGS, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_RENDER_TARGET,
+    D3D12_SHADING_RATE, D3D12_SHADING_RATE_COMBINER, D3D12_VIEWPORT,
+    D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT, D3D12_WRITEBUFFERIMMEDIATE_PARAMETER,
+    ID3D12GraphicsCommandList2, ID3D12GraphicsCommandList5,
 };
 use windows::core::Interface;
 
@@ -194,6 +197,170 @@ extern "system" fn barrier(this: &List) {
     this.wait_for_shader_writes();
 }
 
+/// `OMSetRenderTargets`: `(count, render target descriptors, whether they are one range,
+/// depth target descriptor)`. With one range the first descriptor is given and the others
+/// follow it in its heap.
+///
+/// # Safety
+/// `targets` is null or as many descriptor handles as the call says (one, for a range);
+/// `depth` is null or a descriptor handle; every descriptor names a live resource.
+unsafe extern "system" fn set_render_targets(
+    this: &List,
+    count: u32,
+    targets: *const u64,
+    one_range: i32,
+    depth: *const u64,
+) {
+    let step = u64::from(crate::descriptor::increment(2).unwrap_or(0));
+    let mut views = Vec::new();
+    for index in 0..count.min(8) {
+        // SAFETY: the title's handles, as the contract says.
+        let handle = unsafe {
+            match (targets.is_null(), one_range != 0) {
+                (true, _) => 0,
+                (false, true) => targets.read_unaligned() + u64::from(index) * step,
+                (false, false) => targets.add(index as usize).read_unaligned(),
+            }
+        };
+        // SAFETY: the title's descriptor.
+        let Some(target) = (unsafe { crate::target::render_target(handle) }) else {
+            show_once(&NO_TARGET, || {
+                format!("a render target at descriptor {handle:#x} has no host texture")
+            });
+            // Targets are bound by place, so one that is missing ends the list of them.
+            break;
+        };
+        this.use_texture(&target.texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        views.push(target.view);
+    }
+    // SAFETY: the title's handle; null is no depth target.
+    let depth_view = unsafe { depth.as_ref() }.and_then(|&handle| {
+        // SAFETY: the title's descriptor.
+        let target = unsafe { crate::target::depth_target(handle) }?;
+        this.use_texture(&target.texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        Some(target.view)
+    });
+    // SAFETY: a plain call on the host list with views made on the host.
+    unsafe {
+        this.host().OMSetRenderTargets(
+            views.len() as u32,
+            (!views.is_empty()).then_some(views.as_ptr()),
+            false,
+            depth_view.as_ref().map(std::ptr::from_ref),
+        )
+    };
+}
+
+static NO_TARGET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `ClearRenderTargetView`: `(descriptor, colour, rectangle count, rectangles)`.
+///
+/// # Safety
+/// `colour` is null or four numbers; `rectangles` is null or `count` rectangles; the
+/// descriptor names a live resource.
+unsafe extern "system" fn clear_render_target(
+    this: &List,
+    handle: u64,
+    colour: *const [f32; 4],
+    count: u32,
+    rectangles: *const RECT,
+) {
+    // SAFETY: the title's descriptor.
+    let Some(target) = (unsafe { crate::target::render_target(handle) }) else {
+        show_once(&NO_TARGET, || {
+            format!("a render target at descriptor {handle:#x} has no host texture")
+        });
+        return;
+    };
+    // SAFETY: the title's colour; without one the clear is to nothing.
+    let colour = unsafe { colour.as_ref() }.copied().unwrap_or_default();
+    // SAFETY: the title's rectangles.
+    let rectangles = unsafe { items(rectangles, count) };
+    this.use_texture(&target.texture, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    // SAFETY: a plain call on the host list.
+    unsafe {
+        this.host().ClearRenderTargetView(
+            target.view,
+            &colour,
+            (!rectangles.is_empty()).then_some(rectangles),
+        )
+    };
+}
+
+/// `ClearDepthStencilView`: `(descriptor, what to clear, depth, stencil, rectangle count,
+/// rectangles)`.
+///
+/// # Safety
+/// `rectangles` is null or `count` rectangles; the descriptor names a live resource.
+unsafe extern "system" fn clear_depth_target(
+    this: &List,
+    handle: u64,
+    what: u32,
+    depth: f32,
+    stencil: u8,
+    count: u32,
+    rectangles: *const RECT,
+) {
+    // SAFETY: the title's descriptor.
+    let Some(target) = (unsafe { crate::target::depth_target(handle) }) else {
+        show_once(&NO_TARGET, || {
+            format!("a depth target at descriptor {handle:#x} has no host texture")
+        });
+        return;
+    };
+    // SAFETY: the title's rectangles.
+    let rectangles = unsafe { items(rectangles, count) };
+    this.use_texture(&target.texture, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    // SAFETY: a plain call on the host list.
+    unsafe {
+        this.host().ClearDepthStencilView(
+            target.view,
+            D3D12_CLEAR_FLAGS(what as i32),
+            depth,
+            stencil,
+            (!rectangles.is_empty()).then_some(rectangles),
+        )
+    };
+}
+
+/// `RSSetShadingRate`: `(rate, two combiners or null)`. How coarsely pixels are shaded.
+/// The host has the same call where its GPU can do it; where it cannot, shading stays
+/// fine, which is only slower.
+///
+/// # Safety
+/// `combiners` is null or two combiners.
+unsafe extern "system" fn shading_rate(
+    this: &List,
+    rate: u32,
+    combiners: *const [D3D12_SHADING_RATE_COMBINER; 2],
+) {
+    if let Ok(host) = this.host().cast::<ID3D12GraphicsCommandList5>() {
+        // SAFETY: a plain call on the host list; the combiners are the title's.
+        unsafe {
+            host.RSSetShadingRate(
+                D3D12_SHADING_RATE(rate as i32),
+                (!combiners.is_null()).then_some(combiners.cast()),
+            )
+        };
+    }
+}
+
+/// `OMSetDepthBounds`: `(least, greatest)`. Pixels whose stored depth is outside are not
+/// drawn. The host has the same call where its GPU can do it.
+extern "system" fn depth_bounds(this: &List, least: f32, greatest: f32) {
+    if let Ok(host) = this.host().cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: a plain call on the host list.
+        unsafe { host.OMSetDepthBounds(least, greatest) };
+    }
+}
+
+/// Names for a profiler (`SetMarker`, `BeginEvent`, `EndEvent`) and hints to the console
+/// GPU's driver (`SetPixelShaderDepthOrderX`, `SetDriverHintX`, and one newer method whose
+/// purpose is not known and whose result the title does not use): none changes what is
+/// drawn, and nothing is done. The methods bound to this take different arguments, none
+/// of which is read.
+extern "system" fn changes_nothing(_this: &List) {}
+
 /// State that only a host pipeline can use: accepted, and nothing is kept. The methods
 /// bound to this take different arguments, none of which is read.
 extern "system" fn waits_for_pipelines(_this: &List) {}
@@ -226,14 +393,20 @@ pub(crate) fn methods() -> Vec<(usize, usize)> {
         (23, blend_factor as *const () as usize),
         (24, stencil_reference as *const () as usize),
         (26, barrier as *const () as usize),
+        (50, set_render_targets as *const () as usize),
+        (51, clear_depth_target as *const () as usize),
+        (52, clear_render_target as *const () as usize),
         (69, write_32 as *const () as usize),
         (70, write_64 as *const () as usize),
+        (124, shading_rate as *const () as usize),
+        (68, depth_bounds as *const () as usize),
         (71, wait_on_value as *const () as usize),
         (72, wait_on_value as *const () as usize),
     ];
     // Draws and dispatches: instanced, indexed, dispatch, indirect, and the console's own
     // dispatch and mesh dispatches.
     methods.extend([12, 13, 14, 59, 78, 98, 127].map(|slot| (slot, draw)));
+    methods.extend([56, 57, 58, 73, 99].map(|slot| (slot, changes_nothing as *const () as usize)));
     // The pipeline, descriptor heaps, root signatures and root arguments, index and vertex
     // buffers.
     methods.extend((32..=48).chain([25]).map(|slot| (slot, state)));
@@ -242,7 +415,10 @@ pub(crate) fn methods() -> Vec<(usize, usize)> {
 
 /// The recording methods only lists of the newer layout have, by their position there.
 pub(crate) fn newer_methods() -> Vec<(usize, usize)> {
-    vec![(146, barrier as *const () as usize)]
+    vec![
+        (142, changes_nothing as *const () as usize),
+        (146, barrier as *const () as usize),
+    ]
 }
 
 #[cfg(test)]

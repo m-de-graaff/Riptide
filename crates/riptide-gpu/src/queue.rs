@@ -2,16 +2,21 @@
 //!
 //! Each console queue is one host queue of the same list type.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE,
-    ID3D12CommandQueue,
+    ID3D12CommandList, ID3D12CommandQueue,
 };
+use windows::core::Interface;
 
 use crate::device::Device;
 use crate::fence::Fence;
+use crate::list::List;
 use crate::object::{self, Child, E_INVALIDARG, Hresult, Iid, Object, S_OK, guid};
 #[cfg(test)]
 use crate::object::{E_NOINTERFACE, E_POINTER};
+use crate::resource::Resource;
 use crate::trace;
 
 /// `ID3D12CommandQueue`.
@@ -113,7 +118,14 @@ fn table(newer: bool) -> &'static [usize] {
         methods.extend([
             (14, signal as *const () as usize),
             (15, wait as *const () as usize),
+            (10, execute as *const () as usize),
+            (11, marker as *const () as usize),
+            (12, marker as *const () as usize),
+            (13, marker as *const () as usize),
             (16, timestamp_frequency as *const () as usize),
+            (30, present as *const () as usize),
+            (32, signal_2 as *const () as usize),
+            (33, execute_x as *const () as usize),
             (17, clock_calibration as *const () as usize),
         ]);
         let names: Vec<(usize, &str)> = NAMES
@@ -229,7 +241,11 @@ unsafe extern "system" fn signal(this: &Queue, fence: *const Fence, value: u64) 
     };
     // SAFETY: a plain call on the host queue with a live host fence.
     match unsafe { this.host.Signal(fence.host(), value) } {
-        Ok(()) => S_OK,
+        Ok(()) => {
+            // The fence's own value follows when the host GPU gets there.
+            fence.expect(value);
+            S_OK
+        }
         Err(error) => error.code().0,
     }
 }
@@ -249,6 +265,121 @@ unsafe extern "system" fn wait(this: &Queue, fence: *const Fence, value: u64) ->
         Err(error) => error.code().0,
     }
 }
+
+/// `ExecuteCommandLists`: `(count, lists)`. The host lists the title's lists recorded onto
+/// are submitted to the host queue at once, in the same order.
+///
+/// # Safety
+/// `lists` is null or `count` pointers, each null or a live, closed list.
+unsafe extern "system" fn execute(this: &Queue, count: u32, lists: *const *const List) {
+    if lists.is_null() || count == 0 {
+        return;
+    }
+    // SAFETY: the title passes `count` pointers.
+    let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+    let host: Vec<Option<ID3D12CommandList>> = lists
+        .iter()
+        // SAFETY: each is null or a live list.
+        .filter_map(|&list| unsafe { list.as_ref() })
+        .filter_map(|list| list.host().cast::<ID3D12CommandList>().ok())
+        .map(Some)
+        .collect();
+    if host.is_empty() {
+        return;
+    }
+    let submitted = SUBMITTED.fetch_add(host.len() as u64, Ordering::Relaxed);
+    if submitted == 0 {
+        trace!("the title's first command lists are submitted to the host GPU");
+    }
+    // SAFETY: a plain call on the host queue with closed host lists.
+    unsafe { this.host.ExecuteCommandLists(&host) };
+}
+
+/// Lists submitted so far.
+static SUBMITTED: AtomicU64 = AtomicU64::new(0);
+
+/// `ExecuteCommandListsX`: `(count, lists, frame token, flags)`. As `ExecuteCommandLists`;
+/// the token says which frame the work is for, which the host does not ask.
+///
+/// # Safety
+/// As [`execute`].
+unsafe extern "system" fn execute_x(
+    this: &Queue,
+    count: u32,
+    lists: *const *const List,
+    _token: u64,
+    _flags: u32,
+) {
+    // SAFETY: as received.
+    unsafe { execute(this, count, lists) };
+}
+
+/// `SetMarker`, `BeginEvent` and `EndEvent`: names for a profiler. Nothing to do.
+extern "system" fn marker(_this: &Queue) {}
+
+/// `Signal2X`: `(fence, value, two sets of console sync settings)`. As `Signal`: the host
+/// queue signals when it has done everything submitted so far.
+///
+/// # Safety
+/// `fence` is null or a live fence.
+unsafe extern "system" fn signal_2(
+    this: &Queue,
+    fence: *const Fence,
+    value: u64,
+    _bottom: *const u8,
+    _top: *const u8,
+) -> Hresult {
+    // SAFETY: as received.
+    unsafe { signal(this, fence, value) }
+}
+
+/// One plane of a present: the frame's token, then the textures of the plane. The console
+/// goes on with rectangles, a colour space and options, which are not read here.
+#[repr(C)]
+pub(crate) struct Plane {
+    token: u64,
+    count: u32,
+    resources: *const *const Resource,
+}
+
+/// `PresentX`: `(plane count, planes, parameters)`. The first texture of the first plane
+/// is shown in the window.
+///
+/// # Safety
+/// `planes` is null or at least one plane, whose textures are live resources.
+unsafe extern "system" fn present(
+    this: &Queue,
+    count: u32,
+    planes: *const Plane,
+    _parameters: *const u8,
+) -> Hresult {
+    let frames = PRESENTED.fetch_add(1, Ordering::Relaxed) + 1;
+    // SAFETY: the title's planes; null or none is refused.
+    let Some(plane) = (unsafe { planes.as_ref() }).filter(|_| count > 0) else {
+        return E_INVALIDARG;
+    };
+    if plane.count == 0 || plane.resources.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: the plane has at least one texture pointer, null or a live resource.
+    let Some(resource) = (unsafe { plane.resources.read_unaligned().as_ref() }) else {
+        return E_INVALIDARG;
+    };
+    let shown = resource
+        .host()
+        .is_some_and(|frame| crate::present::show(&this.host, frame));
+    if frames <= 3 || frames.is_power_of_two() {
+        trace!(
+            "frame {frames} presented ({count} planes, token {}): {}",
+            plane.token,
+            if shown { "shown" } else { "not shown" }
+        );
+    }
+    S_OK
+}
+
+/// Frames presented so far.
+static PRESENTED: AtomicU64 = AtomicU64::new(0);
 
 /// `GetTimestampFrequency`: `(frequency out)`. How many ticks of the GPU's timer make a
 /// second. Timestamps a title's lists take come from the host GPU, so the answer is the

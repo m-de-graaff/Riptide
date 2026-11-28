@@ -380,6 +380,9 @@ pub(crate) struct Resource {
     address: u64,
     /// Whose its memory is, and so who gets it back when the resource goes.
     owned: Owned,
+    /// A texture's host texture, made the first time a command needs it; `None` inside if
+    /// the host could not make one.
+    host: OnceLock<Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>>,
 }
 
 /// Where a resource's memory came from.
@@ -435,6 +438,14 @@ impl Resource {
         &self.description
     }
 
+    /// The host texture of a texture, made on first use. `None` for a buffer, which the
+    /// host reads in title memory, and for a texture the host could not make.
+    pub(crate) fn host(&self) -> Option<&windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+        self.host
+            .get_or_init(|| crate::target::make(&self.description))
+            .as_ref()
+    }
+
     /// The title address of its first byte, which is also its GPU address.
     pub(crate) fn address(&self) -> u64 {
         self.address
@@ -485,6 +496,7 @@ pub(crate) fn placed(address: u64, description: &Description) -> *const Resource
                 heap_flags: 0,
                 address,
                 owned: Owned::No,
+                host: OnceLock::new(),
             })) as usize
         });
     at as *const Resource
@@ -565,6 +577,7 @@ pub(crate) unsafe extern "system" fn create_at_address(
         heap_flags: 0,
         address,
         owned: Owned::No,
+        host: OnceLock::new(),
     });
     trace!(
         "resource {:p} made at address {address:#x}, first layout {layout:#x}: {description:?}",
@@ -701,6 +714,7 @@ pub(crate) unsafe extern "system" fn create_committed(
         heap_flags,
         address,
         owned,
+        host: OnceLock::new(),
     });
     trace!(
         "resource {:p} committed at {address:#x}, {:#x} bytes from {from}, heap {heap:?} \

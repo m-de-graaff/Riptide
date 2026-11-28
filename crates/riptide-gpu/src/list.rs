@@ -10,8 +10,10 @@ use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_TYPE, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
-    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_UAV_BARRIER,
-    ID3D12CommandAllocator, ID3D12GraphicsCommandList,
+    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_BARRIER_TYPE_UAV,
+    D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATES, D3D12_RESOURCE_TRANSITION_BARRIER,
+    D3D12_RESOURCE_UAV_BARRIER, ID3D12CommandAllocator, ID3D12GraphicsCommandList, ID3D12Resource,
 };
 
 use crate::device::Device;
@@ -115,6 +117,10 @@ pub(crate) struct List {
     /// is not known; this keeps what follows clear of it.
     newer: [u32; 256],
     host: ID3D12GraphicsCommandList,
+    /// The host textures this list has used since it was last reset, each with the state
+    /// the list last put it in.
+    textures:
+        std::sync::Mutex<std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>>,
 }
 
 const _: () = assert!(std::mem::offset_of!(List, kind) == 0x10);
@@ -387,6 +393,7 @@ unsafe fn make_list(
         pipeline_shadow: [0; 8],
         newer: [0; 256],
         host,
+        textures: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     trace!("command list {:p} made: type {kind}", &raw const *list);
     // SAFETY: `accepts` checked the out-pointer.
@@ -472,6 +479,73 @@ impl List {
         unsafe { self.host.ResourceBarrier(&[barrier]) };
     }
 
+    /// Moves a host texture to the state a command needs, if this list does not have it
+    /// there already.
+    ///
+    /// Lists are recorded on many threads in an order that is not the order they run in,
+    /// so no list can know what state another left a texture in. Each list therefore takes
+    /// every texture as being in the common state when it starts and puts it back when it
+    /// is closed.
+    pub(crate) fn use_texture(&self, texture: &ID3D12Resource, wanted: D3D12_RESOURCE_STATES) {
+        let key = windows::core::Interface::as_raw(texture) as usize;
+        let mut textures = self
+            .textures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = textures
+            .entry(key)
+            .or_insert_with(|| (texture.clone(), D3D12_RESOURCE_STATE_COMMON));
+        if entry.1 != wanted {
+            self.transition(texture, entry.1, wanted);
+            entry.1 = wanted;
+        }
+    }
+
+    /// Records a change of state of all of a host texture.
+    fn transition(
+        &self,
+        texture: &ID3D12Resource,
+        before: D3D12_RESOURCE_STATES,
+        after: D3D12_RESOURCE_STATES,
+    ) {
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    // SAFETY: a copy of the pointer without a reference of its own. The
+                    // barrier is used for one call, during which `texture` is alive, and is
+                    // never dropped.
+                    pResource: unsafe { std::mem::transmute_copy(texture) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        };
+        // SAFETY: a plain call on the host list.
+        unsafe { self.host.ResourceBarrier(&[barrier]) };
+    }
+
+    /// Puts every host texture this list used back in the common state, and forgets them.
+    /// The list holds them until then, so that one the title releases meanwhile outlives
+    /// the commands that name it.
+    fn settle_textures(&self, forget: bool) {
+        let mut textures = self
+            .textures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (texture, state) in textures.values_mut() {
+            if *state != D3D12_RESOURCE_STATE_COMMON {
+                self.transition(texture, *state, D3D12_RESOURCE_STATE_COMMON);
+                *state = D3D12_RESOURCE_STATE_COMMON;
+            }
+        }
+        if forget {
+            textures.clear();
+        }
+    }
+
     /// The host list this one records onto.
     pub(crate) fn host(&self) -> &ID3D12GraphicsCommandList {
         &self.host
@@ -485,6 +559,7 @@ extern "system" fn list_type(this: &List) -> u32 {
 
 /// `Close`: recording ends; the list can be submitted.
 extern "system" fn close(this: &List) -> Hresult {
+    this.settle_textures(false);
     // SAFETY: a plain call on the host list.
     match unsafe { this.host.Close() } {
         Ok(()) => S_OK,
@@ -508,9 +583,11 @@ unsafe extern "system" fn reset(
     let Some(allocator) = (unsafe { allocator.as_ref() }) else {
         return E_INVALIDARG;
     };
-    if pipeline != 0 {
-        trace!("a command list is reset with pipeline {pipeline:#x}; pipelines are not built");
-    }
+    // The first pipeline means nothing until host pipelines exist.
+    let _ = pipeline;
+    // What the list recorded before is gone, or has run: the host textures it held for
+    // those commands are let go.
+    this.settle_textures(true);
     // SAFETY: a plain call on the host list with a live host allocator.
     match unsafe { this.host.Reset(&allocator.host, None) } {
         Ok(()) => S_OK,
