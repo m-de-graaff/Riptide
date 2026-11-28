@@ -107,3 +107,29 @@ Two minutes of running, without the host's own checking.
 With the host checking every call (`RIPTIDE_GPU_CHECKS=1`), 60 s gave more than 1,024 frames and one message, that a render target was made without a clear value. Before commit 41f71e8 the host device was lost within the first minute: the title submits one recorded list every frame without resetting it, and the second submission ran a host list that had been reused.
 
 Not measured: frame times, and what any of this costs in CPU time. Nothing is drawn yet, so neither would say much.
+
+### 2026-11-28 · translating the real title's shader programs, and its first picture · commit COMMIT
+
+Driver 32.0.32029.2010, Windows 11 build 26200. DirectX shader compiler 1.8.2502, from the Windows SDK 10.0.26100.0.
+
+How many programs translate. `cargo run --release -p riptide-shader --example coverage -- <folder> --compile` over the 8,634 distinct programs the title made pipelines with in a longer run (written out with `RIPTIDE_SHADER_DUMP`), compiling on 16 threads.
+
+| Stage | Programs | Lifted | Written as HLSL | Compiled |
+| --- | --- | --- | --- | --- |
+| Vertex | 1,034 | 1,017 | 1,017 | 1,017 |
+| Pixel | 3,297 | 2,851 | 2,851 | 2,851 |
+| Compute | 2,734 | 811 | 800 | 800 |
+| Mesh | 1,569 | 0 | 0 | 0 |
+| All | 8,634 | 4,679 | 4,668 | 4,668 |
+
+Compiling the 4,668 took 5 min 44 s of wall time, about 1.2 s of one core for each on average. No translation that was written failed to compile, and none had control flow that could not be structured. What stops the rest is the lift: mesh programs, and instructions it does not have yet.
+
+The first picture. `riptide run` on the real title, debug build, in a 1280 by 720 window, with the host checking every call (`RIPTIDE_GPU_CHECKS=1`), stopped after 180 s. One run.
+
+| Ran for | Frames presented | Pipelines drawn with | Of them with a host pipeline | First picture other than black | Host messages |
+| --- | --- | --- | --- | --- | --- |
+| 180 s | more than 4,096 | 7 | 7 | about 85 s in | one, known: a render target made without a clear value |
+
+The seven are six drawing pipelines and one compute pipeline. Before the picture the title's frames are black by its own doing: it clears, draws a full-screen rectangle multiplied by constants that are zero, and copies the result to the frame. Making a host pipeline took 3 to 6 ms with its shaders already kept on disc from an earlier run, about 90 ms for the two drawing pipelines met with nothing kept, and 557 ms for the compute pipeline. From about 85 s the frame is the title's first screen, with its row of button prompts, and stays so: the title waits there for a button.
+
+Not measured: frame times, which the debug build and the host's checking would both distort.

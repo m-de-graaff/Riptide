@@ -416,6 +416,46 @@ fn skipped(why: &str) {
     }
 }
 
+/// Whether this draw or dispatch is one of the first that `RIPTIDE_DRAW_LOG=<count>` asks
+/// to be shown in full: its programs, what the list had set, and each stage's inputs with
+/// the memory they lead to. For finding out why a translated program draws wrong; what it
+/// shows is the title's own data, which stays in the session log.
+fn show_this_draw() -> bool {
+    use std::sync::OnceLock;
+    static ASKED: OnceLock<u64> = OnceLock::new();
+    static SHOWN: AtomicU64 = AtomicU64::new(0);
+    let asked = *ASKED.get_or_init(|| {
+        std::env::var("RIPTIDE_DRAW_LOG")
+            .ok()
+            .and_then(|count| count.parse().ok())
+            .unwrap_or(0)
+    });
+    asked != 0 && SHOWN.fetch_add(1, Ordering::Relaxed) < asked
+}
+
+/// Says what a stage of a shown draw is given: its inputs, and for each word of user data
+/// that is an address of title memory, the 16 words there (a table of descriptors, as a
+/// rule).
+fn show_inputs(parameter: u32, words: &[u32; crate::stage::WORDS]) {
+    trace!("draw shown: the inputs at host parameter {parameter} are {words:x?}");
+    for (register, &at) in words[..USER_WORDS].iter().enumerate() {
+        if let Some(there) = words_at(u64::from(at), 16).filter(|_| at != 0) {
+            trace!("draw shown: user data {register} leads to {at:#x}: {there:x?}");
+        }
+    }
+}
+
+/// `count` words of title memory at `address`, if all of them are the title's.
+fn words_at(address: u64, count: usize) -> Option<Vec<u32>> {
+    crate::inplace::find(address, 4 * count as u64)?;
+    Some(
+        (0..count)
+            // SAFETY: the whole stretch is title memory, as just found; read unaligned.
+            .map(|index| unsafe { ((address as usize + 4 * index) as *const u32).read_unaligned() })
+            .collect(),
+    )
+}
+
 /// Says what a pipeline is the first time something is drawn with it, for the first few
 /// pipelines: which programs, and what the list had bound.
 fn show_first_use(state: &State, what: &str) {
@@ -467,6 +507,21 @@ fn prepare(list: &List, compute: bool, indexed: bool, more: &[(usize, u32)]) -> 
         .host()?
         .ok_or("the pipeline's host pipeline is still being made")?;
     let host_list = list.host();
+    let shown = show_this_draw();
+    if shown {
+        let programs: Vec<String> = pipeline
+            .programs()
+            .iter()
+            .map(|(stage, code)| format!("{stage:?} {:016x}", crate::census::hash(code)))
+            .collect();
+        trace!(
+            "draw shown: programs [{}], compute {compute}, indexed {indexed}, the draw says              {more:x?}; topology {}, targets {:x?}, set before: {:?}",
+            programs.join(", "),
+            state.topology,
+            state.targets,
+            state.carried
+        );
+    }
     // SAFETY: plain calls on the host list, with host objects that live for the run or as
     // long as the title's pipeline, and buffers found in title memory.
     unsafe {
@@ -500,6 +555,9 @@ fn prepare(list: &List, compute: bool, indexed: bool, more: &[(usize, u32)]) -> 
             }
             for &(word, value) in more {
                 words[word] = value;
+            }
+            if shown {
+                show_inputs(stage.parameter, &words);
             }
             let block = crate::stage::block(list.allocator_key(), &words)
                 .ok_or("the host gave no memory for a stage's inputs")?;

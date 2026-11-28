@@ -96,7 +96,7 @@ const STRUCTURE: u32 = 0x8000_0000;
 /// | 3 | bits 0 to 11: which channel each of the four comes from. Bits 16 to 19: the last level. Bits 28 to 31: the kind of texture (8 one dimension, 9 two, 10 three, 11 cube, 12 and 13 arrays of one and two, 14 and 15 multisampled and its array) |
 /// | 4 | the depth less one, or the slices less one |
 /// | 5 | the place of the host view in the shaders' heap |
-/// | 6 | bit 0: the format is of whole numbers. Bit 1: they are signed |
+/// | 6 | bit 0: the format is of whole numbers. Bit 1: they are signed. Bit 2: the place holds a view for unordered access |
 /// | 7 | the tag |
 ///
 /// The size is that of the view's first level, and the levels are counted from it, as a
@@ -120,9 +120,13 @@ pub(crate) fn encode(view: &View) -> [u32; 8] {
         if view.dimension == 11 {
             words[3] = STRUCTURE;
         } else if view.kind == KIND_CONSTANTS {
-            // Constants are read in rows of 16 bytes.
+            // A program reads constants either at a byte offset from the first or as
+            // rows of 16 bytes by number, and both are within the view if they end at or
+            // before its size: so the rows are 16 bytes and the bound is in bytes. A
+            // bound by rows would put a byte offset past the first row outside.
             words[1] |= 16 << 16;
-            words[2] = view.extent.div_ceil(16);
+            words[2] = view.extent;
+            words[3] = BOUNDS_IN_BYTES;
         } else if view.flags & 1 != 0 {
             words[2] = view.extent.saturating_mul(view.shape.max(1));
             words[3] = BOUNDS_IN_BYTES;
@@ -188,6 +192,9 @@ pub(crate) fn encode(view: &View) -> [u32; 8] {
         match crate::bindless::view((view.resource as usize, unordered, described), texture) {
             Some(place) => {
                 words[5] = place;
+                // A shader reads a place with a view for writing through another kind of
+                // name than one for reading, and has only the record to tell them by.
+                words[6] |= u32::from(unordered) << 2;
                 // What a shader reads through the view is what the title's memory holds.
                 if let Some(resource) = resource {
                     crate::upload::watch(resource);
@@ -729,6 +736,20 @@ fn unordered_access(
         },
         Some(d) => {
             let format = if d[0] == 0 { resource_format } else { d[0] };
+            // A description is as large as its largest kind, and a title fills in only
+            // the words of the kind it describes. The others are whatever was there, and
+            // are cleared: views are told apart by their descriptions, and two that
+            // differ only in words that mean nothing are the same view.
+            let meant = match d[1] {
+                2 => 1,
+                4 => 2,
+                3 | 8 => 3,
+                5 => 4,
+                _ => 8,
+            };
+            let mut whole = *d;
+            whole[2 + meant..].fill(0);
+            let d = &whole;
             match d[1] {
                 DIMENSION_BUFFER => {
                     let first = u64::from(d[2]) | (u64::from(d[3]) << 32);
@@ -1321,13 +1342,16 @@ mod tests {
     }
 
     #[test]
-    fn constants_are_an_address_and_rows_of_16_bytes() {
+    fn constants_are_an_address_rows_of_16_bytes_and_a_size_in_bytes() {
         let mut slots = [0u64; 4];
         let at = room(&mut slots);
         // SAFETY: a valid description, and room for the record.
         unsafe {
             create_constants(device(), &[0x2000, 0x1, 250, 0], at);
-            assert_eq!(words(at)[..4], [0x2000, 1 | (16 << 16), 16, 0]);
+            assert_eq!(
+                words(at)[..4],
+                [0x2000, 1 | (16 << 16), 250, BOUNDS_IN_BYTES]
+            );
             assert_eq!(kind_at(at), KIND_CONSTANTS);
             // A null descriptor is not written to.
             create_constants(device(), &[0, 0, 0, 0], 0);

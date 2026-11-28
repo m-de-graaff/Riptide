@@ -27,6 +27,10 @@ pub(crate) struct Shaders {
 /// The console's topology types the host does not have: rectangles and quads. Both are
 /// drawn as triangles, with a geometry shader that completes each.
 const RECTANGLES: u32 = 19;
+/// The rasteriser's subobject, whose second word after its type says which side of a
+/// triangle is left out, and the value for neither.
+const RASTERIZER: u32 = 10;
+const CULL_NEITHER: u32 = 1;
 const QUADS: u32 = 32;
 /// The host's triangle topology type.
 const TRIANGLES: u32 = 3;
@@ -106,6 +110,7 @@ fn host_stream(
         .collect();
     let mut host = Vec::with_capacity(stream.len() + 64);
     let mut geometry_written = false;
+    let completes = completes_shapes(stream, subobjects);
     let program = |host: &mut Vec<u8>, kind: u32, code: &Option<Vec<u8>>| {
         if let Some(code) = code {
             push_pointer(host, kind, code.as_ptr() as usize, code.len());
@@ -173,6 +178,14 @@ fn host_stream(
                 if let Some(format) = crate::target::host_format(word(bytes, 4)) {
                     put_word(&mut host, at + 4, format.0 as u32);
                 }
+            }
+            // A rectangle has no front or back on the console, whichever way its three
+            // vertices go round; the triangles it is made of here have, so neither side
+            // is left out.
+            RASTERIZER if completes => {
+                let at = host.len();
+                host.extend_from_slice(bytes);
+                put_word(&mut host, at + 8, CULL_NEITHER);
             }
             // Stream output and a cached pipeline: the host is given neither.
             7 | 19 => {}

@@ -163,7 +163,7 @@ fn compiled(from: &[&[u8]], text: &str, profile: &str) -> Result<Vec<u8>, String
     if let Some(shader) = key.as_deref().and_then(crate::cache::get) {
         return Ok(shader);
     }
-    let shader = crate::compile::compile(text, "main", profile, &["-HV", "2021"])?;
+    let shader = crate::compile::compile(text, "main", profile, riptide_shader::ARGUMENTS)?;
     if let Some(key) = &key {
         crate::cache::put(key, &shader);
     }
@@ -172,26 +172,64 @@ fn compiled(from: &[&[u8]], text: &str, profile: &str) -> Result<Vec<u8>, String
 
 /// What marks a compiled shader as made by this way of translating. It is part of a kept
 /// shader's name, so it changes whenever a translation of the same program would come out
-/// different: bump it with any change to what `source` or `riptide-shader` writes.
-const TRANSLATION: &str = "0";
+/// different: the translator's own version says when what it writes has changed.
+const TRANSLATION: &str = riptide_shader::VERSION;
 
 /// The host shader for the program in `code` that runs as `stage`.
 fn source(code: &[u8], stage: HardwareStage, targets: [u8; 8]) -> Result<Source, String> {
-    let _ = targets;
-    Err(format!(
-        "the translator does not write host shaders yet ({} program {:016x})",
-        stage.short_name(),
-        crate::census::hash(code)
-    ))
+    use riptide_shader::TargetKind;
+    let options = riptide_shader::Options {
+        targets: targets.map(|kind| match kind {
+            0 => TargetKind::Float,
+            1 => TargetKind::Unsigned,
+            _ => TargetKind::Signed,
+        }),
+    };
+    let shader = riptide_shader::translate(code, stage, &options).map_err(|error| {
+        format!(
+            "{} program {:016x} is not translated: {error}",
+            stage.short_name(),
+            crate::census::hash(code)
+        )
+    })?;
+    dump(code, stage, &shader.source);
+    Ok(Source {
+        text: shader.source,
+        profile: shader.profile,
+        samplers: shader.samplers,
+        rows: shader.rows,
+        flat_rows: shader.flat_rows,
+    })
+}
+
+/// Writes a host shader's source next to the programs `RIPTIDE_SHADER_DUMP` asks for, as
+/// `<hash>.<stage>.hlsl`, for reading when a translation draws wrong.
+fn dump(code: &[u8], stage: HardwareStage, text: &str) {
+    if let Some(folder) = std::env::var_os("RIPTIDE_SHADER_DUMP") {
+        let name = format!(
+            "{:016x}.{}.hlsl",
+            crate::census::hash(code),
+            stage.short_name()
+        );
+        let _ = std::fs::write(std::path::Path::new(&folder).join(name), text);
+    }
 }
 
 /// The geometry shader that completes rectangles behind a vertex shader that passes on
 /// `rows` rows, of which those in `flat` must not be interpolated.
 fn rectangles(rows: u32, flat: u32) -> Result<Vec<u8>, String> {
-    Err(format!(
-        "the pipeline draws rectangles, which are not completed yet ({rows} rows, flat \
-         {flat:#x})"
-    ))
+    let text = riptide_shader::rectangle_geometry_shader(rows, flat);
+    compiled(
+        &[
+            b"rectangles",
+            &rows.to_le_bytes(),
+            &flat.to_le_bytes(),
+            TRANSLATION.as_bytes(),
+        ],
+        &text,
+        "gs_6_6",
+    )
+    .map_err(|said| format!("the shader that completes rectangles does not compile: {said}"))
 }
 
 /// Pipelines waiting to have their host pipeline made, and the threads that make them.

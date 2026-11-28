@@ -48,7 +48,7 @@ What every translated shader is given, and where. The emitter in `riptide-shader
 | Textures | the resource heap, from place 64 | Each host view of a title's texture, at the place its descriptor record names. Place 32 is a view of nothing, for a record that names none. |
 | Samplers | the sampler heap | Each host sampler, at the place its descriptor record names. A sampler that an instruction compares with is at that place plus 1,024, as the comparing form of the same sampler. |
 
-A texture's record names its place in word 5 of its eight words, and says in word 6 whether its format is of whole numbers (bit 0) and signed (bit 1). A sampler's record names its place in the low 12 bits of word 3 of its four. A place below 64 in a texture's record, or beyond the heap, is no texture: the shader takes the view of nothing for the kind of texture the instruction names, at place 32 plus the kind's number less 8. The records' other words are laid out in `riptide-gpu`'s `view.rs` (built).
+A texture's record names its place in word 5 of its eight words, and says in word 6 whether its format is of whole numbers (bit 0) and signed (bit 1), and whether the place holds a view for unordered access (bit 2), which a shader reads through a different kind of name. A sampler's record names its place in the low 12 bits of word 3 of its four. A place below 64 in a texture's record, or beyond the heap, is no texture: the shader takes the view of nothing for the kind of texture the instruction names, at place 32 plus the kind's number less 8. The records' other words are laid out in `riptide-gpu`'s `view.rs` (built).
 
 Reading title memory at an address is: the page table's word for the address's page; nothing mapped reads as zero; else the bank and the offset in it; then a load from that bank's buffer. A write is the same through the unordered-access view, and a write where nothing is mapped is dropped.
 
@@ -62,13 +62,13 @@ Reading title memory at an address is: the page table's word for the address's p
 
 The console draws a list of rectangles (list topology 17, pipeline topology type 19) from three vertices each: three corners of a screen-aligned rectangle. The hardware draws the whole rectangle and continues every output linearly into the fourth corner. The host has no such topology. The draw goes out as a triangle list, so that vertex counts and indices stay the title's, with a geometry shader of Riptide's own behind the vertex shader that makes each triangle the rectangle.
 
-Which of the three is the corner between the other two varies from draw to draw. It is the vertex that shares x with one of the others and y with the other. The fourth vertex lies opposite it: `a + b - corner`, for the position and for every row. Three vertices that are not such corners stay the triangle they make. The geometry shader needs to know only how many rows the vertex shader has, so `riptide-shader` writes it from that number.
+Which of the three is the corner between the other two varies from draw to draw. It is the vertex that shares x with one of the others and y with the other. The fourth vertex lies opposite it: `a + b - corner`, for the position and for every row. Three vertices that are not such corners stay the triangle they make. The geometry shader needs to know only how many rows the vertex shader has, so `riptide-shader` writes it from that number. A rectangle has no front or back on the console, so the host pipeline leaves out neither side of the triangles it is made of (built).
 
 ## Order of work
 
 1. Container and decoder (#18). In progress.
-2. Intermediate form, lift and interpreter, with the instructions the title's first pipelines use.
-3. HLSL emitter, the host root signature, and draws in `riptide-gpu`: the first drawn pixel.
+2. Intermediate form, lift and interpreter, with the instructions the title's first pipelines use. Done.
+3. HLSL emitter, the host root signature, and draws in `riptide-gpu`: the first drawn pixel. Done: the real title's first screen is drawn.
 4. Coverage: more instructions, by how often the real title uses them. Texture conversion (#25) alongside, since a sampled texture needs it.
 5. The prepare step (#22), background compiling and the pipeline library (#27).
 

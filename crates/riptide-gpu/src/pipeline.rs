@@ -222,9 +222,11 @@ impl Pipeline {
         {
             // SAFETY: held since `host` asked, as this function's contract says.
             let this = unsafe { &*pipeline };
+            let began = std::time::Instant::now();
             let made = crate::translate::host_pipeline(this);
-            if let Err(why) = &made {
-                show_unmade(why);
+            match &made {
+                Ok(_) => show_made(this, began.elapsed()),
+                Err(why) => show_unmade(why),
             }
             let _ = this.host.set(made);
         }
@@ -295,6 +297,21 @@ impl Pipeline {
 }
 
 /// Says why a pipeline has no host pipeline, for the first few and then by count.
+/// Says that a host pipeline was made and how long it took: the first few, and then
+/// every time the count doubles.
+fn show_made(pipeline: &Pipeline, took: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    let made = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+    if made <= 12 || made.is_power_of_two() {
+        trace!(
+            "host pipeline made in {} ms ({made} so far): {}",
+            took.as_millis(),
+            pipeline.shown()
+        );
+    }
+}
+
 fn show_unmade(why: &str) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static UNMADE: AtomicU64 = AtomicU64::new(0);
