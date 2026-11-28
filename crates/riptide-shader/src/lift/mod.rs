@@ -60,6 +60,7 @@
 
 mod image;
 mod memory;
+mod park;
 mod scalar;
 mod vector;
 
@@ -329,6 +330,9 @@ pub fn lift(program: &Program, data: &StageData) -> Result<Function, LiftError> 
     }
     let mut lifter = Lifter::new(program, data, walked.instructions)?;
     let mut function = lifter.run(program, code)?;
+    // Scalars a compiler parked in lanes of a vector register become
+    // variables of their own; what that leaves unread goes next.
+    park::unpark(&mut function);
     remove_dead(&mut function);
     if make_reducible(&mut function).is_none() {
         return Err(fail(

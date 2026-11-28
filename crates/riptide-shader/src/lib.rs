@@ -1,13 +1,13 @@
 //! Console shader programs (RDNA 2): reading their containers, decoding
-//! their machine code, and lifting it into a form a host shader can be
-//! written from.
+//! their machine code, lifting it into an intermediate form, and writing a
+//! host shader from that.
 //!
 //! A shader of an Xbox Series title is a DXBC container. On a PC the `DXIL`
 //! part of such a container holds LLVM bitcode. On the console that part holds
 //! the console compiler's additions instead, among them the program compiled
 //! to the machine code of the console's GPU. A PC GPU cannot run that code, so
-//! it has to be read and translated. This crate holds the first three of the
-//! four stages of that work (`docs/design/2026-11-28-shader-translation.md`):
+//! it has to be read and translated. This crate holds the four stages of
+//! that work (`docs/design/2026-11-28-shader-translation.md`):
 //!
 //! - [`container`] reads the container: its parts, the input and output
 //!   signatures, the pipeline state validation part, and the console's `DXIL`
@@ -22,26 +22,34 @@
 //! - [`interp`] runs the intermediate form on the CPU, as the reference
 //!   every later translation is checked against, and runs the machine code
 //!   itself a wave at a time, as the reference the lift is checked against.
+//! - [`hlsl`] writes a function of the intermediate form as HLSL for the
+//!   DirectX shader compiler, against the bindings `riptide-gpu` provides.
+//!   [`translate`] goes from a container's bytes to that in one call.
 //! - [`summarize`] reads and decodes one container and returns counts, so
 //!   that the decoder can be checked against a real title without any of the
 //!   title's data leaving the machine it runs on.
 //!
-//! Writing host shaders from the intermediate form is not built. See
-//! README.md in this folder.
+//! What is covered, what is approximate and how it is tested is in README.md
+//! in this folder.
 //!
 //! Everything here is a pure function of its input bytes. Nothing touches the
-//! operating system or a GPU, and malformed input gives an [`Error`], never a
-//! panic.
+//! operating system or a GPU (the crate writes HLSL; it does not compile it),
+//! and malformed input gives an [`Error`], never a panic.
 
 mod bytes;
 pub mod container;
 pub mod gfx10;
+pub mod hlsl;
 pub mod inflate;
 pub mod interp;
 pub mod ir;
 pub mod lift;
 mod summary;
 
+pub use hlsl::{
+    ARGUMENTS, EmitError, Emitted, Options, Shader, TargetKind, TranslateError, VERSION,
+    emit_function, rectangle_geometry_shader, translate,
+};
 pub use summary::{
     ProgramSummary, Summary, UNKNOWN_SAMPLE_LIMIT, UnknownSample, summarize, summarize_program,
 };

@@ -10,3 +10,15 @@ publish = false
 workspace = true
 
 [dependencies]
+
+# The tests that run emitted shaders on a real device (src/hlsl/device.rs).
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "=0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }

@@ -1058,6 +1058,83 @@ fn a_loop_runs_each_lane_as_often_as_that_lane_needs() {
     }
 }
 
+/// A program that parks the numbers of `s8` and `s9` in lanes 3 and 40 of
+/// `v20`, changes the registers, and takes the numbers out again into the
+/// position; `also` comes before the export.
+fn parking(also: Vec<u32>) -> Vec<u32> {
+    let write = |register: u8, lane: i8| {
+        asm::vop3(
+            "v_writelane_b32",
+            20,
+            [O::S(register), O::K(lane), O::K(0)],
+            0,
+            0,
+        )
+    };
+    let read = |register: u8, lane: i8| {
+        asm::vop3(
+            "v_readlane_b32",
+            u32::from(register),
+            [O::V(20), O::K(lane), O::K(0)],
+            0,
+            0,
+        )
+    };
+    Code::new()
+        .i(write(8, 3))
+        .i(write(9, 40))
+        .i(asm::sop2("s_add_u32", O::S(8), O::S(8), O::K(5)))
+        .i(asm::sop2("s_add_u32", O::S(9), O::S(9), O::K(7)))
+        .i(read(12, 3))
+        .i(read(13, 40))
+        // A lane nothing was parked in reads zero.
+        .i(read(14, 9))
+        .i(asm::vop1("v_mov_b32", 5, O::S(12)))
+        .i(asm::vop1("v_mov_b32", 6, O::S(13)))
+        .i(asm::vop1("v_mov_b32", 7, O::S(14)))
+        .i(asm::vop1("v_mov_b32", 8, O::S(8)))
+        .i(also)
+        .i(export_position([5, 6, 7, 8]))
+        .end()
+}
+
+#[test]
+fn scalars_parked_in_lanes_of_a_vector_register_become_variables() {
+    let (function, outcome) = run_both(&vertex(parking(Vec::new())), &vertex_data(), 64);
+    // Nothing of it looks across lanes any more.
+    assert!(!function.has_cross_lane(), "{function}");
+    let lane_bits = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter(|inst| matches!(inst.op, Op::LaneBit { .. } | Op::ReadLane { .. }))
+        .count();
+    assert_eq!(lane_bits, 0, "{function}");
+    for lane in [0, 3, 40, 63] {
+        assert_eq!(
+            position(&outcome, lane),
+            [
+                TestHost::new().user[8],
+                TestHost::new().user[9],
+                0,
+                TestHost::new().user[8].wrapping_add(5)
+            ]
+        );
+    }
+}
+
+#[test]
+fn a_vector_register_that_is_also_read_as_a_vector_is_not_taken_for_parking() {
+    // The register goes to the position as it is: lane 3 and lane 40 hold
+    // what was written there and the others what they held before.
+    let also = asm::vop1("v_mov_b32", 7, O::V(20));
+    let (function, outcome) = run_both(&vertex(parking(also)), &vertex_data(), 64);
+    assert!(function.has_cross_lane());
+    assert_eq!(position(&outcome, 3)[2], TestHost::new().user[8]);
+    assert_eq!(position(&outcome, 40)[2], TestHost::new().user[9]);
+    assert_eq!(position(&outcome, 5)[2], 0);
+}
+
 #[test]
 fn a_loop_over_the_first_lanes_value_serves_every_lane() {
     // The shape compilers give a resource index that differs per lane:
