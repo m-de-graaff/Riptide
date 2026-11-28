@@ -6,20 +6,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE,
-    ID3D12CommandList, ID3D12CommandQueue,
+    ID3D12CommandQueue,
 };
-use windows::core::Interface;
 
 use crate::device::Device;
 use crate::fence::Fence;
 use crate::list::List;
+use crate::list::Piece;
 use crate::object::{self, Child, E_INVALIDARG, Hresult, Iid, Object, S_OK, guid};
 #[cfg(test)]
 use crate::object::{E_NOINTERFACE, E_POINTER};
 use crate::ordered::{Job, Ordered};
 use crate::resource::Resource;
 use crate::trace;
-use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList;
 
 /// `ID3D12CommandQueue`.
 const IID: Iid = guid(
@@ -288,51 +287,52 @@ unsafe extern "system" fn execute(this: &Queue, count: u32, lists: *const *const
     if lists.is_empty() {
         return;
     }
+    for list in &lists {
+        let before = list.count_submission();
+        if before > 0 && RESUBMITTED.fetch_add(1, Ordering::Relaxed) < 6 {
+            trace!(
+                "list {:p} (type {}) is submitted again without a reset: {} times before",
+                std::ptr::from_ref(*list),
+                list.kind(),
+                before
+            );
+        }
+    }
     let submitted = SUBMITTED.fetch_add(lists.len() as u64, Ordering::Relaxed);
     if submitted == 0 {
         trace!("the title's first command lists are submitted to the host GPU");
     }
-    // The usual case: no list waits for anything and nothing earlier is still waiting.
-    // The host lists stay their lists' own and run now.
-    let waits = lists.iter().any(|list| list.has_waits());
-    if !waits && !this.ordered.behind() {
-        let host: Vec<Option<ID3D12CommandList>> = lists
-            .iter()
-            .filter_map(|list| list.submitted().cast::<ID3D12CommandList>().ok())
-            .map(Some)
-            .collect();
-        if this.ordered.submit(vec![Job::Borrowed(host)], true) {
-            return;
-        }
-    }
-    // Otherwise the host lists are taken from their lists, which the title may record
-    // again at once, and run in order when their turn comes.
+    // The lists' parts in order, each wait before the part it holds back.
+    let mut waits = false;
     let mut jobs = Vec::new();
-    let mut run: Vec<(u32, ID3D12GraphicsCommandList)> = Vec::new();
+    let mut run: Vec<Piece> = Vec::new();
     for list in lists {
-        for (wait, host) in list.take_pieces() {
-            if let Some(wait) = wait {
+        for piece in list.pieces() {
+            if let Some(wait) = piece.wait {
+                waits = true;
                 if !run.is_empty() {
                     jobs.push(Job::Lists(std::mem::take(&mut run)));
                 }
                 jobs.push(Job::Gate(wait));
             }
-            run.push((list.kind(), host));
+            run.push(piece);
         }
     }
     if !run.is_empty() {
         jobs.push(Job::Lists(run));
     }
-    if DEFERRED.fetch_add(1, Ordering::Relaxed) == 0 {
-        trace!(
-            "a submission waits for a value in memory: its queue now submits in order on a thread of its own"
-        );
+    // With no wait, and nothing earlier still waiting, this runs now on the title's
+    // thread. Otherwise it takes its turn on the queue's own.
+    if !this.ordered.submit(jobs, !waits) && DEFERRED.fetch_add(1, Ordering::Relaxed) == 0 {
+        trace!("a submission has to wait: its queue now submits in order on a thread of its own");
     }
-    this.ordered.submit(jobs, false);
 }
 
 /// Submissions that had to wait their turn.
 static DEFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// Submissions of a list that had not been reset since its last one.
+static RESUBMITTED: AtomicU64 = AtomicU64::new(0);
 
 /// Lists submitted so far.
 static SUBMITTED: AtomicU64 = AtomicU64::new(0);

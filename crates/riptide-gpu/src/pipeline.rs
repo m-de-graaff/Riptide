@@ -260,6 +260,7 @@ pub(crate) unsafe extern "system" fn create(
                 }
                 // SAFETY: the title's program, of that many bytes.
                 let bytes = unsafe { std::slice::from_raw_parts(code.code, code.bytes) }.to_vec();
+                crate::census::count(&bytes);
                 programs.push((stage, bytes));
             }
             _ if one.kind == 0 => root = pointer(&stream, one),
@@ -317,6 +318,7 @@ pub(crate) unsafe extern "system" fn create_compute(
     }
     // SAFETY: the title's program, of that many bytes.
     let program = unsafe { std::slice::from_raw_parts(code.code, code.bytes) }.to_vec();
+    crate::census::count(&program);
     let pipeline = Box::new(Pipeline {
         object: Object::new(table(), 1),
         packet: [0; 8],

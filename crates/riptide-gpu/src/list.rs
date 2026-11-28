@@ -124,11 +124,15 @@ pub(crate) struct List {
     host: std::cell::UnsafeCell<ID3D12GraphicsCommandList>,
     /// How many commands have gone to the host list since the last reset.
     recorded: std::sync::atomic::AtomicU32,
+    /// How many times the list has been submitted since it was last reset.
+    submissions: std::sync::atomic::AtomicU32,
     /// A wait the GPU is to make before it runs the host list being recorded now.
     gate: std::sync::Mutex<Option<Wait>>,
     /// The pieces the list was cut into at waits before the one being recorded now, in
     /// order, each with the wait the GPU makes before it.
-    earlier: std::sync::Mutex<Vec<(Option<Wait>, ID3D12GraphicsCommandList)>>,
+    earlier: std::sync::Mutex<Vec<Piece>>,
+    /// When the host list being recorded now was last submitted and run.
+    run: std::sync::Mutex<std::sync::Arc<Run>>,
     /// The host allocator the list records into, for a piece started after a cut.
     allocator: std::cell::UnsafeCell<Option<ID3D12CommandAllocator>>,
     /// The host textures this list has used since it was last reset, each with the state
@@ -164,6 +168,27 @@ impl Wait {
             _ => true,
         }
     }
+}
+
+/// What is known of one host list's submissions. Its title list and the queue's
+/// submissions that hold it share this.
+#[derive(Default)]
+pub(crate) struct Run {
+    /// How many submissions hold the host list and have not run it yet.
+    pub(crate) queued: std::sync::atomic::AtomicU32,
+    /// The number, on its queue, of the last submission that ran it. Zero: never.
+    pub(crate) ran_at: std::sync::atomic::AtomicU64,
+}
+
+/// One part of a title's list as it is submitted: a host list, and the wait the GPU makes
+/// before it.
+#[derive(Clone)]
+pub(crate) struct Piece {
+    pub(crate) wait: Option<Wait>,
+    pub(crate) host: ID3D12GraphicsCommandList,
+    pub(crate) run: std::sync::Arc<Run>,
+    /// The list type, as the host numbers them.
+    pub(crate) kind: u32,
 }
 
 /// Host lists that have run and can record again, by list type. A list whose host list
@@ -477,8 +502,10 @@ unsafe fn make_list(
         newer: [0; 256],
         host: std::cell::UnsafeCell::new(host),
         recorded: std::sync::atomic::AtomicU32::new(0),
+        submissions: std::sync::atomic::AtomicU32::new(0),
         gate: std::sync::Mutex::new(None),
         earlier: std::sync::Mutex::new(Vec::new()),
+        run: std::sync::Mutex::new(std::sync::Arc::new(Run::default())),
         allocator: std::cell::UnsafeCell::new(Some(allocator.host.clone())),
         textures: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
@@ -648,9 +675,11 @@ impl List {
         self.current()
     }
 
-    /// The host list, for a submission that runs it now and leaves it this list's own.
-    pub(crate) fn submitted(&self) -> &ID3D12GraphicsCommandList {
-        self.current()
+    /// Counts a submission of the list, and says how many there were before it since the
+    /// list was last reset.
+    pub(crate) fn count_submission(&self) -> u32 {
+        self.submissions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Records a wait: the GPU is to go on with what follows only when a value in memory
@@ -688,27 +717,25 @@ impl List {
                 return false;
             }
             let before = std::mem::replace(&mut *self.host.get(), next);
+            let run = std::mem::take(
+                &mut *self
+                    .run
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            );
             self.earlier
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push((gate.take(), before));
+                .push(Piece {
+                    wait: gate.take(),
+                    host: before,
+                    run,
+                    kind: self.kind,
+                });
         }
         *gate = Some(wait);
         self.recorded.store(0, Ordering::Relaxed);
         true
-    }
-
-    /// Whether the GPU has to wait before any part of this list.
-    pub(crate) fn has_waits(&self) -> bool {
-        self.gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some()
-            || !self
-                .earlier
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_empty()
     }
 
     /// The list type, as the host numbers them.
@@ -716,33 +743,34 @@ impl List {
         self.kind
     }
 
-    /// Takes the list's host lists away, to be run later than the title's submission
-    /// returns: every piece in order, each with the wait the GPU makes before it. A closed
-    /// host list is put in their place. The title may reset and record this list again at
-    /// once, which must not touch commands that have not run yet.
-    pub(crate) fn take_pieces(&self) -> Vec<(Option<Wait>, ID3D12GraphicsCommandList)> {
-        let mut pieces = std::mem::take(
-            &mut *self
-                .earlier
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        );
-        let gate = self
-            .gate
+    /// The list's parts as a submission takes them: every piece in order, each with the
+    /// wait the GPU makes before it. The host lists stay this list's own, so that the title
+    /// can submit the list again as it is. Each is counted as held by a submission until
+    /// the submission has run it.
+    pub(crate) fn pieces(&self) -> Vec<Piece> {
+        let mut pieces = self
+            .earlier
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        match closed_host_list(self.kind) {
-            Some(replacement) => {
-                // SAFETY: as in `current`: only the thread submitting this list uses it.
-                let last = unsafe { std::mem::replace(&mut *self.host.get(), replacement) };
-                pieces.push((gate, last));
-            }
-            None => {
-                trace!(
-                    "the last part of a command list is not submitted: the host gave no list in its place"
-                )
-            }
+            .clone();
+        pieces.push(Piece {
+            wait: *self
+                .gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            host: self.current().clone(),
+            run: self
+                .run
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            kind: self.kind,
+        });
+        for piece in &pieces {
+            piece
+                .run
+                .queued
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
         pieces
     }
@@ -786,19 +814,41 @@ unsafe extern "system" fn reset(
     this.settle_textures(true);
     // SAFETY: a plain call on the host list with a live host allocator.
     this.recorded.store(0, std::sync::atomic::Ordering::Relaxed);
+    this.submissions
+        .store(0, std::sync::atomic::Ordering::Relaxed);
     *this
         .gate
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-    // Pieces that were never submitted can record again.
-    let unsubmitted = std::mem::take(
+    // The pieces of what was recorded before are let go. One that no submission still
+    // holds can record again; the others are given back when their submission has run.
+    let before = std::mem::take(
         &mut *this
             .earlier
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
     );
-    for (_, piece) in unsubmitted {
-        recycle(this.kind, piece);
+    for piece in before {
+        if std::sync::Arc::strong_count(&piece.run) == 1 {
+            recycle(this.kind, piece.host);
+        }
+    }
+    // The host list recorded last may be held by a submission that has not run yet. Then
+    // it must not be touched: another host list takes its place.
+    {
+        let mut run = this
+            .run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if run.queued.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            let Some(next) = closed_host_list(this.kind) else {
+                trace!("a command list is not reset: the host gave no list to record into");
+                return crate::object::E_OUTOFMEMORY;
+            };
+            // SAFETY: as in `current`: only the thread resetting this list touches it.
+            unsafe { *this.host.get() = next };
+        }
+        *run = std::sync::Arc::new(Run::default());
     }
     // SAFETY: as in `current`: only the thread resetting this list touches it.
     unsafe { *this.allocator.get() = Some(allocator.host.clone()) };

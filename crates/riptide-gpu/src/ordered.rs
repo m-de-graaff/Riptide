@@ -6,27 +6,32 @@
 //! held, because it may be the one that sets the value. Such a list, and everything the
 //! title submits to the same queue after it until it has run, is handed to a thread of the
 //! queue's own, which makes the wait and then submits in the order the title did.
+//!
+//! A title may submit a list it has recorded once again and again. The host runs a list
+//! again only when its run before is over, so each host list remembers when it last ran
+//! and the queue waits for that before it submits the list again.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12CommandList, ID3D12CommandQueue, ID3D12Fence, ID3D12GraphicsCommandList, ID3D12Resource,
+    D3D12_FENCE_FLAG_NONE, ID3D12CommandList, ID3D12CommandQueue, ID3D12Fence, ID3D12Resource,
 };
+use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Interface;
 
-use crate::list::Wait;
+use crate::list::{Piece, Wait};
 use crate::trace;
 
 /// One thing a title asked of a queue.
 pub(crate) enum Job {
     /// Wait until a value in title memory lets the GPU go on.
     Gate(Wait),
-    /// Submit host lists. Each is given back afterwards to record again, by its list type.
-    Lists(Vec<(u32, ID3D12GraphicsCommandList)>),
-    /// Submit host lists that stay their title list's own.
-    Borrowed(Vec<Option<ID3D12CommandList>>),
+    /// Submit the host lists of these pieces, in order.
+    Lists(Vec<Piece>),
     /// Have the host fence reach a value when everything before this has run.
     Signal(ID3D12Fence, u64),
     /// Show a frame.
@@ -45,16 +50,31 @@ pub(crate) struct Ordered {
     host: ID3D12CommandQueue,
     state: Mutex<State>,
     arrived: Condvar,
+    /// A host fence of the queue's own, signalled after each submission of lists, and the
+    /// event it wakes a wait with. `None` if the host gave none, in which case a list is
+    /// never waited for.
+    ran: Option<(ID3D12Fence, HANDLE)>,
+    /// The number of the last submission of lists.
+    submissions: AtomicU64,
 }
 
-// SAFETY: the host queue and everything a job holds are free-threaded host objects, and
-// the state is behind a lock.
+// SAFETY: the host queue, the fence and everything a job holds are free-threaded host
+// objects, the event is a process-wide handle, and the state is behind a lock.
 unsafe impl Send for Ordered {}
 // SAFETY: as above.
 unsafe impl Sync for Ordered {}
 
 impl Ordered {
     pub(crate) fn new(host: ID3D12CommandQueue) -> Arc<Ordered> {
+        let ran = crate::host::host().ok().and_then(|device| {
+            // SAFETY: plain calls: a new host fence and a new unnamed event.
+            unsafe {
+                let fence: ID3D12Fence =
+                    device.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                let event = CreateEventW(None, false, false, None).ok()?;
+                Some((fence, event))
+            }
+        });
         Arc::new(Ordered {
             host,
             state: Mutex::new(State {
@@ -63,6 +83,8 @@ impl Ordered {
                 started: false,
             }),
             arrived: Condvar::new(),
+            ran,
+            submissions: AtomicU64::new(0),
         })
     }
 
@@ -70,13 +92,6 @@ impl Ordered {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Whether something submitted earlier has not run yet, so that what comes now has to
-    /// wait its turn.
-    pub(crate) fn behind(&self) -> bool {
-        let state = self.state();
-        state.busy || !state.jobs.is_empty()
     }
 
     /// Runs `jobs` now, on this thread, if nothing submitted earlier is still waiting and
@@ -134,24 +149,54 @@ impl Ordered {
         crate::host::report_problems();
     }
 
+    /// Waits until the GPU has finished the submission numbered `number`.
+    fn wait_for(&self, number: u64) {
+        let Some((fence, event)) = &self.ran else {
+            return;
+        };
+        // SAFETY: plain calls on the queue's own fence and event.
+        unsafe {
+            if fence.GetCompletedValue() < number
+                && fence.SetEventOnCompletion(number, *event).is_ok()
+            {
+                WaitForSingleObject(*event, INFINITE);
+            }
+        }
+    }
+
     fn run_one(&self, job: Job) {
         match job {
             Job::Gate(wait) => hold(&wait),
-            Job::Lists(lists) => {
-                let host: Vec<Option<ID3D12CommandList>> = lists
+            Job::Lists(pieces) => {
+                // A host list that has run before runs again only when that run is over.
+                let before = pieces
                     .iter()
-                    .filter_map(|(_, list)| list.cast::<ID3D12CommandList>().ok())
+                    .map(|piece| piece.run.ran_at.load(Ordering::Acquire))
+                    .max()
+                    .unwrap_or(0);
+                if before != 0 {
+                    self.wait_for(before);
+                }
+                let host: Vec<Option<ID3D12CommandList>> = pieces
+                    .iter()
+                    .filter_map(|piece| piece.host.cast::<ID3D12CommandList>().ok())
                     .map(Some)
                     .collect();
                 // SAFETY: a plain call on the host queue with closed host lists.
                 unsafe { self.host.ExecuteCommandLists(&host) };
-                for (kind, list) in lists {
-                    crate::list::recycle(kind, list);
+                let number = self.submissions.fetch_add(1, Ordering::AcqRel) + 1;
+                if let Some((fence, _)) = &self.ran {
+                    // SAFETY: a plain call on the host queue with its own fence.
+                    let _ = unsafe { self.host.Signal(fence, number) };
                 }
-            }
-            Job::Borrowed(host) => {
-                // SAFETY: a plain call on the host queue with closed host lists.
-                unsafe { self.host.ExecuteCommandLists(&host) };
+                for piece in pieces {
+                    piece.run.ran_at.store(number, Ordering::Release);
+                    piece.run.queued.fetch_sub(1, Ordering::AcqRel);
+                    // A host list its title list has let go of can record again.
+                    if Arc::strong_count(&piece.run) == 1 {
+                        crate::list::recycle(piece.kind, piece.host);
+                    }
+                }
             }
             Job::Signal(fence, value) => {
                 // SAFETY: a plain call on the host queue with a host fence.
