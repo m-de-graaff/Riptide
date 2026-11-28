@@ -178,6 +178,7 @@ fn picture(
             vertex: Some(vertex),
             pixel: Some(pixel),
             geometry: None,
+            mesh: None,
         },
     )
     .unwrap();

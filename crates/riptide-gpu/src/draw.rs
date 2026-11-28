@@ -692,11 +692,38 @@ extern "system" fn dispatch(this: &List, x: u32, y: u32, z: u32) {
     }
 }
 
-/// Indirect draws, mesh draws and the console's own dispatch: not built yet. The methods
+/// `DispatchMesh`: `(groups across, down and deep)`. A draw with a pipeline whose
+/// geometry a mesh program makes: the program is told the counts as a compute program is.
+extern "system" fn dispatch_mesh(this: &List, x: u32, y: u32, z: u32) {
+    use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList6;
+    use windows::core::Interface;
+    show_first_use(this.drawing().state(), "a mesh dispatch");
+    let more = [
+        (crate::translate::GROUP_COUNTS, x),
+        (crate::translate::GROUP_COUNTS + 1, y),
+        (crate::translate::GROUP_COUNTS + 2, z),
+    ];
+    let host = match this.host().cast::<ID3D12GraphicsCommandList6>() {
+        Ok(host) => host,
+        Err(error) => {
+            skipped(&format!(
+                "the host list cannot dispatch mesh shaders: {error}"
+            ));
+            return;
+        }
+    };
+    match prepare(this, false, false, &more) {
+        // SAFETY: a plain call on the host list, which has all the draw needs.
+        Ok(()) => unsafe { host.DispatchMesh(x, y, z) },
+        Err(why) => skipped(&why),
+    }
+}
+
+/// Indirect draws, the console's own mesh draw and its own dispatch: not built yet. The methods
 /// bound to this take different arguments, none of which is read.
 extern "system" fn unbuilt_draw(this: &List) {
     show_first_use(this.drawing().state(), "a draw of a kind not built yet");
-    skipped("indirect draws, mesh draws and the console's own dispatch are not built yet");
+    skipped("indirect draws and the console's own dispatches are not built yet");
 }
 
 /// The methods here by their position in the older list layout.
@@ -723,7 +750,8 @@ pub(crate) fn methods() -> Vec<(usize, usize)> {
         (14, dispatch as *const () as usize),
     ]);
     // Indirect, the console's own dispatch, and the two mesh dispatches.
-    methods.extend([59, 78, 98, 127].map(|slot| (slot, unbuilt_draw as *const () as usize)));
+    methods.extend([59, 78, 98].map(|slot| (slot, unbuilt_draw as *const () as usize)));
+    methods.push((127, dispatch_mesh as *const () as usize));
     methods
 }
 

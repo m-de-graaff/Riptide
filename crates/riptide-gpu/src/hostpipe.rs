@@ -22,6 +22,8 @@ pub(crate) struct Shaders {
     pub(crate) pixel: Option<Vec<u8>>,
     /// A geometry shader of Riptide's own, for a topology the host does not have.
     pub(crate) geometry: Option<Vec<u8>>,
+    /// The mesh shader of a pipeline that has one in place of a vertex shader.
+    pub(crate) mesh: Option<Vec<u8>>,
 }
 
 /// The console's topology types the host does not have: rectangles and quads. Both are
@@ -36,6 +38,9 @@ const QUADS: u32 = 32;
 const TRIANGLES: u32 = 3;
 
 /// The subobject types this module writes or leaves out.
+/// The mesh program's subobject, as the console and as the host number it.
+const CONSOLE_MESH: u32 = 24;
+const HOST_MESH: u32 = 25;
 const ROOT: u32 = 0;
 const VERTEX: u32 = 1;
 const PIXEL: u32 = 2;
@@ -132,9 +137,12 @@ fn host_stream(
                 program(&mut host, GEOMETRY, &shaders.geometry);
                 geometry_written = true;
             }
-            // Hull, domain, amplification and mesh programs: none is translated yet. A
-            // subobject with no program in it is left out.
-            3 | 4 | 23 | 24 => {
+            // A mesh program: the console numbers its subobject one lower than the host.
+            CONSOLE_MESH if shaders.mesh.is_some() => program(&mut host, HOST_MESH, &shaders.mesh),
+            // Hull, domain and amplification programs, and a mesh program without a host
+            // shader: none is translated yet. A subobject with no program in it is left
+            // out.
+            3 | 4 | 23 | CONSOLE_MESH => {
                 if word(bytes, 16) != 0 || word(bytes, 20) != 0 {
                     return Err(format!(
                         "the pipeline has a program of subobject type {}, which is not \
@@ -291,6 +299,7 @@ mod tests {
             vertex: Some(vec![1, 2, 3]),
             pixel: None,
             geometry: Some(vec![4, 5]),
+            mesh: None,
         };
         let (host, elements) = host_stream(&stream, &subobjects, &[], 0x1234, &shaders).unwrap();
         assert!(elements.is_empty());

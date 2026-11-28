@@ -94,6 +94,8 @@ fn place(stage: Stage) -> Option<(HardwareStage, u32)> {
         Stage::Vertex => Some((HardwareStage::Vertex, crate::stage::INPUTS)),
         Stage::Pixel => Some((HardwareStage::Pixel, crate::stage::INPUTS + 1)),
         Stage::Compute => Some((HardwareStage::Compute, crate::stage::INPUTS + 2)),
+        // A mesh program stands where the vertex program does, and has its inputs.
+        Stage::Mesh => Some((HardwareStage::Mesh, crate::stage::INPUTS)),
         _ => None,
     }
 }
@@ -323,6 +325,7 @@ pub(crate) fn host_pipeline(pipeline: &Pipeline) -> Result<HostPipeline, String>
                 shaders.vertex = Some(translated.shader);
             }
             Stage::Pixel => shaders.pixel = Some(translated.shader),
+            Stage::Mesh => shaders.mesh = Some(translated.shader),
             _ => compute = Some(translated.shader),
         }
         stages.push(StageInputs {
